@@ -38,14 +38,17 @@ add_subdirectory(vendors/tree-sitter EXCLUDE_FROM_ALL)
 # tree-sitter language grammars (each is a tiny static lib)
 # --------------------------------------------------------------------------
 function(add_ts_grammar TARGET GRAMMAR_DIR)
-    set(SRCS ${GRAMMAR_DIR}/src/parser.c)
-    if(EXISTS ${GRAMMAR_DIR}/src/scanner.c)
-        list(APPEND SRCS ${GRAMMAR_DIR}/src/scanner.c)
+    set(SRCS ${CMAKE_SOURCE_DIR}/${GRAMMAR_DIR}/src/parser.c)
+    if(EXISTS ${CMAKE_SOURCE_DIR}/${GRAMMAR_DIR}/src/scanner.c)
+        list(APPEND SRCS ${CMAKE_SOURCE_DIR}/${GRAMMAR_DIR}/src/scanner.c)
+    endif()
+    if(EXISTS ${CMAKE_SOURCE_DIR}/${GRAMMAR_DIR}/src/scanner.cc)
+        list(APPEND SRCS ${CMAKE_SOURCE_DIR}/${GRAMMAR_DIR}/src/scanner.cc)
     endif()
     add_library(${TARGET} STATIC ${SRCS})
     target_include_directories(${TARGET} PRIVATE
-        ${GRAMMAR_DIR}/src
-        vendors/tree-sitter/lib/include
+        ${CMAKE_SOURCE_DIR}/${GRAMMAR_DIR}/src
+        ${CMAKE_SOURCE_DIR}/vendors/tree-sitter/lib/include
     )
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endfunction()
@@ -58,36 +61,32 @@ add_ts_grammar(ts_grammar_ts       vendors/tree-sitter-typescript/typescript)
 add_ts_grammar(ts_grammar_tsx      vendors/tree-sitter-typescript/tsx)
 
 # --------------------------------------------------------------------------
-# SQLite — amalgamation build
-# The amalgamation (sqlite3.c + sqlite3.h) must be present in vendors/sqlite/.
-# Generate it once by running `make sqlite3.c` inside vendors/sqlite/ if missing.
+# SQLite — amalgamation build (out-of-source: copy to build dir so no
+# artifacts are ever written back into the vendors/sqlite submodule)
 # --------------------------------------------------------------------------
-set(SQLITE_AMALG_C ${CMAKE_SOURCE_DIR}/vendors/sqlite/sqlite3.c)
-set(SQLITE_AMALG_H ${CMAKE_SOURCE_DIR}/vendors/sqlite/sqlite3.h)
+set(SQLITE_SRC_DIR  ${CMAKE_SOURCE_DIR}/vendors/sqlite)
+set(SQLITE_AMALG_C  ${SQLITE_SRC_DIR}/sqlite3.c)
+set(SQLITE_AMALG_H  ${SQLITE_SRC_DIR}/sqlite3.h)
 
 if(NOT EXISTS ${SQLITE_AMALG_C})
-    message(STATUS "SQLite amalgamation not found — attempting to generate via make")
-    execute_process(
-        COMMAND make sqlite3.c
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/vendors/sqlite
-        RESULT_VARIABLE SQLITE_MAKE_RESULT
-    )
-    if(NOT SQLITE_MAKE_RESULT EQUAL 0 OR NOT EXISTS ${SQLITE_AMALG_C})
-        message(FATAL_ERROR
-            "SQLite amalgamation not found at vendors/sqlite/sqlite3.c.\n"
-            "Run: cd vendors/sqlite && make sqlite3.c")
-    endif()
+    message(FATAL_ERROR
+        "SQLite amalgamation not found at vendors/sqlite/sqlite3.c.\n"
+        "Run: git submodule update --init vendors/sqlite")
 endif()
 
-set(SQLITE_SRCS ${SQLITE_AMALG_C})
+# Copy amalgamation into the build tree so the compiler writes its .o there.
+set(SQLITE_BUILD_DIR ${CMAKE_BINARY_DIR}/sqlite_amalg)
+file(MAKE_DIRECTORY ${SQLITE_BUILD_DIR})
+configure_file(${SQLITE_AMALG_C} ${SQLITE_BUILD_DIR}/sqlite3.c COPYONLY)
+configure_file(${SQLITE_AMALG_H} ${SQLITE_BUILD_DIR}/sqlite3.h COPYONLY)
 
-add_library(sqlite3_static STATIC ${SQLITE_SRCS})
+add_library(sqlite3_static STATIC ${SQLITE_BUILD_DIR}/sqlite3.c)
 target_include_directories(sqlite3_static PUBLIC
-    vendors/sqlite
-    vendors/sqlite/src
+    ${SQLITE_BUILD_DIR}
+    ${SQLITE_SRC_DIR}
 )
 target_compile_definitions(sqlite3_static PRIVATE
-    SQLITE_THREADSAFE=2          # serialized mode — safe for our job system
+    SQLITE_THREADSAFE=2
     SQLITE_DEFAULT_WAL_SYNCHRONOUS=1
     SQLITE_OMIT_LOAD_EXTENSION
 )

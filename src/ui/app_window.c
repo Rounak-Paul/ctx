@@ -8,24 +8,24 @@
 #include "ca_node_graph.h"
 
 /* ============================================================
-   Palette — One Dark Pro / sharp-edged terminal aesthetic
+   Palette — packed RGBA uint32 (R<<24 | G<<16 | B<<8 | A)
    ============================================================ */
-#define C_BG0       ca_color(0x09, 0x0a, 0x0c, 0xff)  /* deepest bg            */
-#define C_BG1       ca_color(0x0e, 0x10, 0x13, 0xff)  /* panel bg              */
-#define C_BG2       ca_color(0x16, 0x1a, 0x1f, 0xff)  /* elevated surface      */
-#define C_BG3       ca_color(0x1e, 0x23, 0x2b, 0xff)  /* hover / selected      */
-#define C_BORDER    ca_color(0x22, 0x29, 0x33, 0xff)  /* hairline border       */
-#define C_ACCENT    ca_color(0x7a, 0xa2, 0xf7, 0xff)  /* blue accent           */
-#define C_ACCENT2   ca_color(0x9e, 0xce, 0x6a, 0xff)  /* green ok              */
-#define C_ACCENT3   ca_color(0xe0, 0xaf, 0x68, 0xff)  /* amber warn            */
-#define C_FG0       ca_color(0xc0, 0xca, 0xf5, 0xff)  /* primary text          */
-#define C_FG1       ca_color(0xa9, 0xb1, 0xd6, 0xff)  /* secondary text        */
-#define C_FG2       ca_color(0x56, 0x5f, 0x89, 0xff)  /* muted text            */
-#define C_FG3       ca_color(0x2d, 0x33, 0x4a, 0xff)  /* very muted            */
-#define C_NODE_FN   ca_color(0x7a, 0xa2, 0xf7, 0x30)  /* fn node header        */
-#define C_NODE_STR  ca_color(0x9e, 0xce, 0x6a, 0x30)  /* struct node header    */
-#define C_NODE_MAC  ca_color(0xe0, 0xaf, 0x68, 0x30)  /* macro node header     */
-#define C_WIRE      ca_color(0x7a, 0xa2, 0xf7, 0x88)  /* call edge wire        */
+#define C_BG0       0x090a0cffU  /* deepest bg            */
+#define C_BG1       0x0e1013ffU  /* panel bg              */
+#define C_BG2       0x161a1fffU  /* elevated surface      */
+#define C_BG3       0x1e232bffU  /* hover / selected      */
+#define C_BORDER    0x222933ffU  /* hairline border       */
+#define C_ACCENT    0x7aa2f7ffU  /* blue accent           */
+#define C_ACCENT2   0x9ece6affU  /* green ok              */
+#define C_ACCENT3   0xe0af68ffU  /* amber warn            */
+#define C_FG0       0xc0caf5ffU  /* primary text          */
+#define C_FG1       0xa9b1d6ffU  /* secondary text        */
+#define C_FG2       0x565f89ffU  /* muted text            */
+#define C_FG3       0x2d334affU  /* very muted            */
+#define C_NODE_FN   0x7aa2f730U  /* fn node header        */
+#define C_NODE_STR  0x9ece6a30U  /* struct node header    */
+#define C_NODE_MAC  0xe0af6830U  /* macro node header     */
+#define C_WIRE      0x7aa2f788U  /* call edge wire        */
 
 /* ============================================================
    State
