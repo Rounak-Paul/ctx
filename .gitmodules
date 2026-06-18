@@ -1,0 +1,30 @@
+[submodule "vendors/sqlite"]
+	path = vendors/sqlite
+	url = https://github.com/Rounak-Paul/sqlite.git
+[submodule "vendors/tree-sitter"]
+	path = vendors/tree-sitter
+	url = https://github.com/Rounak-Paul/tree-sitter.git
+[submodule "vendors/tree-sitter-c"]
+	path = vendors/tree-sitter-c
+	url = https://github.com/Rounak-Paul/tree-sitter-c.git
+[submodule "vendors/tree-sitter-cpp"]
+	path = vendors/tree-sitter-cpp
+	url = https://github.com/Rounak-Paul/tree-sitter-cpp.git
+[submodule "vendors/tree-sitter-python"]
+	path = vendors/tree-sitter-python
+	url = https://github.com/Rounak-Paul/tree-sitter-python.git
+[submodule "vendors/tree-sitter-typescript"]
+	path = vendors/tree-sitter-typescript
+	url = https://github.com/Rounak-Paul/tree-sitter-typescript.git
+[submodule "vendors/tree-sitter-javascript"]
+	path = vendors/tree-sitter-javascript
+	url = https://github.com/Rounak-Paul/tree-sitter-javascript.git
+[submodule "vendors/causality"]
+	path = vendors/causality
+	url = https://github.com/Rounak-Paul/causality.git
+[submodule "vendors/cjson"]
+	path = vendors/cjson
+	url = https://github.com/Rounak-Paul/cJSON.git
+[submodule "vendors/uthash"]
+	path = vendors/uthash
+	url = https://github.com/Rounak-Paul/uthash.git
