@@ -53,6 +53,26 @@ CtxLanguage ctx_lang_from_path(const char *path) {
     return CTX_LANG_UNKNOWN;
 }
 
+static TSTree *parse_source_as(CtxLanguage lang, const char *source, size_t len,
+                               uint32_t *error_count, bool *has_errors) {
+    if (lang == CTX_LANG_UNKNOWN || !source || len > UINT32_MAX) return NULL;
+
+    TSTree *tree = ts_parser_parse_string(s_parsers[lang], NULL, source, (uint32_t)len);
+    if (!tree) return NULL;
+
+    TSNode root = ts_tree_root_node(tree);
+    bool errors = ts_node_has_error(root);
+    if (has_errors) *has_errors = errors;
+    if (error_count) *error_count = errors ? count_error_nodes(root) : 0;
+    return tree;
+}
+
+static bool is_c_family_header(const char *path) {
+    if (!path) return false;
+    const char *dot = strrchr(path, '.');
+    return dot && !strcmp(dot, ".h");
+}
+
 bool ctx_parser_parse_file(const char *path, CtxParseResult *out) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
@@ -91,19 +111,39 @@ bool ctx_parser_parse_file(const char *path, CtxParseResult *out) {
         }
     }
 
-    out->tree = ts_parser_parse_string(s_parsers[out->lang], NULL,
-                                       out->source, (uint32_t)read);
+    if (is_c_family_header(path)) {
+        uint32_t c_errors = 0, cpp_errors = 0;
+        bool c_has_errors = false, cpp_has_errors = false;
+        TSTree *c_tree = parse_source_as(CTX_LANG_C, out->source, read,
+                                         &c_errors, &c_has_errors);
+        TSTree *cpp_tree = parse_source_as(CTX_LANG_CPP, out->source, read,
+                                           &cpp_errors, &cpp_has_errors);
+
+        if (cpp_tree && (!c_tree || cpp_errors < c_errors)) {
+            if (c_tree) ts_tree_delete(c_tree);
+            out->tree = cpp_tree;
+            out->lang = CTX_LANG_CPP;
+            out->has_errors = cpp_has_errors;
+            out->error_count = cpp_errors;
+        } else {
+            if (cpp_tree) ts_tree_delete(cpp_tree);
+            out->tree = c_tree;
+            out->lang = CTX_LANG_C;
+            out->has_errors = c_has_errors;
+            out->error_count = c_errors;
+        }
+    } else {
+        out->tree = parse_source_as(out->lang, out->source, read,
+                                    &out->error_count, &out->has_errors);
+    }
     if (!out->tree) {
         free(out->source);
         out->source = NULL;
         return false;
     }
 
-    TSNode root = ts_tree_root_node(out->tree);
-    out->has_errors = ts_node_has_error(root);
     if (out->has_errors) {
-        out->error_count = count_error_nodes(root);
-        CTX_LOG_DEBUG("Parse errors in %s: %u error nodes", path, out->error_count);
+        CTX_LOG_TRACE("Recoverable parse errors in %s: %u error nodes", path, out->error_count);
     }
     return true;
 }

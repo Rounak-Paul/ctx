@@ -61,36 +61,31 @@ add_ts_grammar(ts_grammar_ts       vendors/tree-sitter-typescript/typescript)
 add_ts_grammar(ts_grammar_tsx      vendors/tree-sitter-typescript/tsx)
 
 # --------------------------------------------------------------------------
-# SQLite — amalgamation build (out-of-source: copy to build dir so no
-# artifacts are ever written back into the vendors/sqlite submodule)
+# SQLite
 # --------------------------------------------------------------------------
-set(SQLITE_SRC_DIR  ${CMAKE_SOURCE_DIR}/vendors/sqlite)
-set(SQLITE_AMALG_C  ${SQLITE_SRC_DIR}/sqlite3.c)
-set(SQLITE_AMALG_H  ${SQLITE_SRC_DIR}/sqlite3.h)
+set(SQLITE_SRC_DIR ${CMAKE_SOURCE_DIR}/vendors/sqlite)
+set(SQLITE_AMALG_C ${SQLITE_SRC_DIR}/sqlite3.c)
+set(SQLITE_AMALG_H ${SQLITE_SRC_DIR}/sqlite3.h)
 
-if(NOT EXISTS ${SQLITE_AMALG_C})
-    message(FATAL_ERROR
-        "SQLite amalgamation not found at vendors/sqlite/sqlite3.c.\n"
-        "Run: git submodule update --init vendors/sqlite")
+if(EXISTS ${SQLITE_AMALG_C} AND EXISTS ${SQLITE_AMALG_H})
+    set(SQLITE_BUILD_DIR ${CMAKE_BINARY_DIR}/sqlite_amalg)
+    file(MAKE_DIRECTORY ${SQLITE_BUILD_DIR})
+    configure_file(${SQLITE_AMALG_C} ${SQLITE_BUILD_DIR}/sqlite3.c COPYONLY)
+    configure_file(${SQLITE_AMALG_H} ${SQLITE_BUILD_DIR}/sqlite3.h COPYONLY)
+
+    add_library(ctx_sqlite STATIC ${SQLITE_BUILD_DIR}/sqlite3.c)
+    target_include_directories(ctx_sqlite PUBLIC ${SQLITE_BUILD_DIR})
+    target_compile_definitions(ctx_sqlite PRIVATE
+        SQLITE_THREADSAFE=2
+        SQLITE_DEFAULT_WAL_SYNCHRONOUS=1
+        SQLITE_OMIT_LOAD_EXTENSION
+    )
+    set_target_properties(ctx_sqlite PROPERTIES POSITION_INDEPENDENT_CODE ON)
+else()
+    find_package(SQLite3 REQUIRED)
+    add_library(ctx_sqlite INTERFACE)
+    target_link_libraries(ctx_sqlite INTERFACE SQLite::SQLite3)
 endif()
-
-# Copy amalgamation into the build tree so the compiler writes its .o there.
-set(SQLITE_BUILD_DIR ${CMAKE_BINARY_DIR}/sqlite_amalg)
-file(MAKE_DIRECTORY ${SQLITE_BUILD_DIR})
-configure_file(${SQLITE_AMALG_C} ${SQLITE_BUILD_DIR}/sqlite3.c COPYONLY)
-configure_file(${SQLITE_AMALG_H} ${SQLITE_BUILD_DIR}/sqlite3.h COPYONLY)
-
-add_library(sqlite3_static STATIC ${SQLITE_BUILD_DIR}/sqlite3.c)
-target_include_directories(sqlite3_static PUBLIC
-    ${SQLITE_BUILD_DIR}
-    ${SQLITE_SRC_DIR}
-)
-target_compile_definitions(sqlite3_static PRIVATE
-    SQLITE_THREADSAFE=2
-    SQLITE_DEFAULT_WAL_SYNCHRONOUS=1
-    SQLITE_OMIT_LOAD_EXTENSION
-)
-set_target_properties(sqlite3_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # --------------------------------------------------------------------------
 # cJSON (static, disable shared + utils + tests)
@@ -129,6 +124,7 @@ if(Vulkan_FOUND AND CAUSALITY_VENDORS_READY)
     message(STATUS "Vulkan found — causality visualization will be built")
     add_compile_definitions(CTX_HAS_CAUSALITY)
     add_subdirectory(vendors/causality EXCLUDE_FROM_ALL)
+    target_compile_definitions(causality PRIVATE NDEBUG)
     set(CTX_CAUSALITY_LIB causality)
 else()
     if(NOT Vulkan_FOUND)
@@ -171,7 +167,7 @@ target_link_libraries(ctx PRIVATE
     ts_grammar_js
     ts_grammar_ts
     ts_grammar_tsx
-    sqlite3_static
+    ctx_sqlite
     cjson
     uthash
     Threads::Threads

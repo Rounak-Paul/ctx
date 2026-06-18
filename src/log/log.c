@@ -163,6 +163,6 @@ void ctx_log_write(CtxLogLevel level,
             ctx_event_emit(level_events[idx], &ev_payload, sizeof(ev_payload));
     }
 
-    /* FATAL aborts after flushing */
-    if (level == CTX_LOG_FATAL) abort();
+    /* FATAL is reported through logs/events. Callers decide whether to retry,
+       degrade, or shut down gracefully. */
 }

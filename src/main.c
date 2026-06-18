@@ -67,6 +67,15 @@ static void cli_progress_loop(void)
 
 int main(int argc, char *argv[])
 {
+    int exit_code = 0;
+    bool event_ready = false;
+    bool jobs_ready = false;
+    bool watcher_ready = false;
+    bool parser_ready = false;
+    bool indexer_ready = false;
+    bool api_ready = false;
+    bool idx_started = false;
+
 #ifdef NDEBUG
     ctx_log_init(CTX_LOG_INFO);
 #else
@@ -84,32 +93,56 @@ int main(int argc, char *argv[])
 
     CtxAppConfig cfg = ctx_app_parse_args(argc, argv);
 
-    if (!ctx_event_system_init())
+    if (!ctx_event_system_init()) {
         CTX_LOG_FATAL("Failed to init event system");
+        exit_code = 1;
+        goto shutdown;
+    }
+    event_ready = true;
 
-    if (!ctx_jobs_init(0))
+    if (!ctx_jobs_init(0)) {
         CTX_LOG_FATAL("Failed to init job system");
+        exit_code = 1;
+        goto shutdown;
+    }
+    jobs_ready = true;
 
-    if (!ctx_watcher_init())
+    if (ctx_watcher_init()) {
+        watcher_ready = true;
+    } else {
         CTX_LOG_WARN("File watcher unavailable — live updates disabled");
+    }
 
-    if (!ctx_parser_init())
+    if (!ctx_parser_init()) {
         CTX_LOG_FATAL("Failed to init parser");
+        exit_code = 1;
+        goto shutdown;
+    }
+    parser_ready = true;
 
-    if (!ctx_indexer_init(cfg.project_path))
+    if (!ctx_indexer_init(cfg.project_path)) {
         CTX_LOG_FATAL("Failed to init indexer for %s", cfg.project_path);
+        exit_code = 1;
+        goto shutdown;
+    }
+    indexer_ready = true;
 
     ctx_event_subscribe(CTX_EVENT_FILE_CREATED,  on_file_change, NULL);
     ctx_event_subscribe(CTX_EVENT_FILE_MODIFIED, on_file_change, NULL);
     ctx_event_subscribe(CTX_EVENT_FILE_DELETED,  on_file_change, NULL);
     ctx_event_subscribe(CTX_EVENT_FILE_RENAMED,  on_file_change, NULL);
 
-    ctx_watcher_add(cfg.project_path, true);
+    if (watcher_ready) ctx_watcher_add(cfg.project_path, true);
 
-    pthread_create(&s_idx_thread, NULL, index_thread, NULL);
+    if (pthread_create(&s_idx_thread, NULL, index_thread, NULL) != 0) {
+        CTX_LOG_FATAL("Failed to start index thread: %s", strerror(errno));
+        exit_code = 1;
+        goto shutdown;
+    }
+    idx_started = true;
 
     if (!cfg.no_api)
-        ctx_api_start(cfg.api_port);
+        api_ready = ctx_api_start(cfg.api_port);
 
     /* Install handlers and unblock signals on main thread only — all threads already created */
     {
@@ -139,21 +172,21 @@ int main(int argc, char *argv[])
         while (!s_quit) { pause(); }
     }
 
-    /* Shutdown — order matters */
-    ctx_event_emit(CTX_EVENT_SHUTDOWN, NULL, 0);
-    if (!cfg.no_api) ctx_api_stop();
-    ctx_watcher_shutdown();
-    if (!s_idx_joined) {
+shutdown:
+    if (event_ready) ctx_event_emit(CTX_EVENT_SHUTDOWN, NULL, 0);
+    if (api_ready) ctx_api_stop();
+    if (watcher_ready) ctx_watcher_shutdown();
+    if (idx_started && !s_idx_joined) {
         pthread_join(s_idx_thread, NULL);
         s_idx_joined = true;
     }
-    ctx_jobs_shutdown();
-    ctx_indexer_shutdown();
-    ctx_parser_shutdown();
+    if (jobs_ready) ctx_jobs_shutdown();
+    if (indexer_ready) ctx_indexer_shutdown();
+    if (parser_ready) ctx_parser_shutdown();
 
     ctx_stats_print_summary();
 
-    ctx_event_system_shutdown();
+    if (event_ready) ctx_event_system_shutdown();
     ctx_log_shutdown();
-    return 0;
+    return exit_code;
 }

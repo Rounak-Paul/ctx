@@ -54,6 +54,48 @@ static CtxSymbolKind sym_kind_for(const char *ntype) {
     return CTX_SYM_UNKNOWN;
 }
 
+static bool str_contains(const char *s, const char *needle) {
+    return s && needle && strstr(s, needle) != NULL;
+}
+
+static bool should_emit_generic_node(TSNode node, const char *ntype) {
+    if (!ntype || !ts_node_is_named(node) || ts_node_is_extra(node)) return false;
+    if (!strcmp(ntype, "comment") || !strcmp(ntype, "string") ||
+        !strcmp(ntype, "string_literal") || !strcmp(ntype, "ERROR")) {
+        return false;
+    }
+    return str_contains(ntype, "declaration") ||
+           str_contains(ntype, "definition") ||
+           str_contains(ntype, "specifier") ||
+           str_contains(ntype, "import") ||
+           str_contains(ntype, "include") ||
+           str_contains(ntype, "namespace") ||
+           str_contains(ntype, "class") ||
+           str_contains(ntype, "struct") ||
+           str_contains(ntype, "enum") ||
+           str_contains(ntype, "typedef") ||
+           str_contains(ntype, "type_alias") ||
+           str_contains(ntype, "function") ||
+           str_contains(ntype, "method");
+}
+
+static void generic_node_name(const char *src, TSNode node, const char *ntype,
+                              char *name, size_t name_sz,
+                              char *signature, size_t signature_sz) {
+    if (!name || name_sz == 0 || !signature || signature_sz == 0) return;
+
+    char text[256];
+    node_text(src, node, text, sizeof(text));
+    for (size_t i = 0; text[i]; ++i) {
+        if ((unsigned char)text[i] < 32) text[i] = ' ';
+    }
+
+    uint32_t line = ts_node_start_point(node).row + 1;
+    uint32_t col = ts_node_start_point(node).column + 1;
+    snprintf(name, name_sz, "%s@%u:%u", ntype ? ntype : "node", line, col);
+    snprintf(signature, signature_sz, "%s", text);
+}
+
 /* ---- recursive AST walk ---- */
 typedef struct {
     CtxGraph   *graph;
@@ -62,10 +104,34 @@ typedef struct {
     char        enclosing_fn[256]; /* name of the innermost function being walked */
 } WalkCtx;
 
-static void walk_node(WalkCtx *ctx, TSNode node, int depth) {
-    if (ts_node_is_null(node)) return;
-    if (depth > 64) return; /* guard against absurd nesting */
+typedef struct {
+    TSNode   node;
+    uint32_t depth;
+    bool     exit_scope;
+    char     restore_fn[256];
+} WalkEntry;
 
+typedef struct {
+    WalkEntry *items;
+    size_t     count;
+    size_t     cap;
+} WalkStack;
+
+static bool walk_stack_push(WalkStack *stack, WalkEntry entry) {
+    if (stack->count >= stack->cap) {
+        size_t next_cap = stack->cap ? stack->cap * 2 : 256;
+        WalkEntry *next = (WalkEntry *)realloc(stack->items, next_cap * sizeof(WalkEntry));
+        if (!next) return false;
+        stack->items = next;
+        stack->cap = next_cap;
+    }
+    stack->items[stack->count++] = entry;
+    return true;
+}
+
+static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn, char pushed_name[256]) {
+    *pushed_fn = false;
+    pushed_name[0] = '\0';
     const char *ntype = ts_node_type(node);
     char namebuf[256] = {0};
     char sigbuf[512]  = {0};
@@ -152,6 +218,13 @@ static void walk_node(WalkCtx *ctx, TSNode node, int depth) {
         }
     }
 
+    if (!emit_sym && should_emit_generic_node(node, ntype)) {
+        generic_node_name(ctx->source, node, ntype, namebuf, sizeof(namebuf),
+                          sigbuf, sizeof(sigbuf));
+        emit_sym = (namebuf[0] != '\0');
+        kind = CTX_SYM_UNKNOWN;
+    }
+
     if (emit_sym && namebuf[0]) {
         CtxSymbol sym = {0};
         sym.id   = ctx_symbol_id(ctx->filepath, namebuf, ts_node_start_point(node).row + 1);
@@ -169,20 +242,61 @@ static void walk_node(WalkCtx *ctx, TSNode node, int depth) {
     }
 
     /* Track enclosing function for call attribution */
-    char saved_fn[256] = {0};
-    bool pushed_fn = (kind == CTX_SYM_FUNCTION || kind == CTX_SYM_METHOD) && namebuf[0];
-    if (pushed_fn) {
-        memcpy(saved_fn, ctx->enclosing_fn, sizeof(saved_fn));
-        strncpy(ctx->enclosing_fn, namebuf, sizeof(ctx->enclosing_fn) - 1);
+    bool entered_fn = (kind == CTX_SYM_FUNCTION || kind == CTX_SYM_METHOD) && namebuf[0];
+    if (entered_fn) {
+        strncpy(pushed_name, namebuf, 255);
+        pushed_name[255] = '\0';
+    }
+    *pushed_fn = entered_fn;
+    return true;
+}
+
+static void walk_tree(WalkCtx *ctx, TSNode root) {
+    if (ts_node_is_null(root)) return;
+
+    WalkStack stack = {0};
+    if (!walk_stack_push(&stack, (WalkEntry){ .node = root })) {
+        CTX_LOG_WARN("Cannot allocate AST walk stack for %s", ctx->filepath);
+        return;
     }
 
-    /* Recurse */
-    uint32_t n = ts_node_child_count(node);
-    for (uint32_t i = 0; i < n; i++)
-        walk_node(ctx, ts_node_child(node, i), depth + 1);
+    while (stack.count > 0) {
+        WalkEntry entry = stack.items[--stack.count];
+        if (entry.exit_scope) {
+            memcpy(ctx->enclosing_fn, entry.restore_fn, sizeof(ctx->enclosing_fn));
+            continue;
+        }
 
-    if (pushed_fn)
-        memcpy(ctx->enclosing_fn, saved_fn, sizeof(ctx->enclosing_fn));
+        if (ts_node_is_null(entry.node)) continue;
+        if (entry.depth > 512) continue;
+
+        bool pushed_fn = false;
+        char pushed_name[256];
+        if (!process_node(ctx, entry.node, &pushed_fn, pushed_name)) continue;
+
+        if (pushed_fn) {
+            WalkEntry exit_entry = { .exit_scope = true };
+            memcpy(exit_entry.restore_fn, ctx->enclosing_fn, sizeof(exit_entry.restore_fn));
+            if (!walk_stack_push(&stack, exit_entry)) break;
+            strncpy(ctx->enclosing_fn, pushed_name, sizeof(ctx->enclosing_fn) - 1);
+            ctx->enclosing_fn[sizeof(ctx->enclosing_fn) - 1] = '\0';
+        }
+
+        uint32_t n = ts_node_child_count(entry.node);
+        for (uint32_t i = n; i > 0; --i) {
+            TSNode child = ts_node_child(entry.node, i - 1);
+            if (!walk_stack_push(&stack, (WalkEntry){
+                    .node = child,
+                    .depth = entry.depth + 1,
+                })) {
+                CTX_LOG_WARN("AST walk stack exhausted while indexing %s", ctx->filepath);
+                stack.count = 0;
+                break;
+            }
+        }
+    }
+
+    free(stack.items);
 }
 
 bool ctx_extract_file(CtxGraph *g, const char *path) {
@@ -193,7 +307,7 @@ bool ctx_extract_file(CtxGraph *g, const char *path) {
 
     TSNode root = ts_tree_root_node(pr.tree);
     WalkCtx wctx = { .graph = g, .source = pr.source, .filepath = path };
-    walk_node(&wctx, root, 0);
+    walk_tree(&wctx, root);
 
     ctx_parser_free_result(&pr);
     return true;

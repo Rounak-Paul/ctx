@@ -157,6 +157,7 @@ char *ctx_context_summary(CtxGraph *g, const char *root_path) {
     sb_appendf(&sb, "| Structs/Enums | %u |\n", structs);
     sb_appendf(&sb, "| Macros | %u |\n", macros);
     sb_appendf(&sb, "| Includes | %u |\n", includes);
+    sb_appendf(&sb, "| Other symbols | %u |\n", other);
     sb_appendf(&sb, "| Edges (relationships) | %u |\n", edges);
     return sb_take(&sb);
 }

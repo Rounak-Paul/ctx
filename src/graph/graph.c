@@ -90,8 +90,9 @@ void ctx_graph_add_symbol(CtxGraph *g, const CtxSymbol *sym) {
     CtxSymbol *existing = NULL;
     HASH_FIND(hh, g->symbols, &sym->id, sizeof(uint64_t), existing);
     if (existing) {
+        UT_hash_handle hh = existing->hh;
         memcpy(existing, sym, sizeof(CtxSymbol));
-        existing->hh = existing->hh; /* preserve hash handle */
+        existing->hh = hh;
     } else {
         CtxSymbol *copy = (CtxSymbol *)malloc(sizeof(CtxSymbol));
         if (copy) {

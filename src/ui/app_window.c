@@ -128,7 +128,6 @@ static void on_graph_updated(const CtxEvent *ev, void *user_data)
 {
     CTX_UNUSED(ev); CTX_UNUSED(user_data);
     s.graph_updated = true;
-    if (s.content_div) ca_div_invalidate(s.content_div);
     ca_instance_wake();
 }
 
@@ -166,6 +165,8 @@ static void on_frame(void *ud)
 
     CtxGraph *g = ctx_indexer_get_graph();
     if (!g) return;
+
+    if (s.content_div) ca_div_invalidate(s.content_div);
 
     char buf[32];
     snprintf(buf, sizeof(buf), "%u", ctx_graph_symbol_count(g));

@@ -11,7 +11,7 @@
  *   INFO    — normal operational messages
  *   WARN    — recoverable unexpected state  (fires CTX_EVENT_LOG_WARN)
  *   ERROR   — operation failed             (fires CTX_EVENT_LOG_ERROR)
- *   FATAL   — unrecoverable, will abort    (fires CTX_EVENT_LOG_FATAL)
+ *   FATAL   — unrecoverable error          (fires CTX_EVENT_LOG_FATAL)
  *
  * Thread-safe: multiple threads may call CTX_LOG_* concurrently.
  * Output: stderr, format:  [HH:MM:SS.mmm] LEVEL  file:line  message

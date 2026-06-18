@@ -5,6 +5,7 @@
 #include "../event/event.h"
 #include "../jobs/jobs.h"
 #include "../log/log.h"
+#include "../stats/stats.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -21,7 +22,7 @@ static volatile bool     s_prog_running = false;
 
 static const char *s_skip_dirs[] = {
     "node_modules", ".git", "build", "bin", "__pycache__",
-    ".cache", "dist", "target", ".svn", ".hg", "vendor", NULL
+    ".cache", "dist", "target", ".svn", ".hg", NULL
 };
 
 static bool should_skip_dir(const char *name) {
@@ -180,6 +181,7 @@ void ctx_indexer_index_all(void) {
 
     CTX_LOG_INFO("Index done: %u symbols, %u edges, %u calls resolved in %"PRId64"ms",
                  s_stats.symbols, s_stats.edges, resolved, dur);
+    ctx_stats_record_index(stale.count, s_stats.symbols, (double)dur);
 
     ctx_store_save_graph(s_graph);
 
