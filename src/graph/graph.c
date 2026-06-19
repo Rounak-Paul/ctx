@@ -189,6 +189,13 @@ CtxSymbol *ctx_graph_find_by_name(CtxGraph *g, const char *name) {
     return found;
 }
 
+CtxSymbol *ctx_graph_find_by_id_locked(CtxGraph *g, uint64_t id) {
+    if (!g) return NULL;
+    CtxSymbol *s = NULL;
+    HASH_FIND(hh, g->symbols, &id, sizeof(uint64_t), s);
+    return s;
+}
+
 void ctx_graph_add_pending_call(CtxGraph *g, const char *caller_file,
                                 const char *caller_name, uint32_t caller_line,
                                 const char *callee_name) {
@@ -243,12 +250,79 @@ void ctx_graph_add_pending_edge(CtxGraph *g, const char *from_file,
 #endif
 }
 
-/* Lightweight name→id map entry for resolution pass */
+/*
+ * Resolution candidate index: name → linked list of every symbol sharing that
+ * name. Resolution ranks candidates by locality (same file/module), definition
+ * preference, and kind so a bare name resolves to the most plausible symbol
+ * instead of an arbitrary first match.
+ */
+typedef struct NameCand {
+    uint64_t         id;
+    const CtxSymbol *sym;        /* borrowed; valid only while graph read-locked */
+    struct NameCand *next;
+} NameCand;
+
 typedef struct NameEntry {
     char           name[256];
-    uint64_t       id;
+    NameCand      *cands;
     UT_hash_handle hh;
 } NameEntry;
+
+/* Module key = directory of the file. Same-module locality is coarser than
+ * same-file but still far better than a global match for common names. */
+static void module_of(const char *file, char *out, size_t out_sz) {
+    out[0] = '\0';
+    if (!file) return;
+    const char *slash = strrchr(file, '/');
+#if defined(CTX_PLATFORM_WINDOWS)
+    const char *bslash = strrchr(file, '\\');
+    if (bslash && (!slash || bslash > slash)) slash = bslash;
+#endif
+    if (!slash) return;
+    size_t len = (size_t)(slash - file);
+    if (len >= out_sz) len = out_sz - 1;
+    memcpy(out, file, len);
+    out[len] = '\0';
+}
+
+static int kind_resolution_rank(CtxSymbolKind k) {
+    switch (k) {
+    case CTX_SYM_FUNCTION: case CTX_SYM_METHOD: return 5;
+    case CTX_SYM_CLASS: case CTX_SYM_STRUCT:    return 4;
+    case CTX_SYM_TYPEDEF: case CTX_SYM_ENUM:    return 3;
+    case CTX_SYM_MACRO: case CTX_SYM_VARIABLE:  return 2;
+    case CTX_SYM_NAMESPACE: case CTX_SYM_INCLUDE: return 1;
+    default:                                    return 0;
+    }
+}
+
+/*
+ * Selects the best target symbol for a pending edge among all candidates with
+ * a matching name. Higher score wins; ties keep the lexically-first id stable.
+ */
+static const CtxSymbol *pick_candidate(const NameCand *cands,
+                                       const char *from_file,
+                                       const char *from_module) {
+    const CtxSymbol *best = NULL;
+    int best_score = INT_MIN;
+    for (const NameCand *c = cands; c; c = c->next) {
+        const CtxSymbol *s = c->sym;
+        int score = 0;
+        if (from_file && !strcmp(s->file, from_file)) score += 100;
+        else if (from_module && from_module[0]) {
+            char m[4096]; module_of(s->file, m, sizeof(m));
+            if (!strcmp(m, from_module)) score += 40;
+        }
+        if (s->is_definition) score += 20;
+        score += kind_resolution_rank(s->kind);
+        if (score > best_score ||
+            (score == best_score && best && s->id < best->id)) {
+            best_score = score;
+            best = s;
+        }
+    }
+    return best;
+}
 
 uint32_t ctx_graph_resolve_calls(CtxGraph *g) {
     if (!g || !g->pending_count) return 0;
@@ -256,7 +330,7 @@ uint32_t ctx_graph_resolve_calls(CtxGraph *g) {
     CTX_LOG_DEBUG("Resolving %u pending semantic edges against %u symbols",
                   g->pending_count, HASH_COUNT(g->symbols));
 
-    /* Build a temporary name→id hash for O(1) lookup during resolution */
+    /* Build name → candidate-list index for ranked O(1) lookup. */
     NameEntry *name_map = NULL;
     ctx_graph_rlock(g);
     {
@@ -265,18 +339,22 @@ uint32_t ctx_graph_resolve_calls(CtxGraph *g) {
             NameEntry *ne = NULL;
             HASH_FIND_STR(name_map, s->name, ne);
             if (!ne) {
-                ne = (NameEntry *)malloc(sizeof(NameEntry));
-                if (ne) {
-                    strncpy(ne->name, s->name, sizeof(ne->name) - 1);
-                    ne->name[sizeof(ne->name)-1] = '\0';
-                    ne->id = s->id;
-                    HASH_ADD_STR(name_map, name, ne);
-                }
+                ne = (NameEntry *)calloc(1, sizeof(NameEntry));
+                if (!ne) continue;
+                strncpy(ne->name, s->name, sizeof(ne->name) - 1);
+                HASH_ADD_STR(name_map, name, ne);
             }
+            NameCand *nc = (NameCand *)malloc(sizeof(NameCand));
+            if (nc) { nc->id = s->id; nc->sym = s; nc->next = ne->cands; ne->cands = nc; }
         }
     }
-    ctx_graph_runlock(g);
 
+    /* Resolve under the read lock into a temp edge buffer, then add edges after
+     * releasing it — ctx_graph_add_edge() takes the write lock and the rwlock is
+     * not recursive. */
+    typedef struct { uint64_t from, to; CtxEdgeKind kind; } ResolvedEdge;
+    ResolvedEdge *out_edges = (ResolvedEdge *)malloc(g->pending_count * sizeof(ResolvedEdge));
+    uint32_t out_count = 0;
     uint32_t resolved = 0;
     uint32_t missed   = 0;
     for (uint32_t i = 0; i < g->pending_count; i++) {
@@ -284,33 +362,54 @@ uint32_t ctx_graph_resolve_calls(CtxGraph *g) {
 
         NameEntry *ce = NULL;
         if (pc->callee_name) HASH_FIND_STR(name_map, pc->callee_name, ce);
-        if (!ce) { missed++; }
+        if (!ce || !ce->cands) { missed++; }
         else {
+            char from_module[4096];
+            module_of(pc->caller_file, from_module, sizeof(from_module));
+            const CtxSymbol *target =
+                pick_candidate(ce->cands, pc->caller_file, from_module);
+
             uint64_t caller_id;
             if (pc->caller_name) {
                 NameEntry *cre = NULL;
                 HASH_FIND_STR(name_map, pc->caller_name, cre);
-                caller_id = cre ? cre->id
+                const CtxSymbol *src = cre && cre->cands
+                    ? pick_candidate(cre->cands, pc->caller_file, from_module)
+                    : NULL;
+                caller_id = src ? src->id
                                 : ctx_symbol_id(pc->caller_file ? pc->caller_file : "",
                                                 pc->caller_name, pc->caller_line);
             } else {
                 caller_id = ctx_symbol_id(pc->caller_file ? pc->caller_file : "",
                                           pc->callee_name, pc->caller_line);
             }
-            ctx_graph_add_edge(g, caller_id, ce->id, pc->kind);
-            resolved++;
+            if (target && caller_id != target->id && out_edges) {
+                out_edges[out_count].from = caller_id;
+                out_edges[out_count].to   = target->id;
+                out_edges[out_count].kind = pc->kind;
+                out_count++;
+                resolved++;
+            }
         }
 
-        /* Free heap strings */
         free(pc->caller_file);
         free(pc->caller_name);
         free(pc->callee_name);
     }
+    ctx_graph_runlock(g);
 
-    /* Free name map */
+    for (uint32_t i = 0; i < out_count; i++)
+        ctx_graph_add_edge(g, out_edges[i].from, out_edges[i].to, out_edges[i].kind);
+    free(out_edges);
+
     {
         NameEntry *ne, *ntmp;
-        HASH_ITER(hh, name_map, ne, ntmp) { HASH_DEL(name_map, ne); free(ne); }
+        HASH_ITER(hh, name_map, ne, ntmp) {
+            NameCand *c = ne->cands;
+            while (c) { NameCand *nx = c->next; free(c); c = nx; }
+            HASH_DEL(name_map, ne);
+            free(ne);
+        }
     }
 
     CTX_LOG_DEBUG("Resolve complete: %u edges added, %u unresolved (target not in graph)", resolved, missed);

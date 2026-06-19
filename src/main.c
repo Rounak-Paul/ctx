@@ -10,6 +10,7 @@
 #include "api/api.h"
 #include "stats/stats.h"
 #include "ui/app_window.h"
+#include "bench/bench.h"
 
 static volatile sig_atomic_t s_quit = 0;
 static void on_sigint(int sig) { CTX_UNUSED(sig); s_quit = 1; }
@@ -140,6 +141,12 @@ int main(int argc, char *argv[])
         goto shutdown;
     }
     idx_started = true;
+
+    if (cfg.bench) {
+        cli_progress_loop();   /* joins the index thread */
+        exit_code = ctx_bench_run(ctx_indexer_get_graph());
+        goto shutdown;
+    }
 
     if (!cfg.no_api)
         api_ready = ctx_api_start(cfg.api_port);

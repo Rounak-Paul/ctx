@@ -26,3 +26,6 @@ Makefile
 # OS
 .DS_Store
 Thumbs.db
+
+# clangd index
+.cache/

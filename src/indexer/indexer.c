@@ -15,7 +15,7 @@ static CtxGraph     *s_graph    = NULL;
 static char          s_root[4096] = {0};
 static CtxGraphStats s_stats    = {0};
 
-#define CTX_SEMANTIC_INDEX_VERSION "2"
+#define CTX_SEMANTIC_INDEX_VERSION "3"
 
 /* Progress — written by indexer thread, read by UI/CLI */
 static volatile uint32_t s_prog_total   = 0;

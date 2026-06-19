@@ -23,6 +23,37 @@ static bool exec_sql(const char *sql) {
     return true;
 }
 
+/* Bumped whenever the symbols/edges table layout changes. A mismatch drops the
+ * cached tables so they are rebuilt with the current columns — no manual delete. */
+#define CTX_STORE_SCHEMA_VERSION 2
+
+static void migrate_schema(void) {
+    exec_sql("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);");
+    sqlite3_stmt *stmt = NULL;
+    int stored = 0;
+    if (sqlite3_prepare_v2(s_db, "SELECT value FROM meta WHERE key='schema_version';",
+                           -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *v = (const char *)sqlite3_column_text(stmt, 0);
+            stored = v ? atoi(v) : 0;
+        }
+        sqlite3_finalize(stmt);
+    }
+    if (stored != CTX_STORE_SCHEMA_VERSION) {
+        CTX_LOG_INFO("Store schema %d → %d; rebuilding cached tables", stored, CTX_STORE_SCHEMA_VERSION);
+        exec_sql("DROP TABLE IF EXISTS symbols; DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS files;");
+        char vbuf[16];
+        snprintf(vbuf, sizeof(vbuf), "%d", CTX_STORE_SCHEMA_VERSION);
+        sqlite3_stmt *up = NULL;
+        if (sqlite3_prepare_v2(s_db, "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?);",
+                               -1, &up, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(up, 1, vbuf, -1, SQLITE_STATIC);
+            sqlite3_step(up);
+            sqlite3_finalize(up);
+        }
+    }
+}
+
 static bool create_schema(void) {
     return exec_sql(
         "CREATE TABLE IF NOT EXISTS meta("
@@ -33,7 +64,8 @@ static bool create_schema(void) {
         "CREATE TABLE IF NOT EXISTS symbols("
         "  id INTEGER PRIMARY KEY, name TEXT, file TEXT,"
         "  line INTEGER, col INTEGER, kind INTEGER,"
-        "  signature TEXT, is_definition INTEGER);"
+        "  signature TEXT, is_definition INTEGER,"
+        "  end_line INTEGER, scope TEXT, lang INTEGER);"
         "CREATE TABLE IF NOT EXISTS edges("
         "  from_id INTEGER, to_id INTEGER, kind INTEGER,"
         "  PRIMARY KEY(from_id, to_id, kind));"
@@ -113,6 +145,7 @@ bool ctx_store_open(const char *db_path) {
     sqlite3_exec(s_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
     sqlite3_exec(s_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
     sqlite3_exec(s_db, "PRAGMA foreign_keys=ON;", NULL, NULL, NULL);
+    migrate_schema();
     bool ok = create_schema();
     pthread_mutex_unlock(&s_lock);
     CTX_LOG_INFO("Store opened: %s", db_path);
@@ -134,8 +167,8 @@ bool ctx_store_save_graph(CtxGraph *g) {
     /* Upsert symbols */
     sqlite3_stmt *sym_stmt = NULL;
     sqlite3_prepare_v2(s_db,
-        "INSERT OR REPLACE INTO symbols(id,name,file,line,col,kind,signature,is_definition)"
-        " VALUES(?,?,?,?,?,?,?,?);", -1, &sym_stmt, NULL);
+        "INSERT OR REPLACE INTO symbols(id,name,file,line,col,kind,signature,is_definition,end_line,scope,lang)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?);", -1, &sym_stmt, NULL);
 
     ctx_graph_rlock(g);
     CtxSymbol *s;
@@ -148,6 +181,9 @@ bool ctx_store_save_graph(CtxGraph *g) {
         sqlite3_bind_int  (sym_stmt, 6, (int)s->kind);
         sqlite3_bind_text (sym_stmt, 7, s->signature, -1, SQLITE_STATIC);
         sqlite3_bind_int  (sym_stmt, 8, s->is_definition ? 1 : 0);
+        sqlite3_bind_int  (sym_stmt, 9, (int)s->end_line);
+        sqlite3_bind_text (sym_stmt, 10, s->scope,    -1, SQLITE_STATIC);
+        sqlite3_bind_int  (sym_stmt, 11, (int)s->lang);
         sqlite3_step(sym_stmt);
         sqlite3_reset(sym_stmt);
     }
@@ -181,7 +217,7 @@ bool ctx_store_load_graph(CtxGraph *g) {
     /* Load symbols */
     sqlite3_stmt *stmt = NULL;
     sqlite3_prepare_v2(s_db,
-        "SELECT id,name,file,line,col,kind,signature,is_definition FROM symbols;",
+        "SELECT id,name,file,line,col,kind,signature,is_definition,end_line,scope,lang FROM symbols;",
         -1, &stmt, NULL);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         CtxSymbol sym = {0};
@@ -193,9 +229,13 @@ bool ctx_store_load_graph(CtxGraph *g) {
         sym.kind         = (CtxSymbolKind)sqlite3_column_int(stmt, 5);
         const char *sig  = (const char *)sqlite3_column_text(stmt, 6);
         sym.is_definition = sqlite3_column_int(stmt, 7) != 0;
+        sym.end_line     = (uint32_t)sqlite3_column_int(stmt, 8);
+        const char *scp  = (const char *)sqlite3_column_text(stmt, 9);
+        sym.lang         = (uint8_t)sqlite3_column_int(stmt, 10);
         if (nm) strncpy(sym.name,      nm,  sizeof(sym.name)      - 1);
         if (fl) strncpy(sym.file,      fl,  sizeof(sym.file)      - 1);
         if (sig) strncpy(sym.signature, sig, sizeof(sym.signature) - 1);
+        if (scp) strncpy(sym.scope,     scp, sizeof(sym.scope)     - 1);
         ctx_graph_add_symbol(g, &sym);
     }
     sqlite3_finalize(stmt);

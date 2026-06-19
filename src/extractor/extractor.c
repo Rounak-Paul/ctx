@@ -192,6 +192,30 @@ static void emit_inheritance_edges(CtxGraph *graph, const char *source,
     }
 }
 
+/* C keywords and ubiquitous identifiers that should never become reference
+ * edges — they create dense, meaningless graph noise across the whole index. */
+static bool is_noise_identifier(const char *name) {
+    if (!name || !name[0]) return false;
+    size_t len = strlen(name);
+    if (len < 3) return true; /* i, j, n, fd, ok … too ambiguous to resolve */
+    static const char *noise[] = {
+        "int","char","void","bool","float","double","long","short","unsigned",
+        "signed","const","static","struct","class","enum","union","return",
+        "true","false","null","NULL","size_t","this","self","auto","new",
+        "delete","public","private","protected","virtual","override","template",
+        "typename","namespace","using","include","define","ifdef","endif",
+        "for","while","switch","case","break","continue","else","sizeof",
+        NULL
+    };
+    for (int i = 0; noise[i]; i++) if (!strcmp(name, noise[i])) return true;
+    return false;
+}
+
+static bool is_variable_decl(const char *ntype) {
+    return ntype && (!strcmp(ntype, "lexical_declaration") ||  /* JS const/let */
+                     !strcmp(ntype, "variable_declaration"));
+}
+
 /* ---- symbol kind from node type string ---- */
 static CtxSymbolKind sym_kind_for(const char *ntype) {
     if (!strcmp(ntype, "function_definition") || !strcmp(ntype, "function_declaration"))
@@ -257,7 +281,9 @@ typedef struct {
     CtxGraph   *graph;
     const char *source;
     const char *filepath;
+    uint8_t     lang;
     char        enclosing_fn[256]; /* name of the innermost function being walked */
+    char        enclosing_scope[256]; /* nearest class/struct/namespace for scope tagging */
 } WalkCtx;
 
 typedef struct {
@@ -265,6 +291,7 @@ typedef struct {
     uint32_t depth;
     bool     exit_scope;
     char     restore_fn[256];
+    char     restore_scope[256];
 } WalkEntry;
 
 typedef struct {
@@ -285,8 +312,10 @@ static bool walk_stack_push(WalkStack *stack, WalkEntry entry) {
     return true;
 }
 
-static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn, char pushed_name[256]) {
+static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
+                         bool *pushed_scope, char pushed_name[256]) {
     *pushed_fn = false;
+    *pushed_scope = false;
     pushed_name[0] = '\0';
     const char *ntype = ts_node_type(node);
     char namebuf[256] = {0};
@@ -372,6 +401,16 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn, char pushed
                                            ctx->enclosing_fn, call_line, callee_name);
             }
         }
+    } else if (!ctx->enclosing_fn[0] && is_variable_decl(ntype)) {
+        /* Module-level variables/constants only — locals are graph noise. */
+        char vname[256] = {0};
+        symbol_name_from_node(ctx->source, node, vname, sizeof(vname));
+        if (vname[0] && !is_noise_identifier(vname)) {
+            strncpy(namebuf, vname, sizeof(namebuf) - 1);
+            node_text(ctx->source, node, sigbuf, sizeof(sigbuf));
+            kind = CTX_SYM_VARIABLE;
+            emit_sym = true;
+        }
     }
 
     if (!emit_sym && should_emit_generic_node(node, ntype)) {
@@ -387,8 +426,11 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn, char pushed
         strncpy(sym.name,      namebuf,         sizeof(sym.name)      - 1);
         strncpy(sym.file,      ctx->filepath,   sizeof(sym.file)      - 1);
         strncpy(sym.signature, sigbuf[0] ? sigbuf : namebuf, sizeof(sym.signature) - 1);
+        strncpy(sym.scope,     ctx->enclosing_scope, sizeof(sym.scope) - 1);
         sym.line         = ts_node_start_point(node).row + 1;
         sym.col          = ts_node_start_point(node).column + 1;
+        sym.end_line     = ts_node_end_point(node).row + 1;
+        sym.lang         = ctx->lang;
         sym.kind         = kind;
         sym.is_definition = (!strcmp(ntype, "function_definition") ||
                              !strcmp(ntype, "class_definition")    ||
@@ -403,7 +445,8 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn, char pushed
                !is_call_target(node) && !is_declaration_name(node)) {
         char ref_name[256] = {0};
         symbol_name_from_node(ctx->source, node, ref_name, sizeof(ref_name));
-        if (ref_name[0] && strcmp(ref_name, ctx->enclosing_fn) != 0) {
+        if (ref_name[0] && !is_noise_identifier(ref_name) &&
+            strcmp(ref_name, ctx->enclosing_fn) != 0) {
             uint32_t ref_line = ts_node_start_point(node).row + 1;
             ctx_graph_add_pending_edge(ctx->graph, ctx->filepath,
                                        ctx->enclosing_fn, ref_line,
@@ -411,13 +454,17 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn, char pushed
         }
     }
 
-    /* Track enclosing function for call attribution */
+    /* Track enclosing function for call attribution and class/namespace for
+     * scope tagging. Both use the same save/restore mechanism in walk_tree. */
     bool entered_fn = (kind == CTX_SYM_FUNCTION || kind == CTX_SYM_METHOD) && namebuf[0];
-    if (entered_fn) {
+    bool entered_scope = (kind == CTX_SYM_CLASS || kind == CTX_SYM_STRUCT ||
+                          kind == CTX_SYM_NAMESPACE) && namebuf[0];
+    if (entered_fn || entered_scope) {
         strncpy(pushed_name, namebuf, 255);
         pushed_name[255] = '\0';
     }
     *pushed_fn = entered_fn;
+    *pushed_scope = entered_scope;
     return true;
 }
 
@@ -434,22 +481,30 @@ static void walk_tree(WalkCtx *ctx, TSNode root) {
         WalkEntry entry = stack.items[--stack.count];
         if (entry.exit_scope) {
             memcpy(ctx->enclosing_fn, entry.restore_fn, sizeof(ctx->enclosing_fn));
+            memcpy(ctx->enclosing_scope, entry.restore_scope, sizeof(ctx->enclosing_scope));
             continue;
         }
 
         if (ts_node_is_null(entry.node)) continue;
         if (entry.depth > 512) continue;
 
-        bool pushed_fn = false;
+        bool pushed_fn = false, pushed_scope = false;
         char pushed_name[256];
-        if (!process_node(ctx, entry.node, &pushed_fn, pushed_name)) continue;
+        if (!process_node(ctx, entry.node, &pushed_fn, &pushed_scope, pushed_name)) continue;
 
-        if (pushed_fn) {
+        if (pushed_fn || pushed_scope) {
             WalkEntry exit_entry = { .exit_scope = true };
             memcpy(exit_entry.restore_fn, ctx->enclosing_fn, sizeof(exit_entry.restore_fn));
+            memcpy(exit_entry.restore_scope, ctx->enclosing_scope, sizeof(exit_entry.restore_scope));
             if (!walk_stack_push(&stack, exit_entry)) break;
-            strncpy(ctx->enclosing_fn, pushed_name, sizeof(ctx->enclosing_fn) - 1);
-            ctx->enclosing_fn[sizeof(ctx->enclosing_fn) - 1] = '\0';
+            if (pushed_fn) {
+                strncpy(ctx->enclosing_fn, pushed_name, sizeof(ctx->enclosing_fn) - 1);
+                ctx->enclosing_fn[sizeof(ctx->enclosing_fn) - 1] = '\0';
+            }
+            if (pushed_scope) {
+                strncpy(ctx->enclosing_scope, pushed_name, sizeof(ctx->enclosing_scope) - 1);
+                ctx->enclosing_scope[sizeof(ctx->enclosing_scope) - 1] = '\0';
+            }
         }
 
         uint32_t n = ts_node_child_count(entry.node);
@@ -476,7 +531,8 @@ bool ctx_extract_file(CtxGraph *g, const char *path) {
     if (!ctx_parser_parse_file(path, &pr)) return false;
 
     TSNode root = ts_tree_root_node(pr.tree);
-    WalkCtx wctx = { .graph = g, .source = pr.source, .filepath = path };
+    WalkCtx wctx = { .graph = g, .source = pr.source, .filepath = path,
+                     .lang = (uint8_t)pr.lang };
     walk_tree(&wctx, root);
 
     ctx_parser_free_result(&pr);

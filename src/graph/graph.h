@@ -18,8 +18,11 @@ typedef struct {
     char          file[4096];
     uint32_t      line;
     uint32_t      col;
+    uint32_t      end_line;     /* last source line of the symbol body (>= line) */
     CtxSymbolKind kind;
     char          signature[512];
+    char          scope[256];   /* enclosing function/class/namespace, "" at file scope */
+    uint8_t       lang;         /* CtxLanguage of the owning file */
     bool          is_definition;
     UT_hash_handle hh;
 } CtxSymbol;
@@ -71,6 +74,9 @@ void      ctx_graph_remove_file(CtxGraph *g, const char *path);
 uint32_t  ctx_graph_symbol_count(CtxGraph *g);
 uint32_t  ctx_graph_edge_count(CtxGraph *g);
 CtxSymbol *ctx_graph_find_by_name(CtxGraph *g, const char *name); /* first match */
+
+/* Find a symbol by its id. Caller must hold at least a read lock. */
+CtxSymbol *ctx_graph_find_by_id_locked(CtxGraph *g, uint64_t id);
 
 void ctx_graph_rlock(CtxGraph *g);
 void ctx_graph_runlock(CtxGraph *g);

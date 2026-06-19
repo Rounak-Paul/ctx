@@ -1,5 +1,6 @@
 #include "api.h"
 #include "../context/context.h"
+#include "../retrieve/retrieve.h"
 #include "../indexer/indexer.h"
 #include "../stats/stats.h"
 #include "../log/log.h"
@@ -8,6 +9,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <ctype.h>
 
 /* Graph is always fetched live from the indexer — no stale pointer. */
 static volatile bool s_running = false;
@@ -85,9 +87,19 @@ static char *get_param(const char *query, const char *key) {
             const char *end = strchr(p, '&');
             size_t vlen = end ? (size_t)(end - p) : strlen(p);
             char *val = (char *)malloc(vlen + 1);
-            memcpy(val, p, vlen); val[vlen] = '\0';
-            /* URL-decode spaces */
-            for (size_t i = 0; val[i]; i++) if (val[i] == '+') val[i] = ' ';
+            if (!val) return NULL;
+            /* URL-decode: '+' → space, %XX → byte */
+            size_t w = 0;
+            for (size_t i = 0; i < vlen; i++) {
+                if (p[i] == '+') { val[w++] = ' '; }
+                else if (p[i] == '%' && i + 2 < vlen &&
+                         isxdigit((unsigned char)p[i+1]) && isxdigit((unsigned char)p[i+2])) {
+                    char hex[3] = { p[i+1], p[i+2], 0 };
+                    val[w++] = (char)strtol(hex, NULL, 16);
+                    i += 2;
+                } else { val[w++] = p[i]; }
+            }
+            val[w] = '\0';
             return val;
         }
         p = strchr(p, '&');
@@ -162,12 +174,66 @@ static void handle_reindex(int fd) {
     send_json(fd, 200, "{\"status\":\"reindex_started\"}");
 }
 
+/* Parses ?budget= (tokens) and ?format=json|markdown from a query string. */
+static uint32_t parse_budget(const char *query) {
+    char *b = get_param(query, "budget");
+    uint32_t budget = 0;
+    if (b) { long v = strtol(b, NULL, 10); if (v > 0) budget = (uint32_t)v; free(b); }
+    return budget;
+}
+
+static CtxFormat parse_format(const char *query) {
+    char *f = get_param(query, "format");
+    CtxFormat fmt = CTX_FMT_MARKDOWN;
+    if (f) { if (!strcasecmp(f, "json")) fmt = CTX_FMT_JSON; free(f); }
+    return fmt;
+}
+
+static void send_retrieval(int fd, char *result, CtxFormat fmt) {
+    if (fmt == CTX_FMT_JSON) send_json(fd, 200, result);
+    else send_text(fd, result);
+    free(result);
+}
+
+static void handle_context(int fd, const char *query, const char *route) {
+    /* route: NULL → task; "symbol"/"file" → anchored */
+    CtxFormat fmt = parse_format(query);
+    uint32_t budget = parse_budget(query);
+    CtxRetrieveRequest req = { .budget = budget, .format = fmt };
+    char *arg = NULL;
+
+    if (!route) {
+        arg = get_param(query, "task");
+        req.kind = CTX_QUERY_TASK;
+    } else if (!strcmp(route, "symbol")) {
+        arg = get_param(query, "name");
+        req.kind = CTX_QUERY_SYMBOL;
+    } else {
+        arg = get_param(query, "path");
+        req.kind = CTX_QUERY_FILE;
+    }
+
+    if (!arg || !arg[0]) {
+        free(arg);
+        send_json(fd, 400, "{\"error\":\"missing required parameter\"}");
+        return;
+    }
+    req.text = arg;
+    char *result = ctx_retrieve(get_graph(), &req);
+    send_retrieval(fd, result, fmt);
+    ctx_stats_record_query(route ? route : "/context", 0);
+    free(arg);
+}
+
 static void handle_request(int fd) {
     HttpReq req = {0};
     if (!parse_request(fd, &req)) { close(fd); return; }
     CTX_LOG_DEBUG("API %s %s", req.method, req.path);
 
     if (!strcmp(req.path, "/health"))      handle_health(fd);
+    else if (!strcmp(req.path, "/context"))        handle_context(fd, req.query, NULL);
+    else if (!strcmp(req.path, "/context/symbol")) handle_context(fd, req.query, "symbol");
+    else if (!strcmp(req.path, "/context/file"))   handle_context(fd, req.query, "file");
     else if (!strcmp(req.path, "/summary")) handle_summary(fd);
     else if (!strcmp(req.path, "/symbol"))  handle_symbol(fd, req.query);
     else if (!strcmp(req.path, "/file"))    handle_file(fd, req.query);

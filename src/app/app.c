@@ -23,6 +23,10 @@ CtxAppConfig ctx_app_parse_args(int argc, char **argv)
             cfg.gui_mode = false;
         } else if (!strcmp(argv[i], "--no-api")) {
             cfg.no_api = true;
+        } else if (!strcmp(argv[i], "--bench")) {
+            cfg.bench   = true;
+            cfg.gui_mode = false;
+            cfg.no_api  = true;
         } else if (!strcmp(argv[i], "--project") && i + 1 < argc) {
             strncpy(cfg.project_path, argv[++i], sizeof(cfg.project_path) - 1);
         } else if (!strcmp(argv[i], "--api-port") && i + 1 < argc) {
