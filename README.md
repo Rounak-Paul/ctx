@@ -43,9 +43,6 @@ remaining matches are listed under "omitted".
 | GET | `/health` | Liveness probe |
 | POST | `/reindex` | Trigger a re-index |
 
-Legacy endpoints `/summary`, `/symbol`, `/file`, `/query` remain for backward
-compatibility.
-
 ### Example
 
 ```sh

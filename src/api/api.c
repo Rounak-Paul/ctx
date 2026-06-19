@@ -1,5 +1,4 @@
 #include "api.h"
-#include "../context/context.h"
 #include "../retrieve/retrieve.h"
 #include "../indexer/indexer.h"
 #include "../stats/stats.h"
@@ -114,47 +113,6 @@ static void handle_health(int fd) {
     send_json(fd, 200, "{\"status\":\"ok\"}");
 }
 
-static void handle_summary(int fd) {
-    CtxGraph *g = get_graph();
-    char *text = ctx_context_summary(g, NULL);
-    send_text(fd, text);
-    free(text);
-    ctx_stats_record_query("/summary", 0);
-}
-
-static void handle_symbol(int fd, const char *query) {
-    char *name = get_param(query, "name");
-    if (!name) { send_json(fd, 400, "{\"error\":\"missing ?name=\"}"); return; }
-    CtxGraph *g = get_graph();
-    char *text = ctx_context_for_symbol(g, name);
-    free(name);
-    send_text(fd, text);
-    free(text);
-    ctx_stats_record_query("/symbol", 0);
-}
-
-static void handle_file(int fd, const char *query) {
-    char *path = get_param(query, "path");
-    if (!path) { send_json(fd, 400, "{\"error\":\"missing ?path=\"}"); return; }
-    CtxGraph *g = get_graph();
-    char *text = ctx_context_for_file(g, path);
-    free(path);
-    send_text(fd, text);
-    free(text);
-    ctx_stats_record_query("/file", 0);
-}
-
-static void handle_query(int fd, const char *query) {
-    char *q = get_param(query, "q");
-    if (!q) { send_json(fd, 400, "{\"error\":\"missing ?q=\"}"); return; }
-    CtxGraph *g = get_graph();
-    char *text = ctx_context_query(g, q, 20);
-    free(q);
-    send_text(fd, text);
-    free(text);
-    ctx_stats_record_query("/query", 0);
-}
-
 static void handle_stats(int fd) {
     CtxGraph *g = get_graph();
     CtxGraphStats gs = {0};
@@ -230,15 +188,11 @@ static void handle_request(int fd) {
     if (!parse_request(fd, &req)) { close(fd); return; }
     CTX_LOG_DEBUG("API %s %s", req.method, req.path);
 
-    if (!strcmp(req.path, "/health"))      handle_health(fd);
+    if (!strcmp(req.path, "/health"))              handle_health(fd);
     else if (!strcmp(req.path, "/context"))        handle_context(fd, req.query, NULL);
     else if (!strcmp(req.path, "/context/symbol")) handle_context(fd, req.query, "symbol");
     else if (!strcmp(req.path, "/context/file"))   handle_context(fd, req.query, "file");
-    else if (!strcmp(req.path, "/summary")) handle_summary(fd);
-    else if (!strcmp(req.path, "/symbol"))  handle_symbol(fd, req.query);
-    else if (!strcmp(req.path, "/file"))    handle_file(fd, req.query);
-    else if (!strcmp(req.path, "/query"))   handle_query(fd, req.query);
-    else if (!strcmp(req.path, "/stats"))   handle_stats(fd);
+    else if (!strcmp(req.path, "/stats"))          handle_stats(fd);
     else if (!strcmp(req.path, "/reindex") && !strcmp(req.method, "POST")) handle_reindex(fd);
     else send_json(fd, 404, "{\"error\":\"not found\"}");
 
