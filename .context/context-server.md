@@ -20,6 +20,10 @@ language. Edges: calls, references, inherits, includes, defines.
 - Pending edges: calls (from enclosing fn), references (enclosing fn → resolved
   identifier, filtered by `is_noise_identifier` to drop keywords/short names),
   inheritance (from base-clause/heritage nodes).
+- `is_noise_identifier`: blocks identifiers shorter than 5 chars, all C/C++
+  keywords, and a curated list of ubiquitous field names (`width`, `height`,
+  `count`, `value`, `state`, `text`, `node`, etc.) that consistently resolve
+  to the wrong vendor symbol.
 - Scope + enclosing-fn tracked via save/restore entries pushed onto the walk
   stack.
 - Generic fallback nodes are still emitted as `CTX_SYM_UNKNOWN` for graph
@@ -35,6 +39,14 @@ language. Edges: calls, references, inherits, includes, defines.
   lock).
 
 ## Retrieval engine (`retrieve/retrieve.c`)
+- `/context/symbol`: exact `strcasecmp` match preferred (score 120+kind); falls
+  back to case-insensitive substring match (score 80+kind) so the endpoint
+  never returns empty on near-miss names. Anchor text is whitespace-trimmed
+  before matching to handle URL-decoding artifacts.
+- `collect_neighbors`: reference edges that cross from non-vendor source to a
+  vendor target are suppressed — these are almost always false resolutions of
+  common field names emitted during extraction.
+
 - Tokenize task → terms (stopword-filtered, light stemming: -ing/-ed/-s).
 - `score_symbol`: name exact/substr, filename, signature, scope matches +
   term-coverage + kind importance + definition bonus − vendor penalty. UNKNOWN
@@ -52,7 +64,7 @@ language. Edges: calls, references, inherits, includes, defines.
 ## Cache/versioning (`store/store.c`, `indexer/indexer.c`)
 - `CTX_STORE_SCHEMA_VERSION` (store table layout) → `migrate_schema` drops
   stale symbol/edge/file tables on mismatch.
-- `CTX_SEMANTIC_INDEX_VERSION` (extraction semantics, currently "3") → indexer
+- `CTX_SEMANTIC_INDEX_VERSION` (extraction semantics, currently "4") → indexer
   forces re-extraction of all files when changed.
 - Both bump automatically; no manual cache deletion. Bump SCHEMA when symbol
   columns change; bump SEMANTIC when extraction/resolution behavior changes.

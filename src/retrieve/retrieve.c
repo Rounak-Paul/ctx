@@ -253,9 +253,13 @@ typedef struct {
 } Neighbor;
 
 /* Collects up to CTX_MAX_NEIGHBORS related symbols for one seed. Caller holds
- * the read lock. */
+ * the read lock. Reference edges that cross from non-vendor code into vendor
+ * code are suppressed — they are almost always noisy false resolutions of
+ * common field names to unrelated vendor symbols. */
 static uint32_t collect_neighbors(CtxGraph *g, uint64_t seed_id,
+                                  const char *seed_file,
                                   Neighbor *out, uint32_t max) {
+    bool seed_is_vendor = is_vendor_path(seed_file);
     uint32_t n = 0;
     for (CtxEdgeEntry *e = g->edges; e && n < max; e = (CtxEdgeEntry *)e->hh.next) {
         uint64_t other = 0; bool outgoing = false;
@@ -264,6 +268,9 @@ static uint32_t collect_neighbors(CtxGraph *g, uint64_t seed_id,
         else continue;
         const CtxSymbol *os = ctx_graph_find_by_id_locked(g, other);
         if (!os) continue;
+        /* Drop reference edges that drag non-vendor seeds into vendor files. */
+        if (e->kind == CTX_EDGE_REFERENCES && !seed_is_vendor && is_vendor_path(os->file))
+            continue;
         bool dup = false;
         for (uint32_t i = 0; i < n; i++) if (out[i].sym->id == os->id) { dup = true; break; }
         if (dup) continue;
@@ -499,6 +506,19 @@ char *ctx_retrieve(CtxGraph *g, const CtxRetrieveRequest *req) {
     }
     if (q.count == 0) return error_payload(req->format, "query has no usable terms");
 
+    /* Trim whitespace from anchor text for symbol/file queries so that URL
+     * decoding artifacts or trailing newlines don't break exact matching. */
+    char anchor_buf[512] = {0};
+    const char *anchor = req->text;
+    if (req->kind == CTX_QUERY_SYMBOL || req->kind == CTX_QUERY_FILE) {
+        strncpy(anchor_buf, req->text, sizeof(anchor_buf) - 1);
+        char *p = anchor_buf;
+        while (*p && isspace((unsigned char)*p)) p++;
+        char *end = p + strlen(p);
+        while (end > p && isspace((unsigned char)*(end - 1))) *--end = '\0';
+        anchor = p;
+    }
+
     ctx_graph_rlock(g);
 
     /* 1. text-score every symbol → bounded ranked seed set */
@@ -507,13 +527,18 @@ char *ctx_retrieve(CtxGraph *g, const CtxRetrieveRequest *req) {
         CtxSymbol *s, *tmp;
         HASH_ITER(hh, g->symbols, s, tmp) {
             if (req->kind == CTX_QUERY_FILE) {
-                if (strcmp(s->file, req->text) != 0) continue;
+                if (strcmp(s->file, anchor) != 0) continue;
                 seeds_offer(&seeds, s, 100 + kind_importance(s->kind), "in target file");
                 continue;
             }
             if (req->kind == CTX_QUERY_SYMBOL) {
-                if (strcasecmp(s->name, req->text) != 0) continue;
-                seeds_offer(&seeds, s, 100 + kind_importance(s->kind), "exact symbol");
+                /* Exact match preferred; fall back to case-insensitive substring
+                 * so the endpoint never returns empty for near-miss names. */
+                if (!strcasecmp(s->name, anchor)) {
+                    seeds_offer(&seeds, s, 120 + kind_importance(s->kind), "exact symbol");
+                } else if (ci_substr(s->name, anchor) || ci_substr(anchor, s->name)) {
+                    seeds_offer(&seeds, s, 80 + kind_importance(s->kind), "symbol substr");
+                }
                 continue;
             }
             double sc = score_symbol(s, &q);
@@ -531,7 +556,8 @@ char *ctx_retrieve(CtxGraph *g, const CtxRetrieveRequest *req) {
         items[i].score  = seeds.items[i].score;
         items[i].reason = seeds.items[i].reason;
         items[i].neighbor_count =
-            collect_neighbors(g, items[i].sym->id, items[i].neighbors, CTX_MAX_NEIGHBORS);
+            collect_neighbors(g, items[i].sym->id, items[i].sym->file,
+                              items[i].neighbors, CTX_MAX_NEIGHBORS);
     }
     ctx_graph_runlock(g);
 

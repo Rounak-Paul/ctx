@@ -192,19 +192,29 @@ static void emit_inheritance_edges(CtxGraph *graph, const char *source,
     }
 }
 
-/* C keywords and ubiquitous identifiers that should never become reference
- * edges — they create dense, meaningless graph noise across the whole index. */
+/* C/C++ keywords and common short field names that should never become
+ * reference edges — they create dense, meaningless graph noise across the
+ * whole index. Identifiers shorter than 5 chars are almost always locals,
+ * loop vars, or single-word field names that resolve to the wrong symbol. */
 static bool is_noise_identifier(const char *name) {
     if (!name || !name[0]) return false;
     size_t len = strlen(name);
-    if (len < 3) return true; /* i, j, n, fd, ok … too ambiguous to resolve */
+    if (len < 5) return true; /* i, j, n, fd, ok, ptr, buf, len, idx … */
     static const char *noise[] = {
+        /* C/C++ keywords */
         "int","char","void","bool","float","double","long","short","unsigned",
         "signed","const","static","struct","class","enum","union","return",
         "true","false","null","NULL","size_t","this","self","auto","new",
         "delete","public","private","protected","virtual","override","template",
         "typename","namespace","using","include","define","ifdef","endif",
         "for","while","switch","case","break","continue","else","sizeof",
+        "inline","extern","volatile","register","typedef","goto","default",
+        /* ubiquitous short field/member names that resolve to wrong symbols */
+        "width","height","depth","count","index","value","error","start",
+        "flags","color","style","state","level","group","entry","child",
+        "first","last","next","prev","data","text","name","type","node",
+        "size","left","right","head","tail","root","file","path","line",
+        "kind","mode","rank","code","info","base","list","hash","time",
         NULL
     };
     for (int i = 0; noise[i]; i++) if (!strcmp(name, noise[i])) return true;

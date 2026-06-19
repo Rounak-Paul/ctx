@@ -253,10 +253,12 @@ static const char *g_css =
     "  padding: 0px 0px 4px 0px;"
     "}"
 
-    /* Progress track */
+    /* Progress bar in status bar */
     ".prog-track {"
-    "  background: #161a1f;"
-    "  height: 2px;"
+    "  background: #1e2530;"
+    "  height: 8px;"
+    "  width: 120px;"
+    "  border: 1px #2a3545;"
     "}";
 
 /* ============================================================
@@ -362,28 +364,46 @@ static void status_bar_builder(Ca_Window *window, void *user_data)
     CtxIndexProgress prog;
     ctx_indexer_get_progress(&prog);
 
+    float frac = 0.0f;
+    if (prog.running && prog.total > 0)
+        frac = (float)prog.done / (float)prog.total;
+    else if (!prog.running)
+        frac = 1.0f;
+
     char sym_buf[32];
     char edge_buf[32];
-    snprintf(sym_buf, sizeof(sym_buf), "%u", g ? ctx_graph_symbol_count(g) : 0u);
-    snprintf(edge_buf, sizeof(edge_buf), "%u", g ? ctx_graph_edge_count(g) : 0u);
+    snprintf(sym_buf,  sizeof(sym_buf),  "%u", g ? ctx_graph_symbol_count(g) : 0u);
+    snprintf(edge_buf, sizeof(edge_buf), "%u", g ? ctx_graph_edge_count(g)   : 0u);
 
     ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "status-bar" });
+
+        /* Left — status badge + state label */
         ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "status-left" });
             ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "status-badge" });
                 ca_text(&(Ca_TextDesc){ .text = "C", .style = "status-badge-text" });
             ca_div_end();
             ca_text(&(Ca_TextDesc){
-                .text = prog.running ? "Indexing" : "Ready",
+                .text  = prog.running ? "Indexing" : "Ready",
                 .style = prog.running ? "status-busy" : "status-ok",
             });
         ca_div_end();
 
+        /* Right — symbol/edge counts + progress bar (bar only while indexing) */
         ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "status-right" });
             ca_text(&(Ca_TextDesc){ .text = "symbols", .style = "status-text" });
-            ca_text(&(Ca_TextDesc){ .text = sym_buf, .style = "status-value" });
-            ca_text(&(Ca_TextDesc){ .text = "edges", .style = "status-text" });
-            ca_text(&(Ca_TextDesc){ .text = edge_buf, .style = "status-value" });
+            ca_text(&(Ca_TextDesc){ .text = sym_buf,   .style = "status-value" });
+            ca_text(&(Ca_TextDesc){ .text = "edges",   .style = "status-text" });
+            ca_text(&(Ca_TextDesc){ .text = edge_buf,  .style = "status-value" });
+            s.prog_bar = ca_progress(&(Ca_ProgressDesc){
+                .value     = frac,
+                .width     = 120.0f,
+                .height    = 8.0f,
+                .bar_color = prog.running ? 0x5d91bdffU : 0x3a6b3affU,
+                .style     = "prog-track",
+                .hidden    = false,
+            });
         ca_div_end();
+
     ca_div_end();
 }
 
@@ -397,29 +417,18 @@ static void on_frame(void *ud)
     CtxIndexProgress prog;
     ctx_indexer_get_progress(&prog);
 
-    if (prog.running && prog.total > 0) {
-        float frac = (float)prog.done / (float)prog.total;
-        if (s.prog_bar) ca_progress_set(s.prog_bar, frac);
+    if (prog.running) {
         if (s.win) ca_window_invalidate_status_bar(s.win);
         ca_instance_wake();
     }
 
     if (s.graph_updated) {
         s.graph_updated = false;
-
         CtxGraph *g = ctx_indexer_get_graph();
         if (g) {
             if (s.force_graph) ctx_force_graph_sync(s.force_graph, g);
             s.content_needs_rebuild = true;
-
-            CtxIndexProgress p2;
-            ctx_indexer_get_progress(&p2);
-            if (p2.running) {
-                if (s.win) ca_window_invalidate_status_bar(s.win);
-            } else {
-                if (s.prog_bar) ca_progress_set(s.prog_bar, 1.0f);
-                if (s.win) ca_window_invalidate_status_bar(s.win);
-            }
+            if (s.win) ca_window_invalidate_status_bar(s.win);
         }
     }
 
@@ -786,19 +795,6 @@ static void build_content(Ca_Div *div, void *ud)
         build_tab_button(3, "Context");
         build_tab_button(4, "Files");
     ca_div_end();
-
-    CtxIndexProgress prog;
-    ctx_indexer_get_progress(&prog);
-    float progress_value = 1.0f;
-    if (prog.running && prog.total > 0)
-        progress_value = (float)prog.done / (float)prog.total;
-    s.prog_bar = ca_progress(&(Ca_ProgressDesc){
-        .value     = progress_value,
-        .width     = 0.0f,
-        .height    = 2.0f,
-        .bar_color = 0x5d91bdff,
-        .style     = "prog-track",
-    });
 
     ca_div_begin(&(Ca_DivDesc){ .direction = CA_VERTICAL, .style = "content-pad" });
         if      (tab == 0) build_graph_tab  (NULL, NULL);
