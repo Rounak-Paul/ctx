@@ -5,7 +5,12 @@
 #include "../event/event.h"
 #include "../indexer/indexer.h"
 #include "../graph/graph.h"
+#include "../retrieve/retrieve.h"
 #include "force_graph.h"
+
+/* ca_input_key_pressed() takes a raw GLFW key code; GLFW's headers are not on
+ * this target's include path, so mirror the one constant we need. */
+#define CTX_KEY_ENTER 257
 
 /* ============================================================
    Palette — packed RGBA uint32 (R<<24 | G<<16 | B<<8 | A)
@@ -36,9 +41,15 @@ typedef struct {
 
     /* Navigation */
     Ca_Div       *content_div;   /* stable div with builder — invalidated on tab change / graph update */
-    volatile int  active_tab;    /* 0=Graph 1=Symbols 2=Calls 3=Files */
+    volatile int  active_tab;    /* 0=Context 1=Graph 2=Symbols 3=Calls 4=Files */
 
     Ca_Progress  *prog_bar;
+
+    /* Context retrieval playground */
+    Ca_TextInput *ctx_query_input;
+    char          ctx_query[512];
+    char         *ctx_result;     /* heap markdown bundle from last query; owned */
+    int           ctx_budget_idx; /* index into g_ctx_budgets                    */
 
     /* Interactive graph viewport */
     CtxForceGraph *force_graph;
@@ -58,12 +69,15 @@ typedef struct {
     int tab;
 } TabActionCtx;
 
-static TabActionCtx g_tab_actions[4] = {
+static TabActionCtx g_tab_actions[5] = {
     { .tab = 0 },
     { .tab = 1 },
     { .tab = 2 },
     { .tab = 3 },
+    { .tab = 4 },
 };
+
+#define CTX_TAB_COUNT 5
 
 /* ============================================================
    CSS — flat, sharp (zero corner_radius in code, all via struct fields)
@@ -136,6 +150,26 @@ static const char *g_css =
     "}"
     ".tab-label { color: #686878; font-size: 11px; text-wrap: nowrap; }"
     ".tab-label-active { color: #c8c8d0; font-size: 11px; text-wrap: nowrap; }"
+
+    /* Context panel */
+    ".ctx-shell { flex-grow: 1; gap: 8px; padding: 10px 12px; }"
+    ".ctx-bar { gap: 8px; align-items: center; }"
+    ".ctx-input {"
+    "  flex-grow: 1; height: 26px; padding: 0px 8px;"
+    "  background: #161a1f; border: 1px #222933; color: #c0caf5; font-size: 12px;"
+    "}"
+    ".ctx-run-btn {"
+    "  height: 26px; padding: 0px 14px; align-items: center; justify-content: center;"
+    "  background: #283b57; border: 1px #3a5375;"
+    "}"
+    ".ctx-run-label { color: #c0caf5; font-size: 11px; text-wrap: nowrap; }"
+    ".ctx-select { height: 26px; background: #161a1f; border: 1px #222933; }"
+    ".ctx-hint { color: #565f89; font-size: 11px; }"
+    ".ctx-result { gap: 1px; flex-grow: 1; }"
+    ".ctx-line { color: #a9b1d6; font-size: 12px; }"
+    ".ctx-line-h { color: #7aa2f7; font-size: 12px; }"
+    ".ctx-line-cite { color: #9ece6a; font-size: 11px; }"
+    ".ctx-line-code { color: #7e8aa8; font-size: 11px; }"
 
     /* Content */
     ".content {"
@@ -276,7 +310,7 @@ static void ca_on_mouse_scroll(const Ca_Event *ev, void *user_data)
 
 static void set_active_tab(int tab)
 {
-    if (tab < 0 || tab > 3 || s.active_tab == tab) return;
+    if (tab < 0 || tab >= CTX_TAB_COUNT || s.active_tab == tab) return;
     s.active_tab = tab;
     s.content_needs_rebuild = true;
     ca_instance_wake();
@@ -602,6 +636,144 @@ static void build_files_tab(Ca_Div *div, void *ud)
     ca_div_end();
 }
 
+/* --- Context retrieval tab -------------------------------- */
+
+/* Selectable token budgets for the playground. Index stored in ctx_budget_idx;
+ * default index 2 == 2000 tokens (matches the API default). */
+static const uint32_t g_ctx_budgets[] = { 500, 1000, 2000, 4000, 8000 };
+static const char *const g_ctx_budget_labels[] = {
+    "500 tokens", "1000 tokens", "2000 tokens", "4000 tokens", "8000 tokens"
+};
+#define CTX_BUDGET_COUNT ((int)(sizeof(g_ctx_budgets) / sizeof(g_ctx_budgets[0])))
+
+static void run_ctx_query(void);
+
+/* Applies the chosen budget and re-runs the query if one is already shown. */
+static void on_ctx_budget_change(Ca_Select *sel, void *ud)
+{
+    CTX_UNUSED(ud);
+    int idx = ca_select_get(sel);
+    if (idx < 0 || idx >= CTX_BUDGET_COUNT) return;
+    s.ctx_budget_idx = idx;
+    if (s.ctx_query[0]) run_ctx_query();
+}
+
+/* Captures the live query text as the user edits the field. */
+static void on_ctx_query_change(Ca_TextInput *input, void *ud)
+{
+    CTX_UNUSED(ud);
+    const char *text = ca_input_text(input);
+    if (!text) { s.ctx_query[0] = '\0'; return; }
+    strncpy(s.ctx_query, text, sizeof(s.ctx_query) - 1);
+    s.ctx_query[sizeof(s.ctx_query) - 1] = '\0';
+}
+
+/* Runs retrieval for the current query and stores the markdown bundle. */
+static void run_ctx_query(void)
+{
+    if (s.ctx_query[0] == '\0') return;
+    free(s.ctx_result);
+    s.ctx_result = NULL;
+
+    CtxRetrieveRequest req = {
+        .kind = CTX_QUERY_TASK, .text = s.ctx_query,
+        .budget = g_ctx_budgets[s.ctx_budget_idx], .format = CTX_FMT_MARKDOWN,
+    };
+    s.ctx_result = ctx_retrieve(ctx_indexer_get_graph(), &req);
+    s.content_needs_rebuild = true;
+    ca_instance_wake();
+}
+
+static void on_ctx_run_click(Ca_Button *button, void *ud)
+{
+    CTX_UNUSED(button); CTX_UNUSED(ud);
+    run_ctx_query();
+}
+
+/* Picks a line style by its markdown prefix so the bundle stays readable
+ * without a full markdown renderer. */
+static const char *ctx_line_style(const char *line)
+{
+    if (line[0] == '#') return "ctx-line-h";
+    if (line[0] == '`' || line[0] == '/') return "ctx-line-cite";
+    if (line[0] == ' ' || line[0] == '\t') return "ctx-line-code";
+    return "ctx-line";
+}
+
+static void build_context_tab(Ca_Div *div, void *ud)
+{
+    CTX_UNUSED(div); CTX_UNUSED(ud);
+
+    ca_div_begin(&(Ca_DivDesc){ .direction = CA_VERTICAL, .style = "ctx-shell" });
+        /* Playground explainer — this tab is a human-facing preview of exactly
+         * what an agent receives from the /context API; it does not call an LLM. */
+        ca_text(&(Ca_TextDesc){
+            .text = "Playground — preview the budget-bounded context bundle an "
+                    "agent would get from GET /context. Pick a token budget and "
+                    "watch what gets packed vs. omitted. No LLM is called.",
+            .style = "ctx-hint", .wrap = true });
+
+        ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "ctx-bar" });
+            s.ctx_query_input = ca_input(&(Ca_InputDesc){
+                .text        = s.ctx_query[0] ? s.ctx_query : NULL,
+                .placeholder = "Describe a task — e.g. how are semantic edges resolved",
+                .on_change   = on_ctx_query_change,
+                .style       = "ctx-input",
+            });
+            ca_text(&(Ca_TextDesc){ .text = "Budget", .style = "ctx-hint" });
+            ca_select(&(Ca_SelectDesc){
+                .options       = g_ctx_budget_labels,
+                .option_count  = CTX_BUDGET_COUNT,
+                .selected      = s.ctx_budget_idx,
+                .width         = 120.0f,
+                .on_change     = on_ctx_budget_change,
+                .style         = "ctx-select",
+            });
+            ca_btn_begin(&(Ca_BtnDesc){
+                .style = "ctx-run-btn", .direction = CA_HORIZONTAL,
+                .background = 0u, .on_click = on_ctx_run_click,
+            });
+                ca_text(&(Ca_TextDesc){ .text = "Retrieve", .style = "ctx-run-label" });
+            ca_btn_end();
+        ca_div_end();
+
+        /* Enter in the focused field submits the query. */
+        if (s.ctx_query_input &&
+            ca_input_key_pressed(s.ctx_query_input, CTX_KEY_ENTER))
+            run_ctx_query();
+
+        if (!s.ctx_result) {
+            ca_text(&(Ca_TextDesc){
+                .text = "Type a task and press Enter (or click Retrieve). The bundle "
+                        "lists ranked symbols, source snippets, caller/callee/reference "
+                        "relationships, and anything omitted to stay within budget.",
+                .style = "ctx-hint", .wrap = true });
+            ca_div_end();
+            return;
+        }
+
+        /* Render the markdown bundle line-by-line, bounded for layout safety. */
+        ca_div_begin(&(Ca_DivDesc){ .direction = CA_VERTICAL, .style = "ctx-result" });
+            const char *p = s.ctx_result;
+            char line[512];
+            int rendered = 0;
+            while (*p && rendered < 200) {
+                const char *nl = strchr(p, '\n');
+                size_t len = nl ? (size_t)(nl - p) : strlen(p);
+                if (len >= sizeof(line)) len = sizeof(line) - 1;
+                memcpy(line, p, len);
+                line[len] = '\0';
+                ca_text(&(Ca_TextDesc){
+                    .text = line[0] ? line : " ",
+                    .style = ctx_line_style(line), .wrap = true });
+                rendered++;
+                if (!nl) break;
+                p = nl + 1;
+            }
+        ca_div_end();
+    ca_div_end();
+}
+
 /* --- Master content builder ------------------------------- */
 static void build_content(Ca_Div *div, void *ud)
 {
@@ -611,7 +783,8 @@ static void build_content(Ca_Div *div, void *ud)
         build_tab_button(0, "Graph");
         build_tab_button(1, "Symbols");
         build_tab_button(2, "Calls");
-        build_tab_button(3, "Files");
+        build_tab_button(3, "Context");
+        build_tab_button(4, "Files");
     ca_div_end();
 
     CtxIndexProgress prog;
@@ -631,6 +804,7 @@ static void build_content(Ca_Div *div, void *ud)
         if      (tab == 0) build_graph_tab  (NULL, NULL);
         else if (tab == 1) build_symbols_tab(NULL, NULL);
         else if (tab == 2) build_calls_tab  (NULL, NULL);
+        else if (tab == 3) build_context_tab(NULL, NULL);
         else               build_files_tab  (NULL, NULL);
     ca_div_end();
 }
@@ -641,6 +815,7 @@ static void build_content(Ca_Div *div, void *ud)
 bool ctx_ui_run(void)
 {
     s.active_tab = 0;
+    s.ctx_budget_idx = 2;   /* default 2000-token budget */
     s.force_graph = ctx_force_graph_create();
     if (!s.force_graph) {
         CTX_LOG_ERROR("Failed to allocate graph viewport");
@@ -670,8 +845,8 @@ bool ctx_ui_run(void)
 
     s.win = ca_window_create(s.inst, &(Ca_WindowDesc){
         .title  = "ctx",
-        .width  = 1080,
-        .height = 680,
+        .width  = 680,
+        .height = 500,
     });
     if (!s.win) {
         ctx_force_graph_destroy(s.force_graph);
@@ -694,11 +869,12 @@ bool ctx_ui_run(void)
         { .label = "Graph",   .action = on_menu_tab, .action_data = &g_tab_actions[0] },
         { .label = "Symbols", .action = on_menu_tab, .action_data = &g_tab_actions[1] },
         { .label = "Calls",   .action = on_menu_tab, .action_data = &g_tab_actions[2] },
-        { .label = "Files",   .action = on_menu_tab, .action_data = &g_tab_actions[3] },
+        { .label = "Context", .action = on_menu_tab, .action_data = &g_tab_actions[3] },
+        { .label = "Files",   .action = on_menu_tab, .action_data = &g_tab_actions[4] },
     };
     static const Ca_MenuDesc title_menus[] = {
         { .label = "ctx",  .items = file_items, .item_count = 1 },
-        { .label = "View", .items = view_items, .item_count = 4 },
+        { .label = "View", .items = view_items, .item_count = 5 },
     };
     ca_window_set_title_bar_menus(s.win, title_menus, 2);
 
@@ -724,6 +900,8 @@ bool ctx_ui_run(void)
 
     ctx_force_graph_destroy(s.force_graph);
     s.force_graph = NULL;
+    free(s.ctx_result);
+    s.ctx_result = NULL;
     ca_instance_destroy(s.inst);
     return true;
 }

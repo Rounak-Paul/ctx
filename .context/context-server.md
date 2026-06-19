@@ -69,6 +69,20 @@ language. Edges: calls, references, inherits, includes, defines.
   small budget. Presence-based (not score-based) to avoid brittleness. `ctx
   --bench` exits with the failure count.
 
+## GUI Context tab (`ui/app_window.c`)
+- New default tab "Context" (tab 0; Graph/Symbols/Calls/Files shifted to 1–4).
+  Tab indices are also referenced in `on_frame` (force_graph_frame runs when
+  `active_tab == 1`) and the View menu — keep all three in sync if reordering.
+- `build_context_tab` renders a `ca_input` query field + Retrieve button; Enter
+  or click runs `ctx_retrieve(graph, budget=1200, markdown)` and the bundle is
+  stored in `s.ctx_result` (freed on rebuild and on `ctx_ui_run` exit). Markdown
+  is rendered line-by-line with prefix-based styling (no full md renderer).
+- Required adding a public getter to bundled Causality:
+  `ca_input_text(const Ca_TextInput*)` in `vendors/causality/.../widget.c` +
+  `causality.h` — `Ca_TextInput` is opaque and had a setter but no getter.
+- `CTX_KEY_ENTER 257` is defined locally because GLFW headers are not on ctx's
+  include path; `ca_input_key_pressed` takes a raw GLFW key int.
+
 ## Build note
 - Output dirs `bin/` and `build/` had root-owned artifacts from a prior `sudo`
   build that blocked the PCH write. Resolved by moving the stale `build/` aside

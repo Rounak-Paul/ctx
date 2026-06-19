@@ -80,4 +80,6 @@ reference-only entry before a symbol is omitted entirely.
 - `api/` — minimal HTTP server exposing the endpoints above.
 - `indexer/`, `watcher/`, `jobs/`, `event/` — indexing pipeline and live updates.
 - `bench/` — built-in retrieval benchmark (`--bench`).
-- `ui/` — optional Causality graph visualizer (debug aid).
+- `ui/` — optional Causality GUI: a **Context** tab that runs the retrieval
+  engine on a typed task (type a query, press Enter, see the ranked bundle), plus
+  the force-directed dependency graph and Symbols/Calls/Files inspectors.
