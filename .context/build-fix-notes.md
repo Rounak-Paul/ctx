@@ -115,3 +115,9 @@
 - Verification: `cmake --build build --parallel` succeeds after explicit content rebuild and continuous-mode changes.
 - Verification: `git diff --check` succeeds in both the main repo and `vendors/causality`.
 - Verification: `env HOME=/private/tmp/ctx-verify-graph-nogui ./bin/ctx --no-gui --no-api --project /Users/duke/Code/ctx/src` loaded the cache and entered the watch loop cleanly.
+
+## Mirrored Graph Follow-Up
+
+- User reported two vertically mirrored graph projections when panning or zooming.
+- Root cause: `graph_render()` drew the pipeline-independent fallback graph first and then drew the shader graph when the shader path was available. The fallback clear-rect path and shader path use different framebuffer/Y conventions, so both projections were visible.
+- Fix: `graph_render()` now prepares the shader path before dynamic rendering and draws exactly one graph path per frame: shader vertices when available, otherwise the clear-rect fallback.

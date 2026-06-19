@@ -591,26 +591,6 @@ static void graph_render(Ca_Viewport *viewport, void *user_data)
     if (!inst || dev == VK_NULL_HANDLE || cmd == VK_NULL_HANDLE || width == 0 || height == 0)
         return;
 
-    view->device = dev;
-    VkClearValue clear = { .color = { .float32 = { 0.035f, 0.039f, 0.047f, 1.0f } } };
-    VkRenderingAttachmentInfo color = {
-        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView = ca_viewport_image_view(viewport),
-        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-        .clearValue = clear,
-    };
-    VkRenderingInfo ri = {
-        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .renderArea = { .offset = {0, 0}, .extent = { width, height } },
-        .layerCount = 1,
-        .colorAttachmentCount = 1,
-        .pColorAttachments = &color,
-    };
-    vkCmdBeginRendering(cmd, &ri);
-    clear_graph_fallback(cmd, view, width, height);
-
     VkFormat format = ca_viewport_format(viewport);
     uint32_t max_vertices = view->edge_count * 6u + view->node_count * CTX_FG_NODE_SEGMENTS * 3u;
     if (max_vertices == 0u)
@@ -631,6 +611,25 @@ static void graph_render(Ca_Viewport *viewport, void *user_data)
         view->gpu_ready = false;
     }
 
+    view->device = dev;
+    VkClearValue clear = { .color = { .float32 = { 0.035f, 0.039f, 0.047f, 1.0f } } };
+    VkRenderingAttachmentInfo color = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = ca_viewport_image_view(viewport),
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .clearValue = clear,
+    };
+    VkRenderingInfo ri = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = { .offset = {0, 0}, .extent = { width, height } },
+        .layerCount = 1,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &color,
+    };
+    vkCmdBeginRendering(cmd, &ri);
+
     VkViewport vp = { .x = 0.0f, .y = 0.0f, .width = (float)width, .height = (float)height,
                       .minDepth = 0.0f, .maxDepth = 1.0f };
     VkRect2D sc = { .offset = {0, 0}, .extent = { width, height } };
@@ -643,6 +642,8 @@ static void graph_render(Ca_Viewport *viewport, void *user_data)
         vkCmdBindVertexBuffers(cmd, 0, 1, &view->vertex_buffer, &off);
         vkCmdPushConstants(cmd, view->pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
         vkCmdDraw(cmd, vertex_count, 1, 0, 0);
+    } else {
+        clear_graph_fallback(cmd, view, width, height);
     }
     vkCmdEndRendering(cmd);
 }
