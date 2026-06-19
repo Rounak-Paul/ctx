@@ -138,7 +138,7 @@ endif()
 # --------------------------------------------------------------------------
 # ctx sources
 # --------------------------------------------------------------------------
-file(GLOB_RECURSE CTX_SRCS src/*.c)
+file(GLOB_RECURSE CTX_SRCS CONFIGURE_DEPENDS src/*.c)
 
 add_executable(ctx ${CTX_SRCS})
 

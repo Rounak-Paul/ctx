@@ -52,3 +52,66 @@
 - Generic control-flow statements were not promoted to top-level graph symbols because full vendored indexing became too slow when every statement/expression-like node was persisted through the current graph/store path.
 - Verification: `env HOME=/private/tmp/ctx-full-home-decls ./bin/ctx --no-gui --no-api --project /Users/duke/Code/ctx` completed the full index with vendors included: 2338 files, 356330 symbols, 545071 edges, 126631 ms.
 - Verification: `env HOME=/private/tmp/ctx-full-home-decls ./bin/ctx --no-api --project /Users/duke/Code/ctx` loaded the expanded graph in GUI mode and stayed alive after the up-to-date graph update.
+
+## Interactive Graph View Follow-Up
+
+- The old Graph tab used a fixed `Ca_NodeGraph` projection capped at 48 nodes and 96 wires.
+- `src/ui/force_graph.c` now owns an Obsidian-style force-directed graph viewport: it ranks the complete indexed graph into a bounded visible projection, simulates node physics, supports drag/pan/scroll zoom, and renders vector edges/nodes into a Causality `Ca_Viewport` with Vulkan dynamic rendering.
+- The complete index is unchanged. The viewport projection is a rendering strategy for interactivity, not a separate or partial indexing operation.
+- Causality `ca_viewport()` now reuses retained viewport widgets instead of allocating a new viewport slot every time a retained builder reruns.
+- `src/store/store.c` now creates the complete cache directory path recursively and checks errors, so a missing `HOME` directory no longer causes SQLite startup failure.
+- `CMakeLists.txt` uses `file(GLOB_RECURSE ... CONFIGURE_DEPENDS ...)` so added source files are picked up by CMake-generated build dependencies.
+- Verification: `cmake --build build --parallel` builds `bin/ctx` successfully.
+- Verification: `env HOME=/private/tmp/ctx-verify-graph-nogui ./bin/ctx --no-gui --no-api --project /Users/duke/Code/ctx/src` created the missing cache path, indexed 32 files, and entered the watch loop.
+- Verification: the same no-GUI command on the warmed cache loaded 2408 symbols and 335 edges, reported the index up to date, and entered the watch loop.
+- GUI smoke verification could not be rerun in this environment because the required approval to launch a macOS window was rejected by the approval system usage limit.
+
+## Graph Visibility Follow-Up
+
+- User reported that the graph was not visible after the first custom viewport implementation.
+- Root cause: the Graph tab relied on a zero-sized/flex viewport directly inside an auto-height content pane, and `ca_viewport()` does not apply CSS to its own descriptor before GPU allocation. The viewport could therefore collapse to an effectively invisible surface.
+- Fix: the Graph tab now wraps the viewport in a CSS-applied `.graph-frame` with `min-height: 520px`, `flex-grow: 1`, border, padding, and background. The main `.content` pane also requests `flex-grow: 1`.
+- Renderer fallback: `graph_render()` now always begins dynamic rendering and clears the viewport before attempting graph pipeline/buffer setup, so a shader/pipeline failure shows a visible empty graph surface instead of an unrendered widget.
+- Verification: `cmake --build build --parallel` succeeds after the visibility fix.
+- Verification: `git diff --check` succeeds.
+- Verification: `env HOME=/private/tmp/ctx-verify-graph-nogui ./bin/ctx --no-gui --no-api --project /Users/duke/Code/ctx/src` reindexed changed UI files and entered the watch loop cleanly.
+
+## Empty Viewport Follow-Up
+
+- User could see the graph area but no graph primitives inside it.
+- The shader pipeline path can still fail silently on a runtime Vulkan setup; if that happens, the viewport only shows the cleared background.
+- Fix: `graph_render()` now draws the graph through a pipeline-independent Vulkan fallback using `vkCmdClearAttachments` rectangles for edge strokes and node markers before the optional shader pipeline path. With graph data present, this should make nodes and edges visible even if shader/pipeline creation or drawing is not working.
+- The fallback also draws a center reticle when no nodes are selected, so the viewport never looks blank.
+- Verification: `cmake --build build --parallel` succeeds after the fallback draw path.
+- Verification: `git diff --check` succeeds.
+- Verification: `env HOME=/private/tmp/ctx-verify-graph-nogui ./bin/ctx --no-gui --no-api --project /Users/duke/Code/ctx/src` reindexed the changed renderer file and entered the watch loop cleanly.
+
+## Quasar Viewport Binding Follow-Up
+
+- User noted that Quasar's custom render path should be used as the reference because the graph area remained empty.
+- Quasar creates a `Ca_Viewport` with an empty descriptor and then binds render callbacks afterward through `qs_renderer_bind()` / `qs_viewport_set_callbacks()` / `ca_viewport_set_callbacks()`.
+- The first ctx implementation passed the render callback in the `Ca_ViewportDesc`; after adding retained viewport reuse, `ca_viewport()` could overwrite an already-bound callback with NULL during retained rebuilds. This is especially wrong for Quasar-style bind-after-create usage.
+- Fix: retained `ca_viewport()` reuse now preserves existing render/resize callbacks when the incoming descriptor does not provide replacements.
+- Fix: `ctx_force_graph_build()` now mirrors Quasar by creating/reusing the viewport first, then explicitly calling `ca_viewport_set_callbacks(viewport, graph_render, view, NULL, NULL)` and requesting redraw.
+- Verification: `cmake --build build --parallel` succeeds after the callback binding fix.
+- Verification: `git diff --check` succeeds in both the main repo and `vendors/causality`.
+- Verification: `env HOME=/private/tmp/ctx-verify-graph-nogui ./bin/ctx --no-gui --no-api --project /Users/duke/Code/ctx/src` reindexed the changed graph renderer file and entered the watch loop cleanly.
+
+## Viewport Redraw Scheduling Follow-Up
+
+- User still saw an empty graph area after the Quasar-style callback binding fix.
+- Root cause found in Causality: `ca_viewport_request_redraw()` only set `viewport->needs_redraw`. The renderer skips `ca_swapchain_frame()` unless `window->needs_render` is true, so viewport-only redraws could be starved after normal UI painting was clean.
+- Fix: `ca_viewport_request_redraw()` now marks the viewport node content-dirty, sets the owning window's `needs_render`, and wakes the instance. `ca_viewport_set_callbacks()` also requests a redraw after callbacks are installed.
+- Verification: `cmake --build build --parallel` succeeds after the Causality redraw scheduling fix.
+- Verification: `git diff --check` succeeds in both the main repo and `vendors/causality`.
+- Verification: `env HOME=/private/tmp/ctx-verify-graph-nogui ./bin/ctx --no-gui --no-api --project /Users/duke/Code/ctx/src` loaded the cache and entered the watch loop cleanly.
+
+## Graph Builder Lifecycle Follow-Up
+
+- The app no longer depends on `ca_div_set_builder()` to construct the graph tab. The content pane is explicitly rebuilt from `on_frame()` when needed: initial frame, tab change, or graph update.
+- The ctx Causality instance now uses `ca_instance_set_continuous(s.inst, true)`, matching Quasar's engine setup. This is required for viewport physics/redraws to advance without relying only on input/window events.
+- Causality `ca_viewport()` now participates in retained child claiming like other widgets, preserving callback ownership on rebuilds and avoiding viewport pool churn.
+- Temporary lifecycle diagnostics were removed after the user confirmed the vector graph is visible.
+- Verification: `cmake --build build --parallel` succeeds after explicit content rebuild and continuous-mode changes.
+- Verification: `git diff --check` succeeds in both the main repo and `vendors/causality`.
+- Verification: `env HOME=/private/tmp/ctx-verify-graph-nogui ./bin/ctx --no-gui --no-api --project /Users/duke/Code/ctx/src` loaded the cache and entered the watch loop cleanly.

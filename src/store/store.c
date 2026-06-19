@@ -3,10 +3,10 @@
 
 #if defined(CTX_PLATFORM_WINDOWS)
 #include <direct.h>
-#define mkdir_p(p) _mkdir(p)
+#define ctx_mkdir_one(p) _mkdir(p)
 #else
 #include <sys/stat.h>
-#define mkdir_p(p) mkdir(p, 0755)
+#define ctx_mkdir_one(p) mkdir(p, 0755)
 #endif
 
 static sqlite3    *s_db   = NULL;
@@ -46,6 +46,36 @@ static bool create_schema(void) {
     );
 }
 
+/*
+ * Creates every directory component in a path if it is missing.
+ *
+ * path  Directory path to create.
+ */
+static bool ensure_dir(const char *path) {
+    if (!path || !*path) return false;
+
+    char buf[4096];
+    int n = snprintf(buf, sizeof(buf), "%s", path);
+    if (n <= 0 || (size_t)n >= sizeof(buf)) return false;
+
+    size_t len = strlen(buf);
+    while (len > 1 && (buf[len - 1] == '/' || buf[len - 1] == '\\'))
+        buf[--len] = '\0';
+
+    for (char *p = buf + 1; *p; ++p) {
+        if (*p != '/' && *p != '\\') continue;
+        char sep = *p;
+        *p = '\0';
+        if (ctx_mkdir_one(buf) != 0 && errno != EEXIST) {
+            *p = sep;
+            return false;
+        }
+        *p = sep;
+    }
+
+    return ctx_mkdir_one(buf) == 0 || errno == EEXIST;
+}
+
 bool ctx_store_build_path(const char *root_path, char *out, size_t out_len) {
     extern uint64_t ctx_fnv64(const char *, size_t);
     uint64_t h = ctx_fnv64(root_path, strlen(root_path));
@@ -60,8 +90,10 @@ bool ctx_store_build_path(const char *root_path, char *out, size_t out_len) {
     snprintf(dir1, sizeof(dir1), "%s/.ctx", home);
     snprintf(dir2, sizeof(dir2), "%s/.ctx/%016" PRIx64, home, h);
 
-    mkdir_p(dir1);
-    mkdir_p(dir2);
+    if (!ensure_dir(dir1) || !ensure_dir(dir2)) {
+        CTX_LOG_ERROR("Cannot create store directory %s", dir2);
+        return false;
+    }
 
     int n = snprintf(out, out_len, "%s/index.db", dir2);
     return (n > 0 && (size_t)n < out_len);
