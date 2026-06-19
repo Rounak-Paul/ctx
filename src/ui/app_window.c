@@ -35,14 +35,9 @@ typedef struct {
     Ca_Window    *win;
 
     /* Navigation */
-    Ca_TabBar    *tabs;
     Ca_Div       *content_div;   /* stable div with builder — invalidated on tab change / graph update */
     volatile int  active_tab;    /* 0=Graph 1=Symbols 2=Calls 3=Files */
 
-    /* Stats labels in title bar */
-    Ca_Label     *lbl_sym;
-    Ca_Label     *lbl_edge;
-    Ca_Label     *lbl_status;
     Ca_Progress  *prog_bar;
 
     /* Interactive graph viewport */
@@ -59,6 +54,17 @@ static AppState s;
 
 static void build_content(Ca_Div *div, void *ud);
 
+typedef struct {
+    int tab;
+} TabActionCtx;
+
+static TabActionCtx g_tab_actions[4] = {
+    { .tab = 0 },
+    { .tab = 1 },
+    { .tab = 2 },
+    { .tab = 3 },
+};
+
 /* ============================================================
    CSS — flat, sharp (zero corner_radius in code, all via struct fields)
    ============================================================ */
@@ -68,50 +74,134 @@ static const char *g_css =
 
     /* Chrome */
     ".chrome {"
-    "  background: #0e1013;"
+    "  background: #0e0e10;"
     "  padding: 0px;"
     "  gap: 0px;"
     "}"
-    ".titlebar {"
-    "  background: #090a0c;"
-    "  padding: 5px 12px;"
-    "  gap: 16px;"
-    "}"
-    ".app-name { color: #7aa2f7; font-size: 13px; }"
-    ".pill {"
-    "  background: #161a1f;"
-    "  padding: 2px 8px;"
-    "  color: #565f89;"
-    "  font-size: 11px;"
-    "}"
-    ".pill-val { color: #c0caf5; font-size: 11px; }"
+
+    /* Status bar */
     ".status-bar {"
-    "  background: #090a0c;"
-    "  padding: 3px 12px;"
+    "  background: #111118;"
+    "  width: 100%;"
+    "  height: 20px;"
+    "  padding: 0px 7px;"
     "  gap: 8px;"
+    "  align-items: center;"
+    "  border-top: 2px #070709;"
+    "  border-bottom: 2px #3c3c48;"
+    "  overflow: hidden;"
     "}"
-    ".status-text { color: #565f89; font-size: 11px; }"
-    ".status-ok   { color: #9ece6a; font-size: 11px; }"
-    ".status-busy { color: #e0af68; font-size: 11px; }"
+    ".status-left { flex-grow: 1; gap: 7px; align-items: center; }"
+    ".status-right { gap: 9px; align-items: center; }"
+    ".status-badge {"
+    "  background: #163254;"
+    "  width: 15px;"
+    "  height: 14px;"
+    "  align-items: center;"
+    "  justify-content: center;"
+    "}"
+    ".status-badge-text { color: #b0c8e0; font-size: 10px; }"
+    ".status-text { color: #787898; font-size: 11px; }"
+    ".status-value { color: #c8c8d0; font-size: 11px; }"
+    ".status-ok   { color: #98c379; font-size: 11px; }"
+    ".status-busy { color: #d6b35c; font-size: 11px; }"
 
     /* Tab bar */
-    ".tabs-wrap { background: #090a0c; padding: 0px 12px; }"
-    ".divider { background: #22293300; height: 1px; }"
+    ".tabs-wrap {"
+    "  width: 100%;"
+    "  height: 24px;"
+    "  background: #1e1e26;"
+    "  padding: 2px 5px 0px 5px;"
+    "  gap: 2px;"
+    "  align-items: flex-end;"
+    "  border-top: 2px #4c4c58;"
+    "  border-bottom: 2px #070709;"
+    "  overflow: hidden;"
+    "}"
+    ".tab-btn {"
+    "  background: #282832;"
+    "  height: 21px;"
+    "  padding: 0px 10px;"
+    "  align-items: center;"
+    "  justify-content: center;"
+    "  border-top: 1px #505060;"
+    "  border-left: 1px #505060;"
+    "  border-right: 1px #070709;"
+    "}"
+    ".tab-btn-active {"
+    "  background: #0d0d11;"
+    "  border-top: 1px #070709;"
+    "  border-left: 1px #070709;"
+    "  border-right: 1px #505060;"
+    "}"
+    ".tab-label { color: #686878; font-size: 11px; text-wrap: nowrap; }"
+    ".tab-label-active { color: #c8c8d0; font-size: 11px; text-wrap: nowrap; }"
 
     /* Content */
     ".content {"
-    "  background: #090a0c;"
-    "  padding: 16px;"
-    "  gap: 12px;"
+    "  background: #0d0d11;"
+    "  padding: 0px;"
+    "  gap: 0px;"
     "  flex-grow: 1;"
+    "  overflow: hidden;"
     "}"
-    ".graph-frame {"
-    "  background: #0e1013;"
-    "  border-width: 1px;"
-    "  border-color: #222933;"
-    "  min-height: 520px;"
+    ".content-pad {"
+    "  background: #0d0d11;"
+    "  padding: 6px;"
+    "  gap: 6px;"
     "  flex-grow: 1;"
-    "  padding: 1px;"
+    "  overflow: hidden;"
+    "}"
+    ".graph-shell {"
+    "  background: #151518;"
+    "  border-width: 1px;"
+    "  border-color: #252530;"
+    "  flex-grow: 1;"
+    "  padding: 0px;"
+    "  gap: 0px;"
+    "}"
+    ".graph-toolbar {"
+    "  background: #18181e;"
+    "  height: 24px;"
+    "  padding: 0px 8px;"
+    "  gap: 8px;"
+    "  align-items: center;"
+    "  border-bottom: 1px #070709;"
+    "}"
+    ".graph-title { color: #b8b8c8; font-size: 10px; }"
+    ".graph-grow { flex-grow: 1; }"
+    ".graph-frame {"
+    "  background: #0d0d11;"
+    "  min-height: 420px;"
+    "  flex-grow: 1;"
+    "  padding: 0px;"
+    "  gap: 0px;"
+    "}"
+    ".graph-legend {"
+    "  background: transparent;"
+    "  gap: 8px;"
+    "  align-items: center;"
+    "}"
+    ".graph-node-legend {"
+    "  background: transparent;"
+    "  gap: 6px;"
+    "  align-items: center;"
+    "}"
+    ".graph-legend-label { color: #a9b1d6; font-size: 10px; }"
+    ".graph-legend-item { height: 14px; gap: 4px; align-items: center; }"
+    ".graph-swatch-box {"
+    "  width: 16px;"
+    "  height: 12px;"
+    "  align-items: center;"
+    "  justify-content: center;"
+    "}"
+    ".graph-swatch {"
+    "  width: 14px;"
+    "  height: 2px;"
+    "}"
+    ".graph-node-swatch {"
+    "  width: 5px;"
+    "  height: 5px;"
     "}"
 
     /* Table */
@@ -184,12 +274,83 @@ static void ca_on_mouse_scroll(const Ca_Event *ev, void *user_data)
                                  s.mouse_y);
 }
 
-static void on_tab_change(Ca_TabBar *tb, void *ud)
+static void set_active_tab(int tab)
 {
-    CTX_UNUSED(ud);
-    s.active_tab = ca_tabs_active(tb);
+    if (tab < 0 || tab > 3 || s.active_tab == tab) return;
+    s.active_tab = tab;
     s.content_needs_rebuild = true;
     ca_instance_wake();
+}
+
+static void on_tab_click(Ca_Button *button, void *user_data)
+{
+    CTX_UNUSED(button);
+    TabActionCtx *ctx = user_data;
+    if (!ctx) return;
+    set_active_tab(ctx->tab);
+}
+
+static void on_menu_tab(void *user_data)
+{
+    TabActionCtx *ctx = user_data;
+    if (!ctx) return;
+    set_active_tab(ctx->tab);
+}
+
+static void on_menu_quit(void *user_data)
+{
+    CTX_UNUSED(user_data);
+    s.closing = true;
+}
+
+static void build_tab_button(int tab, const char *label)
+{
+    bool active = s.active_tab == tab;
+    ca_btn_begin(&(Ca_BtnDesc){
+        .style = active ? "tab-btn tab-btn-active" : "tab-btn",
+        .direction = CA_HORIZONTAL,
+        .background = 0u,
+        .on_click = on_tab_click,
+        .click_data = &g_tab_actions[tab],
+    });
+        ca_text(&(Ca_TextDesc){
+            .text = label,
+            .style = active ? "tab-label tab-label-active" : "tab-label",
+        });
+    ca_btn_end();
+}
+
+static void status_bar_builder(Ca_Window *window, void *user_data)
+{
+    CTX_UNUSED(window); CTX_UNUSED(user_data);
+
+    CtxGraph *g = ctx_indexer_get_graph();
+    CtxIndexProgress prog;
+    ctx_indexer_get_progress(&prog);
+
+    char sym_buf[32];
+    char edge_buf[32];
+    snprintf(sym_buf, sizeof(sym_buf), "%u", g ? ctx_graph_symbol_count(g) : 0u);
+    snprintf(edge_buf, sizeof(edge_buf), "%u", g ? ctx_graph_edge_count(g) : 0u);
+
+    ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "status-bar" });
+        ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "status-left" });
+            ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "status-badge" });
+                ca_text(&(Ca_TextDesc){ .text = "C", .style = "status-badge-text" });
+            ca_div_end();
+            ca_text(&(Ca_TextDesc){
+                .text = prog.running ? "Indexing" : "Ready",
+                .style = prog.running ? "status-busy" : "status-ok",
+            });
+        ca_div_end();
+
+        ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "status-right" });
+            ca_text(&(Ca_TextDesc){ .text = "symbols", .style = "status-text" });
+            ca_text(&(Ca_TextDesc){ .text = sym_buf, .style = "status-value" });
+            ca_text(&(Ca_TextDesc){ .text = "edges", .style = "status-text" });
+            ca_text(&(Ca_TextDesc){ .text = edge_buf, .style = "status-value" });
+        ca_div_end();
+    ca_div_end();
 }
 
 /* ============================================================
@@ -204,7 +365,8 @@ static void on_frame(void *ud)
 
     if (prog.running && prog.total > 0) {
         float frac = (float)prog.done / (float)prog.total;
-        ca_progress_set(s.prog_bar, frac);
+        if (s.prog_bar) ca_progress_set(s.prog_bar, frac);
+        if (s.win) ca_window_invalidate_status_bar(s.win);
         ca_instance_wake();
     }
 
@@ -216,19 +378,13 @@ static void on_frame(void *ud)
             if (s.force_graph) ctx_force_graph_sync(s.force_graph, g);
             s.content_needs_rebuild = true;
 
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%u", ctx_graph_symbol_count(g));
-            ca_set_text(s.lbl_sym, buf);
-            snprintf(buf, sizeof(buf), "%u", ctx_graph_edge_count(g));
-            ca_set_text(s.lbl_edge, buf);
-
             CtxIndexProgress p2;
             ctx_indexer_get_progress(&p2);
             if (p2.running) {
-                ca_set_text(s.lbl_status, "Indexing\xe2\x80\xa6");
+                if (s.win) ca_window_invalidate_status_bar(s.win);
             } else {
-                ca_progress_set(s.prog_bar, 1.0f);
-                ca_set_text(s.lbl_status, "Ready");
+                if (s.prog_bar) ca_progress_set(s.prog_bar, 1.0f);
+                if (s.win) ca_window_invalidate_status_bar(s.win);
             }
         }
     }
@@ -249,6 +405,36 @@ static void on_frame(void *ud)
    ============================================================ */
 
 /* --- Graph tab -------------------------------------------- */
+static void graph_legend_item(uint32_t color, const char *label)
+{
+    ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "graph-legend-item" });
+        ca_div_begin(&(Ca_DivDesc){ .style = "graph-swatch-box" });
+        ca_div_begin(&(Ca_DivDesc){
+            .width = 14.0f,
+            .height = 2.0f,
+            .background = color,
+            .style = "graph-swatch",
+        });
+        ca_div_end();
+        ca_div_end();
+        ca_text(&(Ca_TextDesc){ .text = label, .style = "graph-legend-label" });
+    ca_div_end();
+}
+
+static void graph_node_legend_item(uint32_t color, const char *label)
+{
+    ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "graph-legend-item" });
+        ca_div_begin(&(Ca_DivDesc){
+            .width = 5.0f,
+            .height = 5.0f,
+            .background = color,
+            .style = "graph-node-swatch",
+        });
+        ca_div_end();
+        ca_text(&(Ca_TextDesc){ .text = label, .style = "graph-legend-label" });
+    ca_div_end();
+}
+
 static void build_graph_tab(Ca_Div *div, void *ud)
 {
     CTX_UNUSED(div); CTX_UNUSED(ud);
@@ -259,19 +445,32 @@ static void build_graph_tab(Ca_Div *div, void *ud)
         return;
     }
 
-    ca_div_begin(&(Ca_DivDesc){ .direction = CA_VERTICAL, .style = "graph-frame" });
-        if (s.force_graph)
-            ctx_force_graph_build(s.force_graph);
-    ca_div_end();
-
-    /* Stats row below the graph */
-    ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .gap = 16,
-                                .padding   = {8, 0, 0, 0} });
-        char buf[64];
-        snprintf(buf, sizeof(buf), "Indexed graph: %u symbols / %u edges",
-                 ctx_graph_symbol_count(g),
-                 ctx_graph_edge_count(g));
-        ca_text(&(Ca_TextDesc){ .text = buf, .style = "tbl-file" });
+    ca_div_begin(&(Ca_DivDesc){ .direction = CA_VERTICAL, .style = "graph-shell" });
+        ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "graph-toolbar" });
+            ca_text(&(Ca_TextDesc){ .text = "Dependency graph", .style = "graph-title" });
+            ca_spacer(&(Ca_SpacerDesc){ .width = 0.0f, .style = "graph-grow" });
+            ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "graph-legend" });
+                graph_legend_item(0x7aa2f7b8u, "calls");
+                graph_legend_item(0xe0af68a8u, "refs");
+                graph_legend_item(0xf7768eb8u, "inherits");
+            ca_div_end();
+            ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "graph-node-legend" });
+                graph_node_legend_item(0x7aa2f7ffu, "fn");
+                graph_node_legend_item(0x89b4faffu, "meth");
+                graph_node_legend_item(0xf7768effu, "cls");
+                graph_node_legend_item(0x9ece6affu, "struct");
+                graph_node_legend_item(0xe0af68ffu, "enum");
+                graph_node_legend_item(0xbb9af7ffu, "type");
+                graph_node_legend_item(0xff9e64ffu, "macro");
+                graph_node_legend_item(0x73dacaffu, "ns");
+                graph_node_legend_item(0x565f89ffu, "other");
+            ca_div_end();
+        ca_div_end();
+        if (s.force_graph) {
+            ca_div_begin(&(Ca_DivDesc){ .direction = CA_VERTICAL, .style = "graph-frame" });
+                ctx_force_graph_build(s.force_graph);
+            ca_div_end();
+        }
     ca_div_end();
 }
 
@@ -396,7 +595,7 @@ static void build_files_tab(Ca_Div *div, void *ud)
         ca_text(&(Ca_TextDesc){ .text = buf, .style = "tbl-row" });
         snprintf(buf, sizeof(buf), "%u symbols extracted", stats.symbols);
         ca_text(&(Ca_TextDesc){ .text = buf, .style = "tbl-row" });
-        snprintf(buf, sizeof(buf), "%u call edges resolved", stats.edges);
+        snprintf(buf, sizeof(buf), "%u semantic edges resolved", stats.edges);
         ca_text(&(Ca_TextDesc){ .text = buf, .style = "tbl-row" });
         snprintf(buf, sizeof(buf), "Indexed in %"PRId64" ms", stats.duration_ms);
         ca_text(&(Ca_TextDesc){ .text = buf, .style = "tbl-file" });
@@ -406,12 +605,34 @@ static void build_files_tab(Ca_Div *div, void *ud)
 /* --- Master content builder ------------------------------- */
 static void build_content(Ca_Div *div, void *ud)
 {
-    CTX_UNUSED(ud);
+    CTX_UNUSED(div); CTX_UNUSED(ud);
     int tab = s.active_tab;
-    if      (tab == 0) build_graph_tab  (div, NULL);
-    else if (tab == 1) build_symbols_tab(div, NULL);
-    else if (tab == 2) build_calls_tab  (div, NULL);
-    else               build_files_tab  (div, NULL);
+    ca_div_begin(&(Ca_DivDesc){ .style = "tabs-wrap" });
+        build_tab_button(0, "Graph");
+        build_tab_button(1, "Symbols");
+        build_tab_button(2, "Calls");
+        build_tab_button(3, "Files");
+    ca_div_end();
+
+    CtxIndexProgress prog;
+    ctx_indexer_get_progress(&prog);
+    float progress_value = 1.0f;
+    if (prog.running && prog.total > 0)
+        progress_value = (float)prog.done / (float)prog.total;
+    s.prog_bar = ca_progress(&(Ca_ProgressDesc){
+        .value     = progress_value,
+        .width     = 0.0f,
+        .height    = 2.0f,
+        .bar_color = 0x5d91bdff,
+        .style     = "prog-track",
+    });
+
+    ca_div_begin(&(Ca_DivDesc){ .direction = CA_VERTICAL, .style = "content-pad" });
+        if      (tab == 0) build_graph_tab  (NULL, NULL);
+        else if (tab == 1) build_symbols_tab(NULL, NULL);
+        else if (tab == 2) build_calls_tab  (NULL, NULL);
+        else               build_files_tab  (NULL, NULL);
+    ca_div_end();
 }
 
 /* ============================================================
@@ -449,8 +670,8 @@ bool ctx_ui_run(void)
 
     s.win = ca_window_create(s.inst, &(Ca_WindowDesc){
         .title  = "ctx",
-        .width  = 1280,
-        .height = 800,
+        .width  = 1080,
+        .height = 680,
     });
     if (!s.win) {
         ctx_force_graph_destroy(s.force_graph);
@@ -464,54 +685,28 @@ bool ctx_ui_run(void)
     s.content_needs_rebuild = true;
     ctx_event_subscribe(CTX_EVENT_GRAPH_UPDATED, on_graph_updated, NULL);
     ca_window_set_on_frame(s.win, on_frame, NULL);
+    ca_window_set_status_bar(s.win, status_bar_builder, NULL, 20.0f);
+
+    static const Ca_MenuItemDesc file_items[] = {
+        { .label = "Quit", .action = on_menu_quit },
+    };
+    static const Ca_MenuItemDesc view_items[] = {
+        { .label = "Graph",   .action = on_menu_tab, .action_data = &g_tab_actions[0] },
+        { .label = "Symbols", .action = on_menu_tab, .action_data = &g_tab_actions[1] },
+        { .label = "Calls",   .action = on_menu_tab, .action_data = &g_tab_actions[2] },
+        { .label = "Files",   .action = on_menu_tab, .action_data = &g_tab_actions[3] },
+    };
+    static const Ca_MenuDesc title_menus[] = {
+        { .label = "ctx",  .items = file_items, .item_count = 1 },
+        { .label = "View", .items = view_items, .item_count = 4 },
+    };
+    ca_window_set_title_bar_menus(s.win, title_menus, 2);
 
     /* ---- Retained UI tree ---- */
     ca_ui_begin(s.win, &(Ca_DivDesc){
         .direction = CA_VERTICAL,
         .style     = "chrome",
     });
-
-        /* -- Title bar ------------------------------------------ */
-        ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL,
-                                    .style     = "titlebar" });
-            ca_text(&(Ca_TextDesc){ .text = "ctx", .style = "app-name" });
-            ca_text(&(Ca_TextDesc){ .text = "|",   .style = "status-text" });
-            ca_text(&(Ca_TextDesc){ .text = "sym", .style = "pill" });
-            s.lbl_sym  = ca_text(&(Ca_TextDesc){ .text = "—", .style = "pill-val" });
-            ca_text(&(Ca_TextDesc){ .text = "edge", .style = "pill" });
-            s.lbl_edge = ca_text(&(Ca_TextDesc){ .text = "—", .style = "pill-val" });
-            ca_text(&(Ca_TextDesc){ .text = "|",   .style = "status-text" });
-            s.lbl_status = ca_text(&(Ca_TextDesc){ .text = "starting\xe2\x80\xa6",
-                                                   .style = "status-busy" });
-        ca_div_end();
-
-        /* Progress bar — 2px strip under title bar */
-        s.prog_bar = ca_progress(&(Ca_ProgressDesc){
-            .value     = 0.0f,
-            .width     = 0.0f,
-            .height    = 2.0f,
-            .bar_color = 0x7aa2f7ff,
-            .style     = "prog-track",
-        });
-
-        /* -- Tab bar -------------------------------------------- */
-        static const char *tab_labels[] = { "Graph", "Symbols", "Calls", "Files" };
-        ca_div_begin(&(Ca_DivDesc){ .style = "tabs-wrap" });
-            s.tabs = ca_tabs(&(Ca_TabBarDesc){
-                .labels        = tab_labels,
-                .count         = 4,
-                .active        = 0,
-                .on_change     = on_tab_change,
-                .active_bg     = 0x0e1013ff,
-                .inactive_bg   = 0x00000000,
-                .active_text   = 0x7aa2f7ff,
-                .inactive_text = 0x565f89ff,
-                .tab_padding_x = 14,
-            });
-        ca_div_end();
-
-        /* Hairline separator */
-        ca_hr(&(Ca_HrDesc){ .thickness = 1, .color = 0x22293380 });
 
         /* -- Content pane (reactive) ---------------------------- */
         s.content_div = ca_div_begin(&(Ca_DivDesc){

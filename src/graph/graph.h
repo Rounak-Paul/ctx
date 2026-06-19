@@ -32,20 +32,21 @@ typedef struct CtxEdgeEntry {
     UT_hash_handle   hh;
 } CtxEdgeEntry;
 
-/* Unresolved call: caller site + bare callee name, resolved post-index.
+/* Unresolved semantic edge: source site + target symbol name, resolved post-index.
  * Uses heap strings to keep the array compact (~28 bytes/entry vs 4612). */
 typedef struct {
     char    *caller_file;   /* owned, must free */
     char    *caller_name;   /* owned, may be NULL */
     char    *callee_name;   /* owned */
     uint32_t caller_line;
+    CtxEdgeKind kind;
 } CtxPendingCall;
 
 typedef struct {
     CtxSymbol    *symbols;    /* uthash by id */
     CtxEdgeEntry *edges;      /* uthash by composite FNV key stored in from_id field */
 
-    /* Pending call list — populated during extraction, resolved post-index */
+    /* Pending semantic edge list — populated during extraction, resolved post-index */
     CtxPendingCall *pending_calls;
     uint32_t        pending_count;
     uint32_t        pending_cap;
@@ -76,11 +77,14 @@ void ctx_graph_runlock(CtxGraph *g);
 void ctx_graph_wlock(CtxGraph *g);
 void ctx_graph_wunlock(CtxGraph *g);
 
-/* Accumulate an unresolved call during extraction (thread-safe) */
+/* Accumulate an unresolved call during extraction (thread-safe). */
 void ctx_graph_add_pending_call(CtxGraph *g, const char *caller_file,
                                 const char *caller_name, uint32_t caller_line,
                                 const char *callee_name);
+void ctx_graph_add_pending_edge(CtxGraph *g, const char *from_file,
+                                const char *from_name, uint32_t from_line,
+                                const char *to_name, CtxEdgeKind kind);
 
-/* Resolve all pending calls against the symbol table; called post-index.
+/* Resolve all pending semantic edges against the symbol table; called post-index.
  * Returns the number of edges added. */
 uint32_t ctx_graph_resolve_calls(CtxGraph *g);

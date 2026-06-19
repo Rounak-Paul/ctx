@@ -192,7 +192,23 @@ CtxSymbol *ctx_graph_find_by_name(CtxGraph *g, const char *name) {
 void ctx_graph_add_pending_call(CtxGraph *g, const char *caller_file,
                                 const char *caller_name, uint32_t caller_line,
                                 const char *callee_name) {
-    if (!g || !callee_name || !callee_name[0]) return;
+    ctx_graph_add_pending_edge(g, caller_file, caller_name, caller_line,
+                               callee_name, CTX_EDGE_CALLS);
+}
+
+/*
+ * Adds an unresolved semantic edge for the post-index resolver.
+ *
+ * from_file  Source file used as a fallback when the source symbol is unresolved.
+ * from_name  Source symbol name. May be NULL for anonymous call sites.
+ * from_line  Source line used for fallback source ids.
+ * to_name    Target symbol name resolved after all files are indexed.
+ * kind       Edge kind to create after resolution.
+ */
+void ctx_graph_add_pending_edge(CtxGraph *g, const char *from_file,
+                                const char *from_name, uint32_t from_line,
+                                const char *to_name, CtxEdgeKind kind) {
+    if (!g || !to_name || !to_name[0]) return;
 
 #if defined(CTX_PLATFORM_WINDOWS)
     EnterCriticalSection(&g->pending_lock);
@@ -208,10 +224,11 @@ void ctx_graph_add_pending_call(CtxGraph *g, const char *caller_file,
     }
     if (g->pending_calls && g->pending_count < g->pending_cap) {
         CtxPendingCall *pc = &g->pending_calls[g->pending_count++];
-        pc->caller_file = caller_file ? strdup(caller_file) : NULL;
-        pc->caller_name = (caller_name && caller_name[0]) ? strdup(caller_name) : NULL;
-        pc->callee_name = strdup(callee_name);
-        pc->caller_line = caller_line;
+        pc->caller_file = from_file ? strdup(from_file) : NULL;
+        pc->caller_name = (from_name && from_name[0]) ? strdup(from_name) : NULL;
+        pc->callee_name = strdup(to_name);
+        pc->caller_line = from_line;
+        pc->kind = kind;
         if (!pc->callee_name) {
             free(pc->caller_file);
             free(pc->caller_name);
@@ -236,7 +253,7 @@ typedef struct NameEntry {
 uint32_t ctx_graph_resolve_calls(CtxGraph *g) {
     if (!g || !g->pending_count) return 0;
 
-    CTX_LOG_DEBUG("Resolving %u pending calls against %u symbols",
+    CTX_LOG_DEBUG("Resolving %u pending semantic edges against %u symbols",
                   g->pending_count, HASH_COUNT(g->symbols));
 
     /* Build a temporary name→id hash for O(1) lookup during resolution */
@@ -280,7 +297,7 @@ uint32_t ctx_graph_resolve_calls(CtxGraph *g) {
                 caller_id = ctx_symbol_id(pc->caller_file ? pc->caller_file : "",
                                           pc->callee_name, pc->caller_line);
             }
-            ctx_graph_add_edge(g, caller_id, ce->id, CTX_EDGE_CALLS);
+            ctx_graph_add_edge(g, caller_id, ce->id, pc->kind);
             resolved++;
         }
 
@@ -296,7 +313,7 @@ uint32_t ctx_graph_resolve_calls(CtxGraph *g) {
         HASH_ITER(hh, name_map, ne, ntmp) { HASH_DEL(name_map, ne); free(ne); }
     }
 
-    CTX_LOG_DEBUG("Resolve complete: %u edges added, %u unresolved (callee not in graph)", resolved, missed);
+    CTX_LOG_DEBUG("Resolve complete: %u edges added, %u unresolved (target not in graph)", resolved, missed);
 
     free(g->pending_calls);
     g->pending_calls  = NULL;

@@ -3,6 +3,7 @@
 #include "../log/log.h"
 #include "../jobs/jobs.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -20,6 +21,56 @@ static char *node_text(const char *src, TSNode node, char *buf, size_t buf_sz) {
     return buf;
 }
 
+static bool is_identifier_type(const char *type);
+
+static void rightmost_symbol_name(char *text) {
+    if (!text || !text[0]) return;
+
+    char *last = text;
+    for (char *p = text; *p; ++p) {
+        if (*p == '.' || *p == ':' || *p == '>' || *p == '/') {
+            char *next = p + 1;
+            while (*next == ':' || *next == '>' || *next == '.' || *next == '/') next++;
+            if (*next) last = next;
+        }
+    }
+    if (last != text)
+        memmove(text, last, strlen(last) + 1);
+
+    size_t len = strlen(text);
+    while (len > 0 && !isalnum((unsigned char)text[len - 1]) && text[len - 1] != '_')
+        text[--len] = '\0';
+}
+
+static bool symbol_name_from_node(const char *src, TSNode node, char *buf, size_t buf_sz) {
+    if (!buf || buf_sz == 0) return false;
+    buf[0] = '\0';
+    if (ts_node_is_null(node)) return false;
+
+    const char *type = ts_node_type(node);
+    if (is_identifier_type(type)) {
+        node_text(src, node, buf, buf_sz);
+        rightmost_symbol_name(buf);
+        return buf[0] != '\0';
+    }
+
+    TSNode stack[128];
+    uint32_t count = 0;
+    stack[count++] = node;
+    while (count > 0) {
+        TSNode cur = stack[--count];
+        if (is_identifier_type(ts_node_type(cur))) {
+            node_text(src, cur, buf, buf_sz);
+            rightmost_symbol_name(buf);
+            return buf[0] != '\0';
+        }
+        uint32_t n = ts_node_child_count(cur);
+        for (uint32_t i = 0; i < n && count < 128; ++i)
+            stack[count++] = ts_node_child(cur, i);
+    }
+    return false;
+}
+
 /* ---- find first child of given type ---- */
 static TSNode find_child(TSNode parent, const char *type) {
     if (ts_node_is_null(parent)) { TSNode null = {0}; return null; }
@@ -30,6 +81,115 @@ static TSNode find_child(TSNode parent, const char *type) {
     }
     TSNode null = {0};
     return null;
+}
+
+static bool type_contains(const char *type, const char *needle) {
+    return type && needle && strstr(type, needle) != NULL;
+}
+
+static bool is_identifier_type(const char *type) {
+    return type && (!strcmp(type, "identifier") ||
+                    !strcmp(type, "type_identifier") ||
+                    !strcmp(type, "field_identifier") ||
+                    !strcmp(type, "property_identifier") ||
+                    !strcmp(type, "dotted_name") ||
+                    !strcmp(type, "qualified_identifier") ||
+                    !strcmp(type, "scoped_identifier"));
+}
+
+static bool is_inheritance_container(const char *type) {
+    return type && (type_contains(type, "superclass") ||
+                    type_contains(type, "base_class") ||
+                    type_contains(type, "base_clause") ||
+                    type_contains(type, "extends") ||
+                    type_contains(type, "heritage"));
+}
+
+static bool is_declaration_name(TSNode node) {
+    TSNode parent = ts_node_parent(node);
+    if (ts_node_is_null(parent)) return false;
+
+    const char *ptype = ts_node_type(parent);
+    if (type_contains(ptype, "declarator") ||
+        type_contains(ptype, "declaration") ||
+        type_contains(ptype, "definition") ||
+        type_contains(ptype, "specifier") ||
+        type_contains(ptype, "alias")) {
+        return true;
+    }
+
+    TSNode grand = ts_node_parent(parent);
+    if (!ts_node_is_null(grand)) {
+        const char *gtype = ts_node_type(grand);
+        if (type_contains(gtype, "declarator") ||
+            type_contains(gtype, "declaration") ||
+            type_contains(gtype, "definition") ||
+            type_contains(gtype, "specifier") ||
+            type_contains(gtype, "alias")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool is_call_target(TSNode node) {
+    TSNode parent = ts_node_parent(node);
+    if (ts_node_is_null(parent)) return false;
+    const char *ptype = ts_node_type(parent);
+    if (!strcmp(ptype, "call_expression") || !strcmp(ptype, "call"))
+        return true;
+
+    TSNode grand = ts_node_parent(parent);
+    if (ts_node_is_null(grand)) return false;
+    const char *gtype = ts_node_type(grand);
+    return (!strcmp(gtype, "call_expression") || !strcmp(gtype, "call"));
+}
+
+/*
+ * Emits inheritance edges from a class-like symbol to base symbols found in
+ * language-specific inheritance clauses.
+ *
+ * graph      Graph receiving unresolved edges.
+ * source     Source text backing the tree-sitter nodes.
+ * filepath   File owning the source symbol.
+ * class_name Emitted class/struct symbol name.
+ * class_line Emitted class/struct symbol line.
+ * node       Class/struct node to inspect.
+ */
+static void emit_inheritance_edges(CtxGraph *graph, const char *source,
+                                   const char *filepath, const char *class_name,
+                                   uint32_t class_line, TSNode node) {
+    if (!graph || !source || !class_name || !class_name[0]) return;
+
+    TSNode containers[16];
+    uint32_t container_count = 0;
+    uint32_t child_count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < child_count && container_count < 16; ++i) {
+        TSNode child = ts_node_child(node, i);
+        if (is_inheritance_container(ts_node_type(child)))
+            containers[container_count++] = child;
+    }
+
+    for (uint32_t i = 0; i < container_count; ++i) {
+        TSNode stack[128];
+        uint32_t count = 0;
+        stack[count++] = containers[i];
+        while (count > 0) {
+            TSNode cur = stack[--count];
+            const char *ctype = ts_node_type(cur);
+            if (is_identifier_type(ctype)) {
+                char base_name[256] = {0};
+                node_text(source, cur, base_name, sizeof(base_name));
+                if (base_name[0] && strcmp(base_name, class_name) != 0) {
+                    ctx_graph_add_pending_edge(graph, filepath, class_name, class_line,
+                                               base_name, CTX_EDGE_INHERITS);
+                }
+            }
+            uint32_t n = ts_node_child_count(cur);
+            for (uint32_t j = n; j > 0 && count < 128; --j)
+                stack[count++] = ts_node_child(cur, j - 1);
+        }
+    }
 }
 
 /* ---- symbol kind from node type string ---- */
@@ -54,29 +214,25 @@ static CtxSymbolKind sym_kind_for(const char *ntype) {
     return CTX_SYM_UNKNOWN;
 }
 
-static bool str_contains(const char *s, const char *needle) {
-    return s && needle && strstr(s, needle) != NULL;
-}
-
 static bool should_emit_generic_node(TSNode node, const char *ntype) {
     if (!ntype || !ts_node_is_named(node) || ts_node_is_extra(node)) return false;
     if (!strcmp(ntype, "comment") || !strcmp(ntype, "string") ||
         !strcmp(ntype, "string_literal") || !strcmp(ntype, "ERROR")) {
         return false;
     }
-    return str_contains(ntype, "declaration") ||
-           str_contains(ntype, "definition") ||
-           str_contains(ntype, "specifier") ||
-           str_contains(ntype, "import") ||
-           str_contains(ntype, "include") ||
-           str_contains(ntype, "namespace") ||
-           str_contains(ntype, "class") ||
-           str_contains(ntype, "struct") ||
-           str_contains(ntype, "enum") ||
-           str_contains(ntype, "typedef") ||
-           str_contains(ntype, "type_alias") ||
-           str_contains(ntype, "function") ||
-           str_contains(ntype, "method");
+    return type_contains(ntype, "declaration") ||
+           type_contains(ntype, "definition") ||
+           type_contains(ntype, "specifier") ||
+           type_contains(ntype, "import") ||
+           type_contains(ntype, "include") ||
+           type_contains(ntype, "namespace") ||
+           type_contains(ntype, "class") ||
+           type_contains(ntype, "struct") ||
+           type_contains(ntype, "enum") ||
+           type_contains(ntype, "typedef") ||
+           type_contains(ntype, "type_alias") ||
+           type_contains(ntype, "function") ||
+           type_contains(ntype, "method");
 }
 
 static void generic_node_name(const char *src, TSNode node, const char *ntype,
@@ -209,7 +365,7 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn, char pushed
         if (ts_node_is_null(fn_node)) fn_node = find_child(node, "field_expression");
         if (!ts_node_is_null(fn_node)) {
             char callee_name[256] = {0};
-            node_text(ctx->source, fn_node, callee_name, sizeof(callee_name));
+            symbol_name_from_node(ctx->source, fn_node, callee_name, sizeof(callee_name));
             if (callee_name[0]) {
                 uint32_t call_line = ts_node_start_point(node).row + 1;
                 ctx_graph_add_pending_call(ctx->graph, ctx->filepath,
@@ -239,6 +395,20 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn, char pushed
                              !strcmp(ntype, "struct_specifier")    ||
                              !strcmp(ntype, "enum_specifier"));
         ctx_graph_add_symbol(ctx->graph, &sym);
+        if (kind == CTX_SYM_CLASS || kind == CTX_SYM_STRUCT) {
+            emit_inheritance_edges(ctx->graph, ctx->source, ctx->filepath,
+                                   namebuf, sym.line, node);
+        }
+    } else if (ctx->enclosing_fn[0] && is_identifier_type(ntype) &&
+               !is_call_target(node) && !is_declaration_name(node)) {
+        char ref_name[256] = {0};
+        symbol_name_from_node(ctx->source, node, ref_name, sizeof(ref_name));
+        if (ref_name[0] && strcmp(ref_name, ctx->enclosing_fn) != 0) {
+            uint32_t ref_line = ts_node_start_point(node).row + 1;
+            ctx_graph_add_pending_edge(ctx->graph, ctx->filepath,
+                                       ctx->enclosing_fn, ref_line,
+                                       ref_name, CTX_EDGE_REFERENCES);
+        }
     }
 
     /* Track enclosing function for call attribution */

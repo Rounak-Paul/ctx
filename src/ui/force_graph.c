@@ -6,6 +6,7 @@
 #define CTX_FG_MAX_NODES 1200u
 #define CTX_FG_MAX_EDGES 6000u
 #define CTX_FG_NODE_SEGMENTS 10u
+#define CTX_FG_LABEL_VERTEX_BUDGET 1500000u
 
 typedef struct {
     uint64_t id;
@@ -41,6 +42,7 @@ typedef struct {
 typedef struct {
     uint32_t from;
     uint32_t to;
+    CtxEdgeKind kind;
 } ForceEdge;
 
 typedef struct {
@@ -72,6 +74,8 @@ struct CtxForceGraph {
     float mouse_y;
     bool left_down;
     bool panning;
+    int32_t hover_node;
+    int32_t selected_node;
     int32_t drag_node;
     float drag_dx;
     float drag_dy;
@@ -91,7 +95,7 @@ static const char *GRAPH_VERT_GLSL =
     "layout(location=0) out vec4 out_color;\n"
     "void main() {\n"
     "  vec2 ndc = (in_pos / pc.viewport) * 2.0 - 1.0;\n"
-    "  gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);\n"
+    "  gl_Position = vec4(ndc.x, ndc.y, 0.0, 1.0);\n"
     "  out_color = in_color;\n"
     "}\n";
 
@@ -141,9 +145,43 @@ static uint32_t color_for_kind(CtxSymbolKind kind)
     }
 }
 
+static uint32_t color_for_edge(CtxEdgeKind kind)
+{
+    switch (kind) {
+        case CTX_EDGE_CALLS:      return 0x7aa2f7b8u;
+        case CTX_EDGE_REFERENCES: return 0xe0af68a8u;
+        case CTX_EDGE_INHERITS:   return 0xf7768eb8u;
+        case CTX_EDGE_INCLUDES:
+        case CTX_EDGE_DEFINES:
+        default:                  return 0xe0af68a8u;
+    }
+}
+
+static const char *label_for_edge(CtxEdgeKind kind)
+{
+    switch (kind) {
+        case CTX_EDGE_CALLS:    return "calls";
+        case CTX_EDGE_INHERITS: return "inherits";
+        case CTX_EDGE_REFERENCES:
+        case CTX_EDGE_INCLUDES:
+        case CTX_EDGE_DEFINES:
+        default:                return "refs";
+    }
+}
+
+static bool is_visible_edge_kind(CtxEdgeKind kind)
+{
+    return kind == CTX_EDGE_CALLS ||
+           kind == CTX_EDGE_REFERENCES ||
+           kind == CTX_EDGE_INHERITS ||
+           kind == CTX_EDGE_INCLUDES ||
+           kind == CTX_EDGE_DEFINES;
+}
+
 static int candidate_score(const Candidate *c)
 {
-    int base = c->is_definition ? 40 : 0;
+    int base = c->degree > 0 ? 180 : 0;
+    if (c->is_definition) base += 40;
     switch (c->kind) {
         case CTX_SYM_FUNCTION:
         case CTX_SYM_METHOD:    base += 120; break;
@@ -155,7 +193,7 @@ static int candidate_score(const Candidate *c)
         case CTX_SYM_MACRO:     base += 70; break;
         default:                base += 12; break;
     }
-    return base + (int)c->degree * 16;
+    return base + (int)c->degree * 24;
 }
 
 static int compare_candidates(const void *a, const void *b)
@@ -177,6 +215,18 @@ static bool point_in_viewport(const CtxForceGraph *view, float x, float y)
     return vw > 0.0f && vh > 0.0f && x >= vx && x <= vx + vw && y >= vy && y <= vy + vh;
 }
 
+static void viewport_logical_size(const CtxForceGraph *view, float *w, float *h)
+{
+    float vx = 0.0f, vy = 0.0f, vw = 1.0f, vh = 1.0f;
+    CTX_UNUSED(vx); CTX_UNUSED(vy);
+    if (view && view->viewport)
+        ca_viewport_screen_rect(view->viewport, &vx, &vy, &vw, &vh);
+    if (vw <= 0.0f) vw = 1.0f;
+    if (vh <= 0.0f) vh = 1.0f;
+    if (w) *w = vw;
+    if (h) *h = vh;
+}
+
 static void screen_to_world(const CtxForceGraph *view, float sx, float sy, float *wx, float *wy)
 {
     float vx = 0.0f, vy = 0.0f, vw = 1.0f, vh = 1.0f;
@@ -186,12 +236,29 @@ static void screen_to_world(const CtxForceGraph *view, float sx, float sy, float
     *wy = (sy - vy - vh * 0.5f - view->pan_y) / view->zoom;
 }
 
-static void world_to_screen(const CtxForceGraph *view, float wx, float wy, float *sx, float *sy)
+static void world_to_local(const CtxForceGraph *view, float wx, float wy, float *sx, float *sy)
 {
-    uint32_t w = view->viewport ? ca_viewport_width(view->viewport) : 1u;
-    uint32_t h = view->viewport ? ca_viewport_height(view->viewport) : 1u;
-    *sx = (float)w * 0.5f + view->pan_x + wx * view->zoom;
-    *sy = (float)h * 0.5f + view->pan_y + wy * view->zoom;
+    float w = 1.0f, h = 1.0f;
+    viewport_logical_size(view, &w, &h);
+    *sx = w * 0.5f + view->pan_x + wx * view->zoom;
+    *sy = h * 0.5f + view->pan_y + wy * view->zoom;
+}
+
+static void local_to_pixel(const CtxForceGraph *view, float lx, float ly, float *px, float *py)
+{
+    float lw = 1.0f, lh = 1.0f;
+    viewport_logical_size(view, &lw, &lh);
+    uint32_t pw = view->viewport ? ca_viewport_width(view->viewport) : 1u;
+    uint32_t ph = view->viewport ? ca_viewport_height(view->viewport) : 1u;
+    *px = lx * ((float)pw / lw);
+    *py = ly * ((float)ph / lh);
+}
+
+static void world_to_pixel(const CtxForceGraph *view, float wx, float wy, float *px, float *py)
+{
+    float lx = 0.0f, ly = 0.0f;
+    world_to_local(view, wx, wy, &lx, &ly);
+    local_to_pixel(view, lx, ly, px, py);
 }
 
 static int32_t pick_node(CtxForceGraph *view, float sx, float sy)
@@ -460,6 +527,108 @@ static void push_circle(GraphVertex **cursor, float cx, float cy, float radius, 
     }
 }
 
+static void push_rect_vertices(GraphVertex **cursor, float x, float y, float w, float h,
+                               const float color[4])
+{
+    push_vertex(cursor, x,     y,     color);
+    push_vertex(cursor, x + w, y,     color);
+    push_vertex(cursor, x + w, y + h, color);
+    push_vertex(cursor, x,     y,     color);
+    push_vertex(cursor, x + w, y + h, color);
+    push_vertex(cursor, x,     y + h, color);
+}
+
+static uint8_t glyph_row(char ch, uint32_t row)
+{
+    if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+    switch (ch) {
+        case 'A': { static const uint8_t r[7] = {14,17,17,31,17,17,17}; return r[row]; }
+        case 'B': { static const uint8_t r[7] = {30,17,17,30,17,17,30}; return r[row]; }
+        case 'C': { static const uint8_t r[7] = {14,17,16,16,16,17,14}; return r[row]; }
+        case 'D': { static const uint8_t r[7] = {30,17,17,17,17,17,30}; return r[row]; }
+        case 'E': { static const uint8_t r[7] = {31,16,16,30,16,16,31}; return r[row]; }
+        case 'F': { static const uint8_t r[7] = {31,16,16,30,16,16,16}; return r[row]; }
+        case 'G': { static const uint8_t r[7] = {14,17,16,23,17,17,14}; return r[row]; }
+        case 'H': { static const uint8_t r[7] = {17,17,17,31,17,17,17}; return r[row]; }
+        case 'I': { static const uint8_t r[7] = {14,4,4,4,4,4,14}; return r[row]; }
+        case 'J': { static const uint8_t r[7] = {7,2,2,2,18,18,12}; return r[row]; }
+        case 'K': { static const uint8_t r[7] = {17,18,20,24,20,18,17}; return r[row]; }
+        case 'L': { static const uint8_t r[7] = {16,16,16,16,16,16,31}; return r[row]; }
+        case 'M': { static const uint8_t r[7] = {17,27,21,21,17,17,17}; return r[row]; }
+        case 'N': { static const uint8_t r[7] = {17,25,21,19,17,17,17}; return r[row]; }
+        case 'O': { static const uint8_t r[7] = {14,17,17,17,17,17,14}; return r[row]; }
+        case 'P': { static const uint8_t r[7] = {30,17,17,30,16,16,16}; return r[row]; }
+        case 'Q': { static const uint8_t r[7] = {14,17,17,17,21,18,13}; return r[row]; }
+        case 'R': { static const uint8_t r[7] = {30,17,17,30,20,18,17}; return r[row]; }
+        case 'S': { static const uint8_t r[7] = {15,16,16,14,1,1,30}; return r[row]; }
+        case 'T': { static const uint8_t r[7] = {31,4,4,4,4,4,4}; return r[row]; }
+        case 'U': { static const uint8_t r[7] = {17,17,17,17,17,17,14}; return r[row]; }
+        case 'V': { static const uint8_t r[7] = {17,17,17,17,17,10,4}; return r[row]; }
+        case 'W': { static const uint8_t r[7] = {17,17,17,21,21,21,10}; return r[row]; }
+        case 'X': { static const uint8_t r[7] = {17,17,10,4,10,17,17}; return r[row]; }
+        case 'Y': { static const uint8_t r[7] = {17,17,10,4,4,4,4}; return r[row]; }
+        case 'Z': { static const uint8_t r[7] = {31,1,2,4,8,16,31}; return r[row]; }
+        case '0': { static const uint8_t r[7] = {14,17,19,21,25,17,14}; return r[row]; }
+        case '1': { static const uint8_t r[7] = {4,12,4,4,4,4,14}; return r[row]; }
+        case '2': { static const uint8_t r[7] = {14,17,1,2,4,8,31}; return r[row]; }
+        case '3': { static const uint8_t r[7] = {30,1,1,14,1,1,30}; return r[row]; }
+        case '4': { static const uint8_t r[7] = {2,6,10,18,31,2,2}; return r[row]; }
+        case '5': { static const uint8_t r[7] = {31,16,16,30,1,1,30}; return r[row]; }
+        case '6': { static const uint8_t r[7] = {14,16,16,30,17,17,14}; return r[row]; }
+        case '7': { static const uint8_t r[7] = {31,1,2,4,8,8,8}; return r[row]; }
+        case '8': { static const uint8_t r[7] = {14,17,17,14,17,17,14}; return r[row]; }
+        case '9': { static const uint8_t r[7] = {14,17,17,15,1,1,14}; return r[row]; }
+        case '_': { static const uint8_t r[7] = {0,0,0,0,0,0,31}; return r[row]; }
+        case '-': { static const uint8_t r[7] = {0,0,0,14,0,0,0}; return r[row]; }
+        case '.': { static const uint8_t r[7] = {0,0,0,0,0,12,12}; return r[row]; }
+        case '/': { static const uint8_t r[7] = {1,1,2,4,8,16,16}; return r[row]; }
+        default:  { static const uint8_t r[7] = {0,0,14,0,0,0,0}; return r[row]; }
+    }
+}
+
+static uint32_t label_len(const char *text, uint32_t max_chars)
+{
+    uint32_t n = 0;
+    while (text && text[n] && n < max_chars) n++;
+    return n;
+}
+
+static void push_text_label(GraphVertex **cursor, float x, float y, const char *text,
+                            uint32_t max_chars, float scale, uint32_t fg_color,
+                            float bounds_w, float bounds_h)
+{
+    uint32_t len = label_len(text, max_chars);
+    if (len == 0) return;
+
+    float char_w = 6.0f * scale;
+    float label_w = (float)len * char_w + 4.0f * scale;
+    float label_h = 9.0f * scale;
+    if (bounds_w > label_w + 4.0f * scale)
+        x = clampf(x, 2.0f * scale, bounds_w - label_w - 2.0f * scale);
+    if (bounds_h > label_h + 4.0f * scale)
+        y = clampf(y, 2.0f * scale, bounds_h - label_h - 2.0f * scale);
+
+    float fg[4], bg[4];
+    rgba(fg_color, fg);
+    rgba(0x07090ce6u, bg);
+    push_rect_vertices(cursor, x - 2.0f * scale, y - 1.0f * scale, label_w, label_h, bg);
+
+    for (uint32_t i = 0; i < len; ++i) {
+        char ch = text[i];
+        if (ch == ' ') continue;
+        for (uint32_t row = 0; row < 7; ++row) {
+            uint8_t bits = glyph_row(ch, row);
+            for (uint32_t col = 0; col < 5; ++col) {
+                if (!(bits & (uint8_t)(1u << (4u - col)))) continue;
+                push_rect_vertices(cursor,
+                                   x + (float)i * char_w + (float)col * scale,
+                                   y + (float)row * scale,
+                                   scale, scale, fg);
+            }
+        }
+    }
+}
+
 static void clear_rect(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                        float x, float y, float w, float h, uint32_t color)
 {
@@ -498,11 +667,12 @@ static void clear_rect(VkCommandBuffer cmd, uint32_t width, uint32_t height,
 
 static void clear_line(VkCommandBuffer cmd, CtxForceGraph *view,
                        uint32_t width, uint32_t height,
-                       const ForceNode *a, const ForceNode *b)
+                       const ForceNode *a, const ForceNode *b,
+                       uint32_t color)
 {
     float ax, ay, bx, by;
-    world_to_screen(view, a->x, a->y, &ax, &ay);
-    world_to_screen(view, b->x, b->y, &bx, &by);
+    world_to_pixel(view, a->x, a->y, &ax, &ay);
+    world_to_pixel(view, b->x, b->y, &bx, &by);
     float dx = bx - ax;
     float dy = by - ay;
     float dist = fmaxf(fabsf(dx), fabsf(dy));
@@ -513,7 +683,7 @@ static void clear_line(VkCommandBuffer cmd, CtxForceGraph *view,
         float t = (float)i / (float)steps;
         float x = ax + dx * t;
         float y = ay + dy * t;
-        clear_rect(cmd, width, height, x - 1.0f, y - 1.0f, 2.0f, 2.0f, 0x394b70ffu);
+        clear_rect(cmd, width, height, x - 1.0f, y - 1.0f, 2.0f, 2.0f, color);
     }
 }
 
@@ -533,14 +703,16 @@ static void clear_graph_fallback(VkCommandBuffer cmd, CtxForceGraph *view,
     for (uint32_t i = 0; i < edge_limit; ++i) {
         ForceEdge *e = &view->edges[i];
         if (e->from >= view->node_count || e->to >= view->node_count) continue;
-        clear_line(cmd, view, width, height, &view->nodes[e->from], &view->nodes[e->to]);
+        clear_line(cmd, view, width, height,
+                   &view->nodes[e->from], &view->nodes[e->to],
+                   color_for_edge(e->kind));
     }
 
     uint32_t node_limit = view->node_count < CTX_FG_MAX_NODES ? view->node_count : CTX_FG_MAX_NODES;
     for (uint32_t i = 0; i < node_limit; ++i) {
         ForceNode *n = &view->nodes[i];
         float sx, sy;
-        world_to_screen(view, n->x, n->y, &sx, &sy);
+        world_to_pixel(view, n->x, n->y, &sx, &sy);
         float r = clampf(n->radius * view->zoom, 4.0f, 13.0f);
         clear_rect(cmd, width, height, sx - r, sy - r, r * 2.0f, r * 2.0f, color_for_kind(n->kind));
         clear_rect(cmd, width, height, sx - 1.0f, sy - 1.0f, 2.0f, 2.0f, 0x090a0cffu);
@@ -551,17 +723,17 @@ static uint32_t build_vertices(CtxForceGraph *view, GraphVertex *vertices, uint3
 {
     CTX_UNUSED(max_vertices);
     GraphVertex *cursor = vertices;
-    float edge_col[4];
-    rgba(0x7aa2f738u, edge_col);
-
     for (uint32_t i = 0; i < view->edge_count; ++i) {
         ForceEdge *e = &view->edges[i];
         if (e->from >= view->node_count || e->to >= view->node_count) continue;
+        float edge_col[4];
+        rgba(color_for_edge(e->kind), edge_col);
+        edge_col[3] *= 0.46f;
         ForceNode *a = &view->nodes[e->from];
         ForceNode *b = &view->nodes[e->to];
         float ax, ay, bx, by;
-        world_to_screen(view, a->x, a->y, &ax, &ay);
-        world_to_screen(view, b->x, b->y, &bx, &by);
+        world_to_pixel(view, a->x, a->y, &ax, &ay);
+        world_to_pixel(view, b->x, b->y, &bx, &by);
         push_line(&cursor, ax, ay, bx, by, 1.25f, edge_col);
     }
 
@@ -571,8 +743,65 @@ static uint32_t build_vertices(CtxForceGraph *view, GraphVertex *vertices, uint3
         rgba(color_for_kind(n->kind), col);
         col[3] = n->pinned ? 1.0f : 0.92f;
         float sx, sy;
-        world_to_screen(view, n->x, n->y, &sx, &sy);
-        push_circle(&cursor, sx, sy, clampf(n->radius * view->zoom, 2.4f, 12.0f), col);
+        world_to_pixel(view, n->x, n->y, &sx, &sy);
+        float r = clampf(n->radius * view->zoom, 2.4f, 12.0f);
+        if ((int32_t)i == view->selected_node || (int32_t)i == view->hover_node) {
+            float ring[4];
+            rgba((int32_t)i == view->selected_node ? 0xd7defa70u : 0xffffff38u, ring);
+            push_circle(&cursor, sx, sy, r + ((int32_t)i == view->selected_node ? 5.0f : 3.0f), ring);
+        }
+        push_circle(&cursor, sx, sy, r, col);
+    }
+
+    if (view->zoom >= 0.65f) {
+        float lw = 1.0f, lh = 1.0f;
+        viewport_logical_size(view, &lw, &lh);
+        uint32_t pw = view->viewport ? ca_viewport_width(view->viewport) : 1u;
+        uint32_t ph = view->viewport ? ca_viewport_height(view->viewport) : 1u;
+        float pixel_scale = fminf((float)pw / lw, (float)ph / lh);
+        float text_scale = clampf(pixel_scale * (0.95f + view->zoom * 0.18f), 1.25f, 2.4f);
+        uint32_t label_limit = view->zoom >= 1.8f ? 600u :
+                               view->zoom >= 1.25f ? 320u : 120u;
+        if (label_limit > view->node_count) label_limit = view->node_count;
+        for (uint32_t i = 0; i < view->node_count; ++i) {
+            bool force_label = (int32_t)i == view->selected_node || (int32_t)i == view->hover_node;
+            if (i >= label_limit && !force_label) continue;
+            ForceNode *n = &view->nodes[i];
+            float sx, sy;
+            world_to_pixel(view, n->x, n->y, &sx, &sy);
+            float r = clampf(n->radius * view->zoom * pixel_scale, 4.0f, 15.0f);
+            push_text_label(&cursor, sx + r + 5.0f, sy - 4.0f * text_scale,
+                            n->name, 28u, text_scale, 0xd7defaffu, (float)pw, (float)ph);
+        }
+    }
+
+    if (view->zoom >= 1.75f) {
+        uint32_t edge_label_limit = view->edge_count < 96u ? view->edge_count : 96u;
+        float lw = 1.0f, lh = 1.0f;
+        viewport_logical_size(view, &lw, &lh);
+        uint32_t pw = view->viewport ? ca_viewport_width(view->viewport) : 1u;
+        uint32_t ph = view->viewport ? ca_viewport_height(view->viewport) : 1u;
+        float pixel_scale = fminf((float)pw / lw, (float)ph / lh);
+        float text_scale = clampf(pixel_scale * (0.95f + view->zoom * 0.10f), 1.15f, 1.75f);
+        for (uint32_t i = 0; i < edge_label_limit; ++i) {
+            ForceEdge *e = &view->edges[i];
+            if (e->from >= view->node_count || e->to >= view->node_count) continue;
+            ForceNode *a = &view->nodes[e->from];
+            ForceNode *b = &view->nodes[e->to];
+            float ax, ay, bx, by;
+            world_to_pixel(view, a->x, a->y, &ax, &ay);
+            world_to_pixel(view, b->x, b->y, &bx, &by);
+            float dx = bx - ax;
+            float dy = by - ay;
+            float len = sqrtf(dx * dx + dy * dy);
+            float nx = len > 0.001f ? -dy / len : 0.0f;
+            float ny = len > 0.001f ? dx / len : -1.0f;
+            push_text_label(&cursor, (ax + bx) * 0.5f + nx * 7.0f,
+                            (ay + by) * 0.5f + ny * 7.0f,
+                            label_for_edge(e->kind), 8u, text_scale,
+                            color_for_edge(e->kind) | 0x000000ffu,
+                            (float)pw, (float)ph);
+        }
     }
 
     return (uint32_t)(cursor - vertices);
@@ -592,7 +821,9 @@ static void graph_render(Ca_Viewport *viewport, void *user_data)
         return;
 
     VkFormat format = ca_viewport_format(viewport);
-    uint32_t max_vertices = view->edge_count * 6u + view->node_count * CTX_FG_NODE_SEGMENTS * 3u;
+    uint32_t max_vertices = view->edge_count * 6u +
+                            view->node_count * CTX_FG_NODE_SEGMENTS * 3u +
+                            CTX_FG_LABEL_VERTEX_BUDGET;
     if (max_vertices == 0u)
         max_vertices = 3u;
 
@@ -731,6 +962,8 @@ CtxForceGraph *ctx_force_graph_create(void)
         return NULL;
     }
     view->zoom = 1.0f;
+    view->hover_node = -1;
+    view->selected_node = -1;
     view->drag_node = -1;
     view->energy = 1.0;
     return view;
@@ -798,16 +1031,22 @@ void ctx_force_graph_sync(CtxForceGraph *view, CtxGraph *graph)
     }
 
     CtxEdgeEntry *edge, *etmp;
+    uint32_t connected_count = 0;
     HASH_ITER(hh, graph->edges, edge, etmp) {
-        if (edge->kind != CTX_EDGE_CALLS && edge->kind != CTX_EDGE_REFERENCES &&
-            edge->kind != CTX_EDGE_INHERITS)
+        if (!is_visible_edge_kind(edge->kind))
             continue;
         Candidate *from = NULL;
         Candidate *to = NULL;
         HASH_FIND(hh, candidates, &edge->from_id, sizeof(edge->from_id), from);
         HASH_FIND(hh, candidates, &edge->to_id, sizeof(edge->to_id), to);
-        if (from) from->degree++;
-        if (to) to->degree++;
+        if (from) {
+            if (from->degree == 0) connected_count++;
+            from->degree++;
+        }
+        if (to) {
+            if (to->degree == 0) connected_count++;
+            to->degree++;
+        }
     }
 
     ordered = calloc(candidate_count ? candidate_count : 1u, sizeof(*ordered));
@@ -821,6 +1060,8 @@ void ctx_force_graph_sync(CtxForceGraph *view, CtxGraph *graph)
     uint32_t oi = 0;
     Candidate *c, *ctmp;
     HASH_ITER(hh, candidates, c, ctmp) {
+        if (connected_count > 100u && c->degree == 0)
+            continue;
         if (c->degree == 0 && c->kind == CTX_SYM_UNKNOWN)
             continue;
         ordered[oi++] = c;
@@ -863,15 +1104,18 @@ void ctx_force_graph_sync(CtxForceGraph *view, CtxGraph *graph)
 
     HASH_ITER(hh, graph->edges, edge, etmp) {
         if (view->edge_count >= CTX_FG_MAX_EDGES) break;
-        if (edge->kind != CTX_EDGE_CALLS && edge->kind != CTX_EDGE_REFERENCES &&
-            edge->kind != CTX_EDGE_INHERITS)
+        if (!is_visible_edge_kind(edge->kind))
             continue;
         IdIndex *from = NULL;
         IdIndex *to = NULL;
         HASH_FIND(hh, selected, &edge->from_id, sizeof(edge->from_id), from);
         HASH_FIND(hh, selected, &edge->to_id, sizeof(edge->to_id), to);
         if (!from || !to || from->index == to->index) continue;
-        view->edges[view->edge_count++] = (ForceEdge){ .from = from->index, .to = to->index };
+        view->edges[view->edge_count++] = (ForceEdge){
+            .from = from->index,
+            .to = to->index,
+            .kind = edge->kind,
+        };
     }
     ctx_graph_runlock(graph);
 
@@ -930,6 +1174,10 @@ void ctx_force_graph_mouse_move(CtxForceGraph *view, float x, float y)
     } else if (view->panning) {
         view->pan_x += dx;
         view->pan_y += dy;
+    } else if (point_in_viewport(view, x, y)) {
+        view->hover_node = pick_node(view, x, y);
+    } else {
+        view->hover_node = -1;
     }
     if (view->viewport)
         ca_viewport_request_redraw(view->viewport);
@@ -943,6 +1191,7 @@ void ctx_force_graph_mouse_button(CtxForceGraph *view, int button, int action, f
     if (action == CA_PRESS && point_in_viewport(view, x, y)) {
         view->left_down = true;
         int32_t picked = pick_node(view, x, y);
+        view->selected_node = picked;
         if (picked >= 0) {
             float wx = 0.0f, wy = 0.0f;
             screen_to_world(view, x, y, &wx, &wy);

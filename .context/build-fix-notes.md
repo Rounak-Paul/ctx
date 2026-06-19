@@ -121,3 +121,62 @@
 - User reported two vertically mirrored graph projections when panning or zooming.
 - Root cause: `graph_render()` drew the pipeline-independent fallback graph first and then drew the shader graph when the shader path was available. The fallback clear-rect path and shader path use different framebuffer/Y conventions, so both projections were visible.
 - Fix: `graph_render()` now prepares the shader path before dynamic rendering and draws exactly one graph path per frame: shader vertices when available, otherwise the clear-rect fallback.
+
+## Graph Interaction And Labels Follow-Up
+
+- User reported inverted pan direction, non-working node drag, and lack of node/edge names at zoom.
+- Root cause: the renderer used viewport pixel coordinates while input math used logical window coordinates, and the shader still flipped Y. On HiDPI and during pan/zoom, hit-testing and visual positions could diverge.
+- Fix: graph transforms now separate logical viewport coordinates for input from pixel coordinates for Vulkan rendering. The shader Y flip was removed so dragging/panning follow the cursor.
+- Practical graph labels are now rendered inside the Vulkan graph: node names appear when zoomed in, and edge kind labels appear at closer zoom levels.
+
+## Graph Visual Polish Follow-Up
+
+- User requested cleaner graph visuals, edge color coding, a legend, and consideration of Causality font usage.
+- Causality's public font/text API is available for normal UI widgets but not directly exposed as a text drawing API inside a custom viewport command buffer. Node and edge labels therefore remain viewport-rendered for correct pan/zoom tracking.
+- Edge types are now color-coded in the graph renderer: calls are blue, references amber, and inheritance pink.
+- The graph panel now includes a top-right legend rendered with normal Causality text and swatches.
+- Hovered and selected nodes now render an emphasis ring to make inspection and dragging clearer.
+
+## UI Chrome Follow-Up
+
+- User confirmed the graph visualization is strong but reported that the surrounding tabs/top bar/chrome looked weird compared with Sol.
+- The custom in-content ctx title/stat strip was removed. Causality's title bar is now the only title strip, with `ctx` and `View` menus.
+- The tab strip now uses explicit Sol-style tab buttons instead of the previous built-in segmented tab bar.
+- Runtime stats moved into Causality's managed status bar at the bottom, matching Sol's title/content/status structure.
+- The graph view now sits in a single content surface with a compact toolbar and legend, removing the large black header band and floating stats line below the canvas.
+
+## Compact Graph Chrome Follow-Up
+
+- User requested a smaller default window, denser chrome, and cleaner graph legend alignment.
+- The default GUI window is now 1080x680 instead of 1280x800, with tighter tabs, content padding, graph toolbar, and status bar sizing.
+- The graph toolbar no longer shows instructional text; it keeps the graph title and a compact edge-color legend only.
+- Legend swatches now sit inside fixed-height items so the color lines and labels align consistently instead of touching the toolbar top.
+- Viewport labels are clamped inside the graph surface. Node and edge label scales are less aggressive, and edge labels are shown later, in fewer numbers, with a small perpendicular offset from the edge line.
+
+## Edge Legend Clarity Follow-Up
+
+- User reported that edge colors did not match the legend clearly and that the toolbar showed four text labels for three line samples.
+- The legend heading was removed; the toolbar now shows only three paired line samples and labels: calls, refs, inherits.
+- Renderer edge colors now use those same three groups. Includes and defines are grouped under refs, and zoomed edge labels use the same grouping.
+
+## Semantic Edge Extraction Follow-Up
+
+- User reported that many nodes had no names or connections, and refs/inherits were not visible despite the legend.
+- Root cause: extraction only resolved pending call edges. The visual legend had refs/inherits, but the graph data almost never contained those edge kinds, and the force-graph projection filtered out include/define edges entirely.
+- `CtxPendingCall` now carries a semantic edge kind and `ctx_graph_add_pending_edge()` resolves calls, references, and inheritance through the same post-index name resolver.
+- The extractor now emits reference edges from the current enclosing function/method to identifier and type-identifier nodes that resolve to known symbols. It also extracts inheritance edges from tree-sitter superclass/base/extends/heritage clauses.
+- Call/reference target extraction now reduces field/scoped expressions to the rightmost symbol name before resolution, improving cross-language tree-sitter resolution for expressions like `object.method` and `Namespace::Type`.
+- The force graph now includes all semantic edge kinds in degree scoring and projection. Include/define edges are grouped visually as refs, disconnected symbols are deprioritized when enough connected symbols exist, and more node labels are shown at higher zoom while hovered/selected labels are always retained.
+- `semantic_index_version=2` is stored in cache metadata so existing mtime-clean caches are rebuilt once and pick up the new refs/inherits extraction without manual cache deletion.
+- Verification: `cmake --build build --parallel` succeeds.
+- Verification: `git diff --check` succeeds.
+- Verification: fresh `src` index produced persisted calls and refs: edge kind `0=383`, `3=35`, with 2794 symbols.
+- Verification: cache-version smoke forced one rebuild on a fresh cache, then the second run loaded 2797 symbols and 419 edges as up to date with `semantic_index_version=2`.
+- Verification: a throwaway C++ inheritance fixture produced persisted inherit edge kind `4=1`.
+- Verification: full repo no-GUI index with vendors completed: 2340 files, 357140 symbols, 581451 persisted edges, 729948 semantic edges resolved in 90910ms. Persisted edge distribution was calls `545473`, refs `35934`, inherits `44`.
+
+## Node Legend Follow-Up
+
+- User reported that node colors also need labels like edge colors.
+- The graph toolbar now keeps a single compact row: edge kinds use line swatches and node symbol kinds use small square swatches.
+- Node legend colors match the renderer: fn, method, class, struct, enum, type, macro, namespace, and other.

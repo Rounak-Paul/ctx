@@ -15,6 +15,8 @@ static CtxGraph     *s_graph    = NULL;
 static char          s_root[4096] = {0};
 static CtxGraphStats s_stats    = {0};
 
+#define CTX_SEMANTIC_INDEX_VERSION "2"
+
 /* Progress — written by indexer thread, read by UI/CLI */
 static volatile uint32_t s_prog_total   = 0;
 static volatile uint32_t s_prog_done    = 0;
@@ -117,6 +119,14 @@ void ctx_indexer_index_all(void) {
     FileList fl = {0};
     collect_files(s_root, &fl);
 
+    char index_version[32] = {0};
+    bool force_reindex = !ctx_store_get_meta("semantic_index_version",
+                                             index_version, sizeof(index_version)) ||
+                         strcmp(index_version, CTX_SEMANTIC_INDEX_VERSION) != 0;
+    if (force_reindex) {
+        CTX_LOG_INFO("Semantic index version changed; rebuilding symbol graph");
+    }
+
     /* Identify stale files */
     FileList stale = {0};
     for (uint32_t i = 0; i < fl.count; i++) {
@@ -124,7 +134,7 @@ void ctx_indexer_index_all(void) {
         if (stat(fl.paths[i], &st) != 0) continue;
         int64_t stored_mtime = 0;
         bool known = ctx_store_file_mtime(fl.paths[i], &stored_mtime);
-        if (known && stored_mtime == (int64_t)st.st_mtime) continue;
+        if (!force_reindex && known && stored_mtime == (int64_t)st.st_mtime) continue;
         fl_push(&stale, fl.paths[i]);
     }
 
@@ -179,7 +189,7 @@ void ctx_indexer_index_all(void) {
     s_stats.errors      = errors;
     s_stats.duration_ms = dur;
 
-    CTX_LOG_INFO("Index done: %u symbols, %u edges, %u calls resolved in %"PRId64"ms",
+    CTX_LOG_INFO("Index done: %u symbols, %u edges, %u semantic edges resolved in %"PRId64"ms",
                  s_stats.symbols, s_stats.edges, resolved, dur);
     ctx_stats_record_index(stale.count, s_stats.symbols, (double)dur);
 
@@ -191,6 +201,7 @@ void ctx_indexer_index_all(void) {
     strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", tm_info);
     ctx_store_set_meta("last_indexed", ts);
     ctx_store_set_meta("root_path",    s_root);
+    ctx_store_set_meta("semantic_index_version", CTX_SEMANTIC_INDEX_VERSION);
     ctx_store_increment_stat("files_indexed",       (int64_t)stale.count);
     ctx_store_increment_stat("symbols_found",        (int64_t)s_stats.symbols);
     ctx_store_increment_stat("errors_encountered",   (int64_t)errors);
