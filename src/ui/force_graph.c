@@ -29,6 +29,7 @@ typedef struct {
     uint64_t id;
     CtxSymbolKind kind;
     uint32_t degree;
+    uint32_t mod_id;   /* color_for_module() result cached at node creation */
     float x;
     float y;
     float vx;
@@ -37,6 +38,8 @@ typedef struct {
     bool pinned;
     char name[96];
     char file[192];
+    /* Display label with kind prefix, e.g. "fn:render_frame". Populated in sync. */
+    char label[100];
 } ForceNode;
 
 typedef struct {
@@ -64,7 +67,9 @@ struct CtxForceGraph {
     VkDeviceSize vertex_capacity;
     VkPipelineLayout pipeline_layout;
     VkPipeline pipeline;
+    VkPipeline halo_pipeline;  /* max-blend pipeline for module halos */
     VkFormat pipeline_format;
+    uint32_t halo_vertex_count; /* vertices at the start of the buffer for halo pass */
     bool gpu_ready;
 
     float pan_x;
@@ -130,6 +135,49 @@ static void rgba(uint32_t packed, float out[4])
     out[3] = (float)(packed & 0xffu) / 255.0f;
 }
 
+/*
+ * Returns a stable opaque color for a source file's directory module.
+ * FNV-1a hash of the directory path maps into a 10-color palette.
+ * Alpha is always 0xff — callers set desired transparency by replacing the low byte.
+ *
+ * file  Absolute path of the source file.
+ */
+static uint32_t color_for_module(const char *file)
+{
+    char dir[192]; size_t dlen = 0;
+    const char *last_slash = NULL;
+    for (const char *p = file; *p; p++) if (*p == '/') last_slash = p;
+    if (last_slash) {
+        dlen = (size_t)(last_slash - file);
+        if (dlen >= sizeof(dir)) dlen = sizeof(dir) - 1;
+        memcpy(dir, file, dlen);
+        dir[dlen] = '\0';
+    } else {
+        dir[0] = '.'; dir[1] = '\0'; dlen = 1;
+    }
+
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < dlen; i++) { h ^= (uint8_t)dir[i]; h *= 1099511628211ULL; }
+
+    static const uint32_t palette[10] = {
+        0x7aa2f7ffu,  /* blue      */
+        0x9ece6affu,  /* green     */
+        0xf7768effu,  /* pink      */
+        0xe0af68ffu,  /* amber     */
+        0xbb9af7ffu,  /* purple    */
+        0x73dacaffu,  /* teal      */
+        0xff9e64ffu,  /* orange    */
+        0x2ac3deffu,  /* cyan      */
+        0xdb4b4bffu,  /* red       */
+        0x41a6b5ffu,  /* slate     */
+    };
+    return palette[h % 10];
+}
+
+/*
+ * Returns the color for a symbol kind — used for node fill so kind is
+ * immediately visible while module regions supply structural context.
+ */
 static uint32_t color_for_kind(CtxSymbolKind kind)
 {
     switch (kind) {
@@ -361,6 +409,10 @@ static bool create_pipeline(CtxForceGraph *view, Ca_Instance *inst, VkFormat for
         vkDestroyPipeline(dev, view->pipeline, NULL);
         view->pipeline = VK_NULL_HANDLE;
     }
+    if (view->halo_pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, view->halo_pipeline, NULL);
+        view->halo_pipeline = VK_NULL_HANDLE;
+    }
     if (view->pipeline_layout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(dev, view->pipeline_layout, NULL);
         view->pipeline_layout = VK_NULL_HANDLE;
@@ -475,6 +527,28 @@ static bool create_pipeline(CtxForceGraph *view, Ca_Instance *inst, VkFormat for
     if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &pci, NULL, &view->pipeline) != VK_SUCCESS)
         goto fail;
 
+    /* Halo pipeline: identical but uses MAX blending so overlapping halos
+     * of the same color don't accumulate — they settle at the maximum alpha. */
+    VkPipelineColorBlendAttachmentState halo_blend_att = {
+        .blendEnable         = VK_TRUE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp        = VK_BLEND_OP_MAX,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .alphaBlendOp        = VK_BLEND_OP_MAX,
+        .colorWriteMask      = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+    };
+    VkPipelineColorBlendStateCreateInfo halo_blend = {
+        .sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1,
+        .pAttachments    = &halo_blend_att,
+    };
+    pci.pColorBlendState = &halo_blend;
+    if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &pci, NULL, &view->halo_pipeline) != VK_SUCCESS)
+        view->halo_pipeline = VK_NULL_HANDLE; /* non-fatal: halos just won't render */
+
     view->pipeline_format = format;
     vkDestroyShaderModule(dev, vs, NULL);
     vkDestroyShaderModule(dev, fs, NULL);
@@ -524,6 +598,21 @@ static void push_circle(GraphVertex **cursor, float cx, float cy, float radius, 
         push_vertex(cursor, cx, cy, color);
         push_vertex(cursor, cx + cosf(a0) * radius, cy + sinf(a0) * radius, color);
         push_vertex(cursor, cx + cosf(a1) * radius, cy + sinf(a1) * radius, color);
+    }
+}
+
+/* Radial gradient circle: full color[3] alpha at center, fading to 0 at rim. */
+static void push_halo_circle(GraphVertex **cursor, float cx, float cy, float radius,
+                              const float color[4])
+{
+    const float step = 6.28318530718f / (float)CTX_FG_NODE_SEGMENTS;
+    float rim[4] = { color[0], color[1], color[2], 0.0f };
+    for (uint32_t i = 0; i < CTX_FG_NODE_SEGMENTS; ++i) {
+        float a0 = step * (float)i;
+        float a1 = step * (float)(i + 1u);
+        push_vertex(cursor, cx,                      cy,                      color);
+        push_vertex(cursor, cx + cosf(a0) * radius,  cy + sinf(a0) * radius,  rim);
+        push_vertex(cursor, cx + cosf(a1) * radius,  cy + sinf(a1) * radius,  rim);
     }
 }
 
@@ -719,10 +808,36 @@ static void clear_graph_fallback(VkCommandBuffer cmd, CtxForceGraph *view,
     }
 }
 
+
+#define CTX_FG_MAX_MOD_CENTROIDS 32u
+
+typedef struct {
+    uint32_t mod_id;
+    float    cx, cy;
+    uint32_t count;
+} ModuleCentroid;
+
 static uint32_t build_vertices(CtxForceGraph *view, GraphVertex *vertices, uint32_t max_vertices)
 {
     CTX_UNUSED(max_vertices);
     GraphVertex *cursor = vertices;
+
+    /* ---- Module halos: radial-gradient circle per node, colored by module.
+     * Center is opaque, rim fades to alpha=0 — no hard edge, purely organic.
+     * Max-blend pipeline ensures overlapping halos from the same module merge
+     * smoothly rather than summing: cluster centers glow, isolated nodes barely show. */
+    GraphVertex *halo_start = cursor;
+    for (uint32_t i = 0; i < view->node_count; ++i) {
+        ForceNode *n = &view->nodes[i];
+        float halo[4];
+        rgba((n->mod_id & 0xffffff00u) | 0x0eu, halo);
+        float sx, sy;
+        world_to_pixel(view, n->x, n->y, &sx, &sy);
+        float r = clampf(n->radius * view->zoom, 2.4f, 12.0f);
+        push_halo_circle(&cursor, sx, sy, r * 5.0f, halo);
+    }
+    view->halo_vertex_count = (uint32_t)(cursor - halo_start);
+
     for (uint32_t i = 0; i < view->edge_count; ++i) {
         ForceEdge *e = &view->edges[i];
         if (e->from >= view->node_count || e->to >= view->node_count) continue;
@@ -821,8 +936,9 @@ static void graph_render(Ca_Viewport *viewport, void *user_data)
         return;
 
     VkFormat format = ca_viewport_format(viewport);
+    /* node_count * 2: one halo circle + one kind circle per node */
     uint32_t max_vertices = view->edge_count * 6u +
-                            view->node_count * CTX_FG_NODE_SEGMENTS * 3u +
+                            view->node_count * CTX_FG_NODE_SEGMENTS * 3u * 2u +
                             CTX_FG_LABEL_VERTEX_BUDGET;
     if (max_vertices == 0u)
         max_vertices = 3u;
@@ -879,6 +995,7 @@ static void graph_render(Ca_Viewport *viewport, void *user_data)
     vkCmdEndRendering(cmd);
 }
 
+
 static void step_physics(CtxForceGraph *view)
 {
     if (!view || view->node_count == 0) return;
@@ -888,20 +1005,56 @@ static void step_physics(CtxForceGraph *view)
     const float spring = 0.0048f;
     const float desired = 95.0f;
     const float center = 0.004f;
+    const float cohesion = 0.06f;   /* strong pull toward module centroid */
+    const float same_mod_rep = 0.22f; /* intra-module repulsion scale — pack tight */
     view->energy = 0.0;
+
+    /* Compute per-module centroids for cohesion force */
+    ModuleCentroid centroids[CTX_FG_MAX_MOD_CENTROIDS];
+    uint32_t centroid_count = 0;
+    for (uint32_t i = 0; i < view->node_count; ++i) {
+        ForceNode *n = &view->nodes[i];
+        ModuleCentroid *mc = NULL;
+        for (uint32_t c = 0; c < centroid_count; c++) {
+            if (centroids[c].mod_id == n->mod_id) { mc = &centroids[c]; break; }
+        }
+        if (!mc && centroid_count < CTX_FG_MAX_MOD_CENTROIDS) {
+            mc = &centroids[centroid_count++];
+            mc->mod_id = n->mod_id; mc->cx = 0.0f; mc->cy = 0.0f; mc->count = 0;
+        }
+        if (mc) { mc->cx += n->x; mc->cy += n->y; mc->count++; }
+    }
+    for (uint32_t c = 0; c < centroid_count; c++) {
+        if (centroids[c].count > 0) {
+            centroids[c].cx /= (float)centroids[c].count;
+            centroids[c].cy /= (float)centroids[c].count;
+        }
+    }
 
     for (uint32_t i = 0; i < view->node_count; ++i) {
         ForceNode *a = &view->nodes[i];
         if (a->pinned) continue;
         float fx = -a->x * center;
         float fy = -a->y * center;
+
+        /* Cohesion: pull each node toward its module's centroid */
+        for (uint32_t c = 0; c < centroid_count; c++) {
+            if (centroids[c].mod_id == a->mod_id && centroids[c].count > 1) {
+                fx += (centroids[c].cx - a->x) * cohesion;
+                fy += (centroids[c].cy - a->y) * cohesion;
+                break;
+            }
+        }
+
         for (uint32_t j = i + 1u; j < view->node_count; ++j) {
             ForceNode *b = &view->nodes[j];
             float dx = a->x - b->x;
             float dy = a->y - b->y;
             float d2 = dx * dx + dy * dy + 24.0f;
             float d = sqrtf(d2);
-            float f = repulsion / d2;
+            /* Same-module nodes repel each other less so they cluster tightly */
+            float rep_scale = (a->mod_id == b->mod_id) ? same_mod_rep : 1.0f;
+            float f = (repulsion * rep_scale) / d2;
             float ux = dx / d;
             float uy = dy / d;
             fx += ux * f;
@@ -979,6 +1132,8 @@ void ctx_force_graph_destroy(CtxForceGraph *view)
             vkFreeMemory(view->device, view->vertex_memory, NULL);
         if (view->pipeline != VK_NULL_HANDLE)
             vkDestroyPipeline(view->device, view->pipeline, NULL);
+        if (view->halo_pipeline != VK_NULL_HANDLE)
+            vkDestroyPipeline(view->device, view->halo_pipeline, NULL);
         if (view->pipeline_layout != VK_NULL_HANDLE)
             vkDestroyPipelineLayout(view->device, view->pipeline_layout, NULL);
     }
@@ -1080,8 +1235,10 @@ void ctx_force_graph_sync(CtxForceGraph *view, CtxGraph *graph)
         dst->kind = src->kind;
         dst->degree = src->degree;
         dst->radius = clampf(3.5f + sqrtf((float)src->degree + 1.0f) * 0.6f, 4.0f, 12.0f);
-        snprintf(dst->name, sizeof(dst->name), "%s", src->name);
-        snprintf(dst->file, sizeof(dst->file), "%s", src->file);
+        snprintf(dst->name,  sizeof(dst->name),  "%s", src->name);
+        snprintf(dst->file,  sizeof(dst->file),  "%s", src->file);
+        dst->mod_id = color_for_module(src->file);
+        dst->label[0] = '\0'; /* unused; name is rendered directly */
         if (old) {
             dst->x = old->x;
             dst->y = old->y;

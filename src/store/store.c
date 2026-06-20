@@ -375,3 +375,44 @@ bool ctx_store_get_stat(const char *key, int64_t *out) {
     pthread_mutex_unlock(&s_lock);
     return found;
 }
+
+uint32_t ctx_store_enumerate_files(CtxFileRecord *out, uint32_t max, CtxGraph *g) {
+    if (!s_db || !out || max == 0) return 0;
+    pthread_mutex_lock(&s_lock);
+
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_prepare_v2(s_db,
+        "SELECT path, lang, mtime, size, error_count FROM files ORDER BY path;",
+        -1, &stmt, NULL);
+
+    uint32_t n = 0;
+    while (n < max && sqlite3_step(stmt) == SQLITE_ROW) {
+        CtxFileRecord *r = &out[n];
+        memset(r, 0, sizeof(*r));
+        const char *p = (const char *)sqlite3_column_text(stmt, 0);
+        if (p) strncpy(r->path, p, sizeof(r->path) - 1);
+        r->lang        = sqlite3_column_int  (stmt, 1);
+        r->mtime       = sqlite3_column_int64(stmt, 2);
+        r->size        = sqlite3_column_int64(stmt, 3);
+        r->error_count = sqlite3_column_int  (stmt, 4);
+        r->sym_count   = 0;
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&s_lock);
+
+    /* Fill sym_count from live graph — avoids an expensive JOIN */
+    if (g) {
+        ctx_graph_rlock(g);
+        CtxSymbol *s, *tmp;
+        HASH_ITER(hh, g->symbols, s, tmp) {
+            if (!s->is_definition) continue;
+            for (uint32_t i = 0; i < n; i++) {
+                if (!strcmp(out[i].path, s->file)) { out[i].sym_count++; break; }
+            }
+        }
+        ctx_graph_runlock(g);
+    }
+
+    return n;
+}

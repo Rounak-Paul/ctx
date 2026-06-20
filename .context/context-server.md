@@ -62,17 +62,70 @@ No budget or format params. Output: plain structured text, always complete.
 - 6 presence-based cases asserting expected file/symbol names appear in output.
 - No budget assertion — output is unbounded by design.
 
-## GUI Context tab (`ui/app_window.c`)
+## Retrieval engine (`retrieve/retrieve.c`) — output format
+Output is optimised for LLM consumption — compact, structured, hierarchical:
+
+```
+CODEBASE: /abs/path/to/root
+QUERY: how does culling work
+TERMS: cull frustum render
+SYMBOLS: 47 across 3 modules
+
+MODULES:
+  src/render/  18 syms  C  [also: shadow.c, material.c]
+  src/math/     8 syms  C  [also: vec.c]
+
+MODULE src/render/
+  FILE src/render/culling.c  [8 syms, C]
+    fn       ctx_cull_frustum(RenderList*, Frustum*)  :18-67
+      calls: frustum_test_sphere(frustum.c:44), ...
+      called-by: qs_renderer_submit_renderable(renderer.c:203)
+    struct   CullResult  :12
+```
+
+Key format rules:
+- `CODEBASE:` from `ctx_store_get_meta("root_path")`.
+- `MODULES:` compact table — module path, sym count, lang, peer files not in ss.
+- `MODULE path/` at column 0; `  FILE fullpath  [N syms, lang]` at indent 2.
+- Symbol: `    kind  name(sig)  :line[-endline]` at indent 4.
+- Edges: `      label: name:line, cross(file.c:line)` at indent 6.
+  Same-file edges show `name:line`; cross-file show `name(basename:line)`.
+- No `(reason)` noise. No redundant file paths inside symbol lines.
+- Modules ordered by relevance (first appearance in score-sorted list).
+
+## Retrieval engine — scoring
+- `score_symbol()`: exact=40, substr=18, filename=10, dir path match=6,
+  sig=5, scope=4, coverage×8, kind importance, definition+6, scope depth+2, vendor×0.3.
+- After BFS + file siblings, also runs `collect_include_chain()` for top-8 seeds.
+
+## Store (`store/store.h`, `store/store.c`)
+- Added `CtxFileRecord` struct: path, lang, mtime, size, error_count, sym_count.
+- Added `ctx_store_enumerate_files(out, max, g)` — queries `files` table ordered
+  by path, fills sym_count from live graph.
+
+## GUI (`ui/app_window.c`)
 - Tab order: Graph(0) · Symbols(1) · Calls(2) · Context(3) · Files(4).
-  `force_graph_frame` guard: `active_tab == 0`. View menu and tab buttons must
-  stay in sync if reordering.
-- `build_context_tab`: text input + Retrieve button. Enter or click runs
-  `ctx_retrieve` (CTX_QUERY_TASK). Result rendered line-by-line up to 400 lines
-  with prefix-based styling (MODULE/QUERY → blue, FILE → green, indented → muted).
-- No budget dropdown — retrieval is always full depth.
-- `ca_input_text(const Ca_TextInput*)` added to vendored Causality (widget.c +
-  causality.h) — Ca_TextInput is opaque, had no public text getter.
-- `CTX_KEY_ENTER 257` defined locally (GLFW headers not on ctx include path).
+- **Files tab**: full per-file table grouped by directory. Columns: file, lang,
+  syms, size, errors. Data from `ctx_store_enumerate_files()`. Max 200 rows.
+- **Status bar right**: now shows error count in amber when `stats.errors > 0`.
+- `ctx-line-h` prefix for DIRECTORY_TREE: added to `ctx_line_style()` already
+  via MODULE/QUERY/SYMBOLS prefix match.
+- `ca_input_text(const Ca_TextInput*)` in vendored Causality.
+- `CTX_KEY_ENTER 257` defined locally.
+
+## Force graph (`ui/force_graph.c`)
+- **Dual encoding**: nodes colored by kind (`color_for_kind` restored); module
+  membership shown via translucent region overlays drawn first (behind edges+nodes).
+- `ModuleRegion`: AABB per unique module palette color, with 22px padding.
+  Fill: module color at α=0x28 (≈15%). Border: α=0x60 (≈38%), 1.5px.
+  Name label: directory basename at α=0x58, drawn inside top-left of region.
+  Regions < 30px wide/tall are skipped (degenerate overlapping positions).
+- `color_for_module(file)`: FNV-1a of directory → 10-color palette (index only
+  used for region color — not node color).
+- `dir_basename(file, out, sz)`: extracts second-to-last path segment.
+- Node labels back to plain `n->name`.
+- Graph toolbar legend: edge legend + node-kind dot legend + "| region=module" label.
+- Vertex budget: `+ CTX_FG_MAX_MODULES * 256u` added to max_vertices.
 
 ## Build note
 - Root-owned `build/` artifacts block PCH write. Fix: `mv build build.bak`,

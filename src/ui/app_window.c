@@ -6,6 +6,7 @@
 #include "../indexer/indexer.h"
 #include "../graph/graph.h"
 #include "../retrieve/retrieve.h"
+#include "../store/store.h"
 #include "force_graph.h"
 
 /* ca_input_key_pressed() takes a raw GLFW key code; GLFW's headers are not on
@@ -257,7 +258,17 @@ static const char *g_css =
     "  height: 8px;"
     "  width: 120px;"
     "  border: 1px #2a3545;"
-    "}";
+    "}"
+
+    /* Files tab */
+    ".files-dir {"
+    "  color: #7aa2f7;"
+    "  font-size: 11px;"
+    "  padding: 4px 0px 2px 0px;"
+    "}"
+    ".files-err  { color: #e0af68; font-size: 11px; }"
+    ".files-stat { color: #565f89; font-size: 11px; }"
+    ".files-sum  { color: #9ece6a; font-size: 11px; padding: 6px 0px 2px 0px; }";
 
 /* ============================================================
    Event callbacks (called from background threads)
@@ -386,12 +397,21 @@ static void status_bar_builder(Ca_Window *window, void *user_data)
             });
         ca_div_end();
 
-        /* Right — symbol/edge counts + progress bar (bar only while indexing) */
+        /* Right — symbol/edge counts + error warning + progress bar */
         ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "status-right" });
             ca_text(&(Ca_TextDesc){ .text = "symbols", .style = "status-text" });
             ca_text(&(Ca_TextDesc){ .text = sym_buf,   .style = "status-value" });
             ca_text(&(Ca_TextDesc){ .text = "edges",   .style = "status-text" });
             ca_text(&(Ca_TextDesc){ .text = edge_buf,  .style = "status-value" });
+            /* Show parse-error count if any files had extraction errors */
+            {
+                CtxGraphStats gs2; ctx_indexer_get_stats(&gs2);
+                if (gs2.errors > 0) {
+                    char errbuf[32];
+                    snprintf(errbuf, sizeof(errbuf), "%u err", gs2.errors);
+                    ca_text(&(Ca_TextDesc){ .text = errbuf, .style = "status-busy" });
+                }
+            }
             s.prog_bar = ca_progress(&(Ca_ProgressDesc){
                 .value     = frac,
                 .width     = 120.0f,
@@ -490,11 +510,13 @@ static void build_graph_tab(Ca_Div *div, void *ud)
         ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "graph-toolbar" });
             ca_text(&(Ca_TextDesc){ .text = "Dependency graph", .style = "graph-title" });
             ca_spacer(&(Ca_SpacerDesc){ .width = 0.0f, .style = "graph-grow" });
+            /* Edge kind legend */
             ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "graph-legend" });
                 graph_legend_item(0x7aa2f7b8u, "calls");
                 graph_legend_item(0xe0af68a8u, "refs");
                 graph_legend_item(0xf7768eb8u, "inherits");
             ca_div_end();
+            /* Node kind legend — node color encodes symbol kind; region fill encodes module */
             ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "graph-node-legend" });
                 graph_node_legend_item(0x7aa2f7ffu, "fn");
                 graph_node_legend_item(0x89b4faffu, "meth");
@@ -505,6 +527,8 @@ static void build_graph_tab(Ca_Div *div, void *ud)
                 graph_node_legend_item(0xff9e64ffu, "macro");
                 graph_node_legend_item(0x73dacaffu, "ns");
                 graph_node_legend_item(0x565f89ffu, "other");
+                ca_text(&(Ca_TextDesc){ .text = "|", .style = "graph-legend-label" });
+                ca_text(&(Ca_TextDesc){ .text = "region=module", .style = "graph-legend-label" });
             ca_div_end();
         ca_div_end();
         if (s.force_graph) {
@@ -623,6 +647,19 @@ static void build_calls_tab(Ca_Div *div, void *ud)
 }
 
 /* --- Files tab -------------------------------------------- */
+#define FILES_TAB_MAX 2048
+
+static const char *lang_abbrev(int lang) {
+    switch (lang) {
+    case 1: return "C";
+    case 2: return "C++";
+    case 3: return "Py";
+    case 4: return "JS";
+    case 5: return "TS";
+    default: return "?";
+    }
+}
+
 static void build_files_tab(Ca_Div *div, void *ud)
 {
     CTX_UNUSED(div); CTX_UNUSED(ud);
@@ -630,17 +667,103 @@ static void build_files_tab(Ca_Div *div, void *ud)
     CtxGraphStats stats;
     ctx_indexer_get_stats(&stats);
 
-    ca_div_begin(&(Ca_DivDesc){ .direction = CA_VERTICAL, .gap = 6 });
-        char buf[128];
-        snprintf(buf, sizeof(buf), "%u files indexed", stats.files);
-        ca_text(&(Ca_TextDesc){ .text = buf, .style = "tbl-row" });
-        snprintf(buf, sizeof(buf), "%u symbols extracted", stats.symbols);
-        ca_text(&(Ca_TextDesc){ .text = buf, .style = "tbl-row" });
-        snprintf(buf, sizeof(buf), "%u semantic edges resolved", stats.edges);
-        ca_text(&(Ca_TextDesc){ .text = buf, .style = "tbl-row" });
-        snprintf(buf, sizeof(buf), "Indexed in %"PRId64" ms", stats.duration_ms);
-        ca_text(&(Ca_TextDesc){ .text = buf, .style = "tbl-file" });
-    ca_div_end();
+    CtxGraph *g = ctx_indexer_get_graph();
+
+    /* Enumerate files from the store */
+    static CtxFileRecord files[FILES_TAB_MAX];
+    uint32_t nfiles = ctx_store_enumerate_files(files, FILES_TAB_MAX, g);
+
+    /* Summary header */
+    char sum[256];
+    snprintf(sum, sizeof(sum),
+             "%u files · %u symbols · %u edges · %"PRId64" ms last index",
+             stats.files, stats.symbols, stats.edges, stats.duration_ms);
+    ca_text(&(Ca_TextDesc){ .text = sum, .style = "files-sum" });
+
+    if (nfiles == 0) {
+        ca_text(&(Ca_TextDesc){ .text = "No files indexed yet.", .style = "tbl-file" });
+        return;
+    }
+
+    /* Columns: file, lang, syms, size, errors */
+    static const float cols[] = { 280, 36, 48, 64, 48 };
+    ca_table_begin(&(Ca_TableDesc){ .column_count = 5, .column_widths = cols });
+        ca_table_row_begin(NULL);
+            ca_table_cell(&(Ca_TextDesc){ .text = "File",    .style = "tbl-hdr" });
+            ca_table_cell(&(Ca_TextDesc){ .text = "Lang",    .style = "tbl-hdr" });
+            ca_table_cell(&(Ca_TextDesc){ .text = "Syms",    .style = "tbl-hdr" });
+            ca_table_cell(&(Ca_TextDesc){ .text = "Size",    .style = "tbl-hdr" });
+            ca_table_cell(&(Ca_TextDesc){ .text = "Errors",  .style = "tbl-hdr" });
+        ca_table_row_end();
+
+        /* Group by directory — files are already sorted by path */
+        char cur_dir[4096] = "";
+        int row = 0;
+        for (uint32_t i = 0; i < nfiles && row < MAX_LIST_ROWS; i++) {
+            /* Compute directory for this file */
+            const char *fpath = files[i].path;
+            char dir[4096];
+            const char *slash = strrchr(fpath, '/');
+            if (slash) {
+                size_t dlen = (size_t)(slash - fpath);
+                if (dlen >= sizeof(dir)) dlen = sizeof(dir) - 1;
+                memcpy(dir, fpath, dlen);
+                dir[dlen] = '\0';
+            } else {
+                dir[0] = '.'; dir[1] = '\0';
+            }
+
+            if (strcmp(dir, cur_dir) != 0) {
+                /* Directory group header row */
+                strncpy(cur_dir, dir, sizeof(cur_dir) - 1);
+                ca_table_row_begin(&(Ca_DivDesc){ .style = "tbl-row-alt" });
+                    char dhead[4096];
+                    snprintf(dhead, sizeof(dhead), "%s/", dir);
+                    ca_table_cell(&(Ca_TextDesc){ .text = dhead, .style = "files-dir" });
+                    ca_table_cell(&(Ca_TextDesc){ .text = "",     .style = "tbl-hdr" });
+                    ca_table_cell(&(Ca_TextDesc){ .text = "",     .style = "tbl-hdr" });
+                    ca_table_cell(&(Ca_TextDesc){ .text = "",     .style = "tbl-hdr" });
+                    ca_table_cell(&(Ca_TextDesc){ .text = "",     .style = "tbl-hdr" });
+                ca_table_row_end();
+            }
+
+            /* File row — show basename only (dir shown in group header) */
+            const char *basename = slash ? slash + 1 : fpath;
+            char sizebuf[32];
+            if (files[i].size >= 1024 * 1024)
+                snprintf(sizebuf, sizeof(sizebuf), "%.1fM", (double)files[i].size / (1024.0 * 1024.0));
+            else if (files[i].size >= 1024)
+                snprintf(sizebuf, sizeof(sizebuf), "%.1fK", (double)files[i].size / 1024.0);
+            else
+                snprintf(sizebuf, sizeof(sizebuf), "%"PRId64"B", files[i].size);
+
+            char symbuf[16];  snprintf(symbuf, sizeof(symbuf), "%d", files[i].sym_count);
+            char errbuf[16];
+            if (files[i].error_count > 0)
+                snprintf(errbuf, sizeof(errbuf), "%d", files[i].error_count);
+            else
+                errbuf[0] = '\0';
+
+            const char *row_style = (row % 2 == 0) ? "tbl-row" : "tbl-row-alt";
+            ca_table_row_begin(&(Ca_DivDesc){ .style = row_style });
+                ca_table_cell(&(Ca_TextDesc){ .text = basename,                    .style = "tbl-file" });
+                ca_table_cell(&(Ca_TextDesc){ .text = lang_abbrev(files[i].lang),  .style = "tbl-kind" });
+                ca_table_cell(&(Ca_TextDesc){ .text = symbuf,                      .style = "tbl-sym"  });
+                ca_table_cell(&(Ca_TextDesc){ .text = sizebuf,                     .style = "files-stat" });
+                ca_table_cell(&(Ca_TextDesc){
+                    .text  = errbuf[0] ? errbuf : "-",
+                    .style = errbuf[0] ? "files-err" : "files-stat",
+                });
+            ca_table_row_end();
+            row++;
+        }
+    ca_table_end();
+
+    if (nfiles > MAX_LIST_ROWS) {
+        char note[64];
+        snprintf(note, sizeof(note), "(showing first %d of %u files)", MAX_LIST_ROWS, nfiles);
+        ca_text(&(Ca_TextDesc){ .text = note, .style = "tbl-file" });
+    }
 }
 
 /* --- Context retrieval tab -------------------------------- */
@@ -677,9 +800,14 @@ static void on_ctx_run_click(Ca_Button *button, void *ud)
  * MODULE/FILE headers → blue, edge/sig lines (indented) → muted, rest → normal */
 static const char *ctx_line_style(const char *line)
 {
-    if (!strncmp(line, "MODULE:", 7) || !strncmp(line, "QUERY:", 6) ||
-        !strncmp(line, "SYMBOLS:", 8)) return "ctx-line-h";
-    if (!strncmp(line, "  FILE:", 7)) return "ctx-line-cite";
+    /* Top-level keyword headers */
+    if (!strncmp(line, "CODEBASE:", 9) || !strncmp(line, "QUERY:", 6)  ||
+        !strncmp(line, "TERMS:", 6)    || !strncmp(line, "SYMBOLS:", 8) ||
+        !strncmp(line, "MODULES:", 8)  || !strncmp(line, "MODULE ", 7))
+        return "ctx-line-h";
+    /* File lines (2 spaces + "FILE ") */
+    if (!strncmp(line, "  FILE ", 7)) return "ctx-line-cite";
+    /* Module map entries and all other indented content */
     if (line[0] == ' ' || line[0] == '\t') return "ctx-line-code";
     return "ctx-line";
 }

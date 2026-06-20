@@ -1,4 +1,5 @@
 #include "retrieve.h"
+#include "../store/store.h"
 #include "../log/log.h"
 #include <ctype.h>
 
@@ -6,12 +7,12 @@
 /* tunables                                                                  */
 /* ======================================================================== */
 #define CTX_MAX_QUERY_TERMS    24
-#define CTX_MAX_SEEDS          128   /* top text-scored entry points          */
-#define CTX_MAX_TRAVERSAL      512   /* max symbols collected via graph walk  */
-#define CTX_TRAVERSAL_DEPTH    6     /* BFS hop limit in each direction       */
-#define CTX_MODULE_SIBLINGS    48    /* max co-file symbols pulled per seed   */
-#define CTX_DIR_PEERS          16    /* max peer-file names pulled per module */
-#define CTX_MIN_SCORE          4.0   /* ignore symbols below this text score  */
+#define CTX_MAX_SEEDS          64    /* top text-scored entry points          */
+#define CTX_MAX_TRAVERSAL      96    /* max symbols collected via graph walk  */
+#define CTX_TRAVERSAL_DEPTH    4     /* BFS hop limit in each direction       */
+#define CTX_MODULE_SIBLINGS    8     /* max co-file symbols pulled per seed   */
+#define CTX_DIR_PEERS          8     /* max peer-file names pulled per module */
+#define CTX_MIN_SCORE          6.0   /* ignore symbols below this text score  */
 
 /* ======================================================================== */
 /* string builder                                                            */
@@ -172,6 +173,8 @@ static double score_symbol(const CtxSymbol *s, const QueryTerms *q) {
         if (!strcasecmp(s->name, t))        { score += 40; hit = true; }
         else if (ci_substr(s->name, t))     { score += 18; hit = true; }
         if (ci_substr(base, t))             { score += 10; hit = true; }
+        /* directory path match: signals the symbol lives in a relevant module */
+        if (ci_substr(s->file, t))          { score += 6;  hit = true; }
         if (s->signature[0] && ci_substr(s->signature, t)) { score += 5; hit = true; }
         if (s->scope[0] && ci_substr(s->scope, t))         { score += 4; hit = true; }
         if (hit) covered++;
@@ -180,6 +183,8 @@ static double score_symbol(const CtxSymbol *s, const QueryTerms *q) {
     score += covered * 8;
     score += kind_importance(s->kind);
     if (s->is_definition) score += 6;
+    /* scope depth bonus: symbol in a matching scope is more specific */
+    if (s->scope[0]) score += 2;
     if (is_vendor_path(s->file)) score *= 0.3;
     return score;
 }
@@ -327,55 +332,136 @@ static void traverse_from(CtxGraph *g, uint64_t seed_id, const char *seed_file,
 }
 
 /* ======================================================================== */
-/* module / file sibling collection                                         */
+/* file index — built once per retrieval call to avoid O(n) scans per seed  */
 /* ======================================================================== */
+
+#define FILE_INDEX_BUCKETS 4096u  /* power of 2; >2342 files */
+
+typedef struct FileEntry {
+    const char      *file;
+    const CtxSymbol **syms;
+    uint32_t          sym_count;
+    uint32_t          sym_cap;
+    struct FileEntry *next;
+} FileEntry;
+
+typedef struct {
+    FileEntry *buckets[FILE_INDEX_BUCKETS];
+    FileEntry *entries;    /* flat allocation pool */
+    uint32_t   entry_count;
+    uint32_t   entry_cap;
+} FileIndex;
+
+static uint32_t fi_hash(const char *file) {
+    uint32_t h = 2166136261u;
+    for (const char *p = file; *p; p++) h = (h ^ (unsigned char)*p) * 16777619u;
+    return h & (FILE_INDEX_BUCKETS - 1u);
+}
+
 /*
- * Adds all definition symbols from the same file as sym into ss.
- * This captures the implicit co-location relationship — functions in the same
- * file are almost always semantically related. Caller holds read lock.
+ * Builds a file→symbols index over all non-UNKNOWN, non-INCLUDE definition
+ * symbols. Must be called under the graph read lock. Caller frees with fi_free().
  */
-static void collect_file_siblings(CtxGraph *g, const CtxSymbol *sym, SymSet *ss) {
-    int added = 0;
+static FileIndex *fi_build(CtxGraph *g) {
+    FileIndex *fi = calloc(1, sizeof(FileIndex));
+    if (!fi) return NULL;
+
+    uint32_t total = HASH_COUNT(g->symbols);
+    fi->entry_cap = total < 64 ? 64 : total;
+    fi->entries = calloc(fi->entry_cap, sizeof(FileEntry));
+    if (!fi->entries) { free(fi); return NULL; }
+
     CtxSymbol *s, *tmp;
     HASH_ITER(hh, g->symbols, s, tmp) {
-        if (added >= CTX_MODULE_SIBLINGS) break;
-        if (s->id == sym->id) continue;
         if (s->kind == CTX_SYM_UNKNOWN || s->kind == CTX_SYM_INCLUDE) continue;
         if (!s->is_definition) continue;
-        if (strcmp(s->file, sym->file) != 0) continue;
+
+        uint32_t h = fi_hash(s->file);
+        FileEntry *fe = NULL;
+        for (FileEntry *e = fi->buckets[h]; e; e = e->next) {
+            if (strcmp(e->file, s->file) == 0) { fe = e; break; }
+        }
+        if (!fe) {
+            if (fi->entry_count >= fi->entry_cap) continue; /* shouldn't happen */
+            fe = &fi->entries[fi->entry_count++];
+            fe->file = s->file;
+            fe->sym_cap = 8; fe->sym_count = 0;
+            fe->syms = malloc(fe->sym_cap * sizeof(CtxSymbol *));
+            if (!fe->syms) continue;
+            fe->next = fi->buckets[h];
+            fi->buckets[h] = fe;
+        }
+        if (fe->sym_count >= fe->sym_cap) {
+            uint32_t nc = fe->sym_cap * 2u;
+            const CtxSymbol **ns = realloc((void *)fe->syms, nc * sizeof(CtxSymbol *));
+            if (!ns) continue;
+            fe->syms = ns; fe->sym_cap = nc;
+        }
+        fe->syms[fe->sym_count++] = s;
+    }
+    return fi;
+}
+
+static FileEntry *fi_get(FileIndex *fi, const char *file) {
+    if (!fi || !file) return NULL;
+    uint32_t h = fi_hash(file);
+    for (FileEntry *e = fi->buckets[h]; e; e = e->next)
+        if (strcmp(e->file, file) == 0) return e;
+    return NULL;
+}
+
+static void fi_free(FileIndex *fi) {
+    if (!fi) return;
+    for (uint32_t i = 0; i < fi->entry_count; i++) free((void *)fi->entries[i].syms);
+    free(fi->entries);
+    free(fi);
+}
+
+/* ======================================================================== */
+/* module / file sibling collection                                         */
+/* ======================================================================== */
+
+/*
+ * Adds definition symbols from the same file as sym into ss using the file
+ * index — O(file_syms) instead of O(all_syms). Caller holds read lock.
+ */
+static void collect_file_siblings(FileIndex *fi, const CtxSymbol *sym, SymSet *ss) {
+    FileEntry *fe = fi_get(fi, sym->file);
+    if (!fe) return;
+    int added = 0;
+    for (uint32_t i = 0; i < fe->sym_count && added < CTX_MODULE_SIBLINGS; i++) {
+        const CtxSymbol *s = fe->syms[i];
+        if (s->id == sym->id) continue;
         if (symset_add(ss, s, 20.0, "co-file")) added++;
     }
 }
 
 /*
- * Collects file paths in the same directory as sym->file.
- * Returns count of unique basenames written into out[].
+ * Collects unique file basenames in the same directory as file using the
+ * file index. O(unique_files_in_dir) instead of O(all_syms).
  */
-static uint32_t collect_dir_peers(CtxGraph *g, const char *file,
+static uint32_t collect_dir_peers(FileIndex *fi, const char *file,
                                   char out[][256], uint32_t max) {
     char dir[4096];
     path_dir(file, dir, sizeof(dir));
     if (!dir[0]) return 0;
 
-    /* Collect unique file basenames in the same directory */
     char seen[CTX_DIR_PEERS][256]; uint32_t seen_count = 0;
     uint32_t found = 0;
 
-    CtxSymbol *s, *tmp;
-    HASH_ITER(hh, g->symbols, s, tmp) {
-        if (found >= max) break;
-        if (strcmp(s->file, file) == 0) continue;
-        if (is_vendor_path(s->file)) continue;
-        char sdir[4096]; path_dir(s->file, sdir, sizeof(sdir));
+    for (uint32_t i = 0; i < fi->entry_count && found < max; i++) {
+        FileEntry *fe = &fi->entries[i];
+        if (strcmp(fe->file, file) == 0) continue;
+        if (is_vendor_path(fe->file)) continue;
+        char sdir[4096]; path_dir(fe->file, sdir, sizeof(sdir));
         if (strcmp(sdir, dir) != 0) continue;
-        const char *base = path_basename(s->file);
+        const char *base = path_basename(fe->file);
         bool dup = false;
-        for (uint32_t i = 0; i < seen_count; i++)
-            if (!strcmp(seen[i], base)) { dup = true; break; }
+        for (uint32_t j = 0; j < seen_count; j++)
+            if (!strcmp(seen[j], base)) { dup = true; break; }
         if (!dup && seen_count < CTX_DIR_PEERS) {
-            strncpy(seen[seen_count], base, 255);
-            strncpy(out[found], base, 255);
-            seen_count++; found++;
+            strncpy(seen[seen_count++], base, 255);
+            strncpy(out[found++], base, 255);
         }
     }
     return found;
@@ -410,69 +496,131 @@ static uint32_t collect_all_edges(CtxGraph *g, uint64_t sym_id,
 }
 
 /* ======================================================================== */
-/* output formatting — dense structured text, no markdown                   */
+/* file metadata helpers                                                     */
 /* ======================================================================== */
 
-/* Emit one symbol entry: kind, name, file:line, signature, scope */
-static void emit_symbol(SB *sb, const CtxSymbol *s) {
-    sb_printf(sb, "[%s] %s  %s:%u",
-              kind_str(s->kind), s->name, s->file, s->line);
-    if (s->end_line > s->line)
-        sb_printf(sb, "-%u", s->end_line);
-    if (s->scope[0])
-        sb_printf(sb, "  scope:%s", s->scope);
-    sb_puts(sb, "\n");
-    if (s->signature[0] && s->kind != CTX_SYM_UNKNOWN)
-        sb_printf(sb, "  sig: %s\n", s->signature);
+static const char *lang_name(int lang) {
+    switch (lang) {
+    case 1: return "C";
+    case 2: return "C++";
+    case 3: return "Python";
+    case 4: return "JavaScript";
+    case 5: return "TypeScript";
+    default: return "unknown";
+    }
 }
 
-/* Emit full edge inventory for a symbol */
-static void emit_edges(SB *sb, CtxGraph *g, const CtxSymbol *s) {
+/* Count symbols in ss that belong to a given file. */
+static uint32_t count_file_syms(const SymSet *ss, const char *file) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < ss->count; i++)
+        if (!strcmp(ss->items[i].sym->file, file)) n++;
+    return n;
+}
+
+/*
+ * Pulls symbols reachable through include edges from seed files into ss.
+ * For each CTX_EDGE_INCLUDES edge where seed is the includer, adds symbols
+ * from the included file. This captures the import-chain structural signal:
+ * headers and their included types are almost always needed together.
+ * Caller holds the graph read lock.
+ */
+static void collect_include_chain(CtxGraph *g, FileIndex *fi,
+                                  const CtxSymbol *seed, SymSet *ss) {
+    for (CtxEdgeEntry *e = g->edges; e; e = (CtxEdgeEntry *)e->hh.next) {
+        if (e->kind != CTX_EDGE_INCLUDES) continue;
+        if (e->from_id != seed->id) continue;
+        const CtxSymbol *target = ctx_graph_find_by_id_locked(g, e->to_id);
+        if (!target || target->kind == CTX_SYM_UNKNOWN) continue;
+        if (is_vendor_path(target->file)) continue;
+        FileEntry *fe = fi_get(fi, target->file);
+        if (!fe) continue;
+        for (uint32_t i = 0; i < fe->sym_count; i++)
+            symset_add(ss, fe->syms[i], 15.0, "include-chain");
+    }
+}
+
+/* ======================================================================== */
+/* output formatting — compact structured text optimised for LLM consumption */
+/* ======================================================================== */
+
+/*
+ * Emits a single symbol line: kind  name(signature)  :line[-endline]
+ * Signature is inlined — no separate sig: line.
+ * File path is NOT emitted here; the caller already emitted the FILE: header.
+ *
+ * s  Symbol to emit.
+ */
+static void emit_symbol(SB *sb, const CtxSymbol *s) {
+    sb_printf(sb, "    %-8s %s", kind_str(s->kind), s->name);
+    if (s->signature[0] && s->kind != CTX_SYM_UNKNOWN)
+        sb_printf(sb, "(%s)", s->signature);
+    sb_printf(sb, "  :%u", s->line);
+    if (s->end_line > s->line) sb_printf(sb, "-%u", s->end_line);
+    sb_puts(sb, "\n");
+}
+
+/*
+ * Emits the relational edge inventory for a symbol, grouped by direction/kind.
+ * Cross-file refs include the file basename so the LLM can locate them;
+ * same-file refs show only the name and line.
+ *
+ * s        Symbol whose edges to emit.
+ * cur_file File currently being rendered (used to elide redundant paths).
+ */
+static void emit_edges(SB *sb, CtxGraph *g, const CtxSymbol *s, const char *cur_file) {
     EdgeRef refs[256];
     uint32_t n = collect_all_edges(g, s->id, refs, 256);
     if (n == 0) return;
 
-    /* Group edges by kind+direction:
-     * outgoing=true  means sym→other (sym is the caller/referrer/base)
-     * outgoing=false means other→sym (sym is the callee/target/derived) */
-    typedef struct { const char *label; int count; char names[32][128]; } EGroup;
-    EGroup groups[8] = {
+    /* ref'd-by omitted — reverse reference edges are high-volume noise at scale.
+     * calls/called-by/includes/inherits carry the structural signal that matters. */
+#define CTX_EDGE_GROUP_CAP 6
+    typedef struct { const char *label; int count; char names[CTX_EDGE_GROUP_CAP][96]; } EGroup;
+    EGroup groups[7] = {
         { "calls",       0, {{0}} },
         { "called-by",   0, {{0}} },
         { "includes",    0, {{0}} },
         { "included-by", 0, {{0}} },
         { "defines",     0, {{0}} },
         { "refs",        0, {{0}} },
-        { "ref'd-by",    0, {{0}} },
         { "inherits",    0, {{0}} },
     };
-    /* map (kind, outgoing) → group index */
     int gmap[5][2] = {
-        /* CALLS */      { 0, 1 },
-        /* INCLUDES */   { 2, 3 },
-        /* DEFINES */    { 4, 4 },
-        /* REFERENCES */ { 5, 6 },
-        /* INHERITS */   { 7, 7 },
+        { 0, 1 }, /* CALLS:      out=calls,       in=called-by   */
+        { 2, 3 }, /* INCLUDES:   out=includes,    in=included-by */
+        { 4, 4 }, /* DEFINES:    symmetric                       */
+        { 5, 5 }, /* REFERENCES: out=refs only (drop ref'd-by)   */
+        { 6, 6 }, /* INHERITS:   symmetric                       */
     };
 
     for (uint32_t i = 0; i < n; i++) {
         int k = (int)refs[i].kind;
         if (k < 0 || k > 4) continue;
-        int g_idx = gmap[k][refs[i].outgoing ? 0 : 1];
-        EGroup *eg = &groups[g_idx];
-        if (eg->count < 32) {
-            snprintf(eg->names[eg->count++], 128, "%s(%s:%u)",
-                     refs[i].sym->name, path_basename(refs[i].sym->file),
-                     refs[i].sym->line);
+        /* suppress incoming reference edges — too noisy */
+        if (k == 3 /* CTX_EDGE_REFERENCES */ && !refs[i].outgoing) continue;
+        int gi = gmap[k][refs[i].outgoing ? 0 : 1];
+        EGroup *eg = &groups[gi];
+        if (eg->count >= CTX_EDGE_GROUP_CAP) continue;
+        const char *other_file = refs[i].sym->file;
+        if (strcmp(other_file, cur_file) == 0) {
+            /* same file — name:line is enough */
+            snprintf(eg->names[eg->count++], 96, "%s:%u",
+                     refs[i].sym->name, refs[i].sym->line);
+        } else {
+            /* cross-file — include basename for navigability */
+            snprintf(eg->names[eg->count++], 96, "%s(%s:%u)",
+                     refs[i].sym->name,
+                     path_basename(other_file), refs[i].sym->line);
         }
     }
 
-    for (int g = 0; g < 8; g++) {
-        if (groups[g].count == 0) continue;
-        sb_printf(sb, "  %s: ", groups[g].label);
-        for (int i = 0; i < groups[g].count; i++) {
+    for (int gi = 0; gi < 7; gi++) {
+        if (groups[gi].count == 0) continue;
+        sb_printf(sb, "      %s: ", groups[gi].label);
+        for (int i = 0; i < groups[gi].count; i++) {
             if (i) sb_puts(sb, ", ");
-            sb_puts(sb, groups[g].names[i]);
+            sb_puts(sb, groups[gi].names[i]);
         }
         sb_puts(sb, "\n");
     }
@@ -583,15 +731,25 @@ char *ctx_retrieve(CtxGraph *g, const CtxRetrieveRequest *req) {
     for (uint32_t i = 0; i < seed_count && ss->count < CTX_MAX_TRAVERSAL; i++)
         traverse_from(g, seeds[i].sym->id, seeds[i].sym->file, ss, CTX_TRAVERSAL_DEPTH);
 
+    /* Build file index once (under read lock) for O(1) per-file lookups */
+    FileIndex *fi = fi_build(g);
+
     /* Pull co-file siblings for top seeds (structural locality) */
     uint32_t top = seed_count < 8 ? seed_count : 8;
-    for (uint32_t i = 0; i < top && ss->count < CTX_MAX_TRAVERSAL; i++)
-        collect_file_siblings(g, seeds[i].sym, ss);
+    if (fi) {
+        for (uint32_t i = 0; i < top && ss->count < CTX_MAX_TRAVERSAL; i++)
+            collect_file_siblings(fi, seeds[i].sym, ss);
+
+        /* Pull include-chain symbols for top seeds (import hierarchy signal) */
+        for (uint32_t i = 0; i < top && ss->count < CTX_MAX_TRAVERSAL; i++)
+            collect_include_chain(g, fi, seeds[i].sym, ss);
+    }
 
     ctx_graph_runlock(g);
     free(seeds);
 
     if (ss->count == 0) {
+        fi_free(fi);
         free(ss);
         SB sb; sb_init(&sb);
         sb_printf(&sb, "ERROR: no symbols found for query: %s\n", req->text);
@@ -601,17 +759,11 @@ char *ctx_retrieve(CtxGraph *g, const CtxRetrieveRequest *req) {
     /* Sort by score */
     qsort(ss->items, ss->count, sizeof(CollectedSym), cmp_collected);
 
-    /* ---- 4. build output ---- */
-    SB sb; sb_init(&sb);
-
-    sb_printf(&sb, "QUERY: %s\n", req->text);
-    sb_printf(&sb, "SYMBOLS: %u  QUERY_TERMS:", ss->count);
-    for (uint32_t i = 0; i < q.count; i++) sb_printf(&sb, " %s", q.terms[i]);
-    sb_puts(&sb, "\n\n");
-
-    /* Group output by module (directory) so structural hierarchy is visible */
-    /* First pass: collect unique modules */
-    char modules[CTX_MAX_TRAVERSAL][4096];
+    /* ---- 4. collect unique modules (ordered by relevance = first appearance) ---- */
+    /* We use heap-allocated arrays since 4096-byte paths × 512 would be 2MB on stack */
+    typedef char PathBuf[4096];
+    PathBuf *modules = (PathBuf *)malloc(64 * sizeof(PathBuf));
+    if (!modules) { free(ss); goto err_oom; }
     uint32_t mod_count = 0;
 
     ctx_graph_rlock(g);
@@ -621,13 +773,59 @@ char *ctx_retrieve(CtxGraph *g, const CtxRetrieveRequest *req) {
         bool dup = false;
         for (uint32_t m = 0; m < mod_count; m++)
             if (!strcmp(modules[m], mod)) { dup = true; break; }
-        if (!dup && mod_count < CTX_MAX_TRAVERSAL)
-            strncpy(modules[mod_count++], mod, sizeof(modules[0]) - 1);
+        if (!dup && mod_count < 64)
+            strncpy(modules[mod_count++], mod, sizeof(PathBuf) - 1);
     }
 
-    /* Second pass: emit by module */
+    /* ---- 5. build output ---- */
+    SB sb; sb_init(&sb);
+
+    /* CODEBASE header: gives the LLM immediate orientation */
+    {
+        char root[4096] = {0};
+        ctx_store_get_meta("root_path", root, sizeof(root));
+        if (root[0]) sb_printf(&sb, "CODEBASE: %s\n", root);
+    }
+    sb_printf(&sb, "QUERY: %s\n", req->text);
+    sb_puts(&sb, "TERMS:");
+    for (uint32_t i = 0; i < q.count; i++) sb_printf(&sb, " %s", q.terms[i]);
+    sb_printf(&sb, "\nSYMBOLS: %u across %u modules\n\n", ss->count, mod_count);
+
+    /* Module map: compact table giving the LLM a structural overview first */
+    sb_puts(&sb, "MODULES:\n");
     for (uint32_t m = 0; m < mod_count; m++) {
-        /* Count symbols in this module */
+        uint32_t in_mod = 0;
+        const char *lang_hint = NULL;
+        /* Collect peer file basenames for this module */
+        char peers[CTX_DIR_PEERS][256]; uint32_t pcount = 0;
+        const char *mod_file = NULL;
+
+        for (uint32_t i = 0; i < ss->count; i++) {
+            char mod[4096]; path_module(ss->items[i].sym->file, mod, sizeof(mod));
+            if (strcmp(mod, modules[m]) != 0) continue;
+            in_mod++;
+            if (!lang_hint) lang_hint = lang_name(ss->items[i].sym->lang);
+            if (!mod_file)  mod_file  = ss->items[i].sym->file;
+        }
+        if (mod_file && pcount == 0)
+            pcount = collect_dir_peers(fi, mod_file, peers, CTX_DIR_PEERS);
+
+        sb_printf(&sb, "  %s/  %u syms  %s", modules[m], in_mod,
+                  lang_hint ? lang_hint : "?");
+        if (pcount > 0) {
+            sb_puts(&sb, "  [also: ");
+            for (uint32_t p = 0; p < pcount; p++) {
+                if (p) sb_puts(&sb, ", ");
+                sb_puts(&sb, peers[p]);
+            }
+            sb_puts(&sb, "]");
+        }
+        sb_puts(&sb, "\n");
+    }
+    sb_puts(&sb, "\n");
+
+    /* Per-module detail */
+    for (uint32_t m = 0; m < mod_count; m++) {
         uint32_t in_mod = 0;
         for (uint32_t i = 0; i < ss->count; i++) {
             char mod[4096]; path_module(ss->items[i].sym->file, mod, sizeof(mod));
@@ -635,27 +833,12 @@ char *ctx_retrieve(CtxGraph *g, const CtxRetrieveRequest *req) {
         }
         if (in_mod == 0) continue;
 
-        sb_printf(&sb, "MODULE: %s/\n", modules[m]);
+        sb_printf(&sb, "MODULE %s/\n", modules[m]);
 
-        /* Emit peer files in same directory */
-        char peers[CTX_DIR_PEERS][256];
-        /* find a representative file for this module */
-        const char *mod_file = NULL;
-        for (uint32_t i = 0; i < ss->count; i++) {
-            char mod[4096]; path_module(ss->items[i].sym->file, mod, sizeof(mod));
-            if (!strcmp(mod, modules[m])) { mod_file = ss->items[i].sym->file; break; }
-        }
-        if (mod_file) {
-            uint32_t pc = collect_dir_peers(g, mod_file, peers, CTX_DIR_PEERS);
-            if (pc > 0) {
-                sb_puts(&sb, "  dir-peers:");
-                for (uint32_t p = 0; p < pc; p++) sb_printf(&sb, " %s", peers[p]);
-                sb_puts(&sb, "\n");
-            }
-        }
-
-        /* Group by file within module */
-        char files[64][4096]; uint32_t fcount = 0;
+        /* Collect unique files within this module */
+        PathBuf *files = (PathBuf *)malloc(64 * sizeof(PathBuf));
+        if (!files) { ctx_graph_runlock(g); free(modules); free(ss); goto err_oom; }
+        uint32_t fcount = 0;
         for (uint32_t i = 0; i < ss->count; i++) {
             char mod[4096]; path_module(ss->items[i].sym->file, mod, sizeof(mod));
             if (strcmp(mod, modules[m]) != 0) continue;
@@ -663,26 +846,36 @@ char *ctx_retrieve(CtxGraph *g, const CtxRetrieveRequest *req) {
             for (uint32_t f = 0; f < fcount; f++)
                 if (!strcmp(files[f], ss->items[i].sym->file)) { dup = true; break; }
             if (!dup && fcount < 64)
-                strncpy(files[fcount++], ss->items[i].sym->file, sizeof(files[0]) - 1);
+                strncpy(files[fcount++], ss->items[i].sym->file, sizeof(PathBuf) - 1);
         }
 
         for (uint32_t f = 0; f < fcount; f++) {
-            sb_printf(&sb, "  FILE: %s\n", files[f]);
+            uint32_t fsyms = count_file_syms(ss, files[f]);
+            const char *flang = NULL;
+            for (uint32_t i = 0; i < ss->count; i++)
+                if (!strcmp(ss->items[i].sym->file, files[f]))
+                    { flang = lang_name(ss->items[i].sym->lang); break; }
+
+            sb_printf(&sb, "  FILE %s  [%u syms, %s]\n",
+                      files[f], fsyms, flang ? flang : "?");
+
             for (uint32_t i = 0; i < ss->count; i++) {
                 if (strcmp(ss->items[i].sym->file, files[f]) != 0) continue;
                 const CtxSymbol *s = ss->items[i].sym;
-                sb_printf(&sb, "    (%s) ", ss->items[i].reason);
                 emit_symbol(&sb, s);
-                emit_edges(&sb, g, s);
+                emit_edges(&sb, g, s, files[f]);
             }
+            sb_puts(&sb, "\n");
         }
-        sb_puts(&sb, "\n");
+        free(files);
     }
 
     ctx_graph_runlock(g);
+    free(modules);
 
     CTX_LOG_DEBUG("retrieve '%s': %u symbols across %u modules",
                   req->text, ss->count, mod_count);
+    fi_free(fi);
     free(ss);
     return sb.buf;
 
