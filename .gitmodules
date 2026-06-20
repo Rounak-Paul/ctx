@@ -28,3 +28,9 @@
 [submodule "vendors/uthash"]
 	path = vendors/uthash
 	url = https://github.com/Rounak-Paul/uthash.git
+[submodule "vendors/tree-sitter-go"]
+	path = vendors/tree-sitter-go
+	url = https://github.com/Rounak-Paul/tree-sitter-go.git
+[submodule "vendors/tree-sitter-rust"]
+	path = vendors/tree-sitter-rust
+	url = https://github.com/Rounak-Paul/tree-sitter-rust.git
