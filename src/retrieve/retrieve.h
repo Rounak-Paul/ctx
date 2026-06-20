@@ -5,35 +5,33 @@
 /*
  * Context retrieval engine.
  *
- * Accepts a natural-language task/query or an explicit symbol/file anchor and
- * returns a compact, ranked, budget-bounded context bundle suitable for direct
- * inclusion in an LLM prompt. The bundle is rendered to either JSON (for
- * programmatic agents) or Markdown (for prompt inclusion). Output is
- * deterministic and never dumps whole files — it packs the highest-value source
- * slices first and reports what was omitted when the budget is exceeded.
+ * Given a natural-language query or an explicit symbol/file anchor, performs
+ * deep graph traversal across the indexed codebase and returns a structured
+ * relational context block. Output captures: matched symbols with full
+ * signatures, transitive call/reference/inheritance chains, field usage sites
+ * (write vs read), co-located symbols in the same file and directory module,
+ * and structural hierarchy. No token budget, no truncation, no markdown
+ * formatting — the goal is to give an agent the same picture it would have
+ * after reading the entire relevant portion of the codebase itself.
  */
 
-typedef enum { CTX_FMT_MARKDOWN = 0, CTX_FMT_JSON } CtxFormat;
-
 typedef enum {
-    CTX_QUERY_TASK = 0,   /* natural-language task text */
-    CTX_QUERY_SYMBOL,     /* anchored on a symbol name  */
-    CTX_QUERY_FILE        /* anchored on a file path    */
+    CTX_QUERY_TASK = 0,  /* natural-language task/question */
+    CTX_QUERY_SYMBOL,    /* anchored on a specific symbol name */
+    CTX_QUERY_FILE       /* anchored on a file path */
 } CtxQueryKind;
 
 typedef struct {
     CtxQueryKind kind;
-    const char  *text;        /* task text, symbol name, or file path */
-    uint32_t     budget;      /* token budget (approx); 0 → default    */
-    CtxFormat    format;
+    const char  *text;   /* task text, symbol name, or file path — must be non-NULL */
 } CtxRetrieveRequest;
 
 /*
- * Runs retrieval and returns a heap-allocated, NUL-terminated response string
- * in the requested format. Never returns NULL: on any error it returns a valid
- * formatted error payload. Caller must free().
+ * Run retrieval and return a heap-allocated, NUL-terminated structured context
+ * block. Never returns NULL — errors produce a valid error message string.
+ * Caller must free().
  *
  * g    Live graph (may be NULL or empty — handled gracefully).
- * req  Retrieval request. req->text must be non-NULL.
+ * req  Retrieval request.
  */
 char *ctx_retrieve(CtxGraph *g, const CtxRetrieveRequest *req);

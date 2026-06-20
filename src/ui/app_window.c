@@ -48,8 +48,7 @@ typedef struct {
     /* Context retrieval playground */
     Ca_TextInput *ctx_query_input;
     char          ctx_query[512];
-    char         *ctx_result;     /* heap markdown bundle from last query; owned */
-    int           ctx_budget_idx; /* index into g_ctx_budgets                    */
+    char         *ctx_result;    /* heap-allocated structured context block; owned */
 
     /* Interactive graph viewport */
     CtxForceGraph *force_graph;
@@ -163,7 +162,6 @@ static const char *g_css =
     "  background: #283b57; border: 1px #3a5375;"
     "}"
     ".ctx-run-label { color: #c0caf5; font-size: 11px; text-wrap: nowrap; }"
-    ".ctx-select { height: 26px; background: #161a1f; border: 1px #222933; }"
     ".ctx-hint { color: #565f89; font-size: 11px; }"
     ".ctx-result { gap: 1px; flex-grow: 1; }"
     ".ctx-line { color: #a9b1d6; font-size: 12px; }"
@@ -647,27 +645,8 @@ static void build_files_tab(Ca_Div *div, void *ud)
 
 /* --- Context retrieval tab -------------------------------- */
 
-/* Selectable token budgets for the playground. Index stored in ctx_budget_idx;
- * default index 2 == 2000 tokens (matches the API default). */
-static const uint32_t g_ctx_budgets[] = { 500, 1000, 2000, 4000, 8000 };
-static const char *const g_ctx_budget_labels[] = {
-    "500 tokens", "1000 tokens", "2000 tokens", "4000 tokens", "8000 tokens"
-};
-#define CTX_BUDGET_COUNT ((int)(sizeof(g_ctx_budgets) / sizeof(g_ctx_budgets[0])))
-
 static void run_ctx_query(void);
 
-/* Applies the chosen budget and re-runs the query if one is already shown. */
-static void on_ctx_budget_change(Ca_Select *sel, void *ud)
-{
-    CTX_UNUSED(ud);
-    int idx = ca_select_get(sel);
-    if (idx < 0 || idx >= CTX_BUDGET_COUNT) return;
-    s.ctx_budget_idx = idx;
-    if (s.ctx_query[0]) run_ctx_query();
-}
-
-/* Captures the live query text as the user edits the field. */
 static void on_ctx_query_change(Ca_TextInput *input, void *ud)
 {
     CTX_UNUSED(ud);
@@ -677,17 +656,12 @@ static void on_ctx_query_change(Ca_TextInput *input, void *ud)
     s.ctx_query[sizeof(s.ctx_query) - 1] = '\0';
 }
 
-/* Runs retrieval for the current query and stores the markdown bundle. */
 static void run_ctx_query(void)
 {
     if (s.ctx_query[0] == '\0') return;
     free(s.ctx_result);
     s.ctx_result = NULL;
-
-    CtxRetrieveRequest req = {
-        .kind = CTX_QUERY_TASK, .text = s.ctx_query,
-        .budget = g_ctx_budgets[s.ctx_budget_idx], .format = CTX_FMT_MARKDOWN,
-    };
+    CtxRetrieveRequest req = { .kind = CTX_QUERY_TASK, .text = s.ctx_query };
     s.ctx_result = ctx_retrieve(ctx_indexer_get_graph(), &req);
     s.content_needs_rebuild = true;
     ca_instance_wake();
@@ -699,12 +673,13 @@ static void on_ctx_run_click(Ca_Button *button, void *ud)
     run_ctx_query();
 }
 
-/* Picks a line style by its markdown prefix so the bundle stays readable
- * without a full markdown renderer. */
+/* Line styling for the structured output format:
+ * MODULE/FILE headers → blue, edge/sig lines (indented) → muted, rest → normal */
 static const char *ctx_line_style(const char *line)
 {
-    if (line[0] == '#') return "ctx-line-h";
-    if (line[0] == '`' || line[0] == '/') return "ctx-line-cite";
+    if (!strncmp(line, "MODULE:", 7) || !strncmp(line, "QUERY:", 6) ||
+        !strncmp(line, "SYMBOLS:", 8)) return "ctx-line-h";
+    if (!strncmp(line, "  FILE:", 7)) return "ctx-line-cite";
     if (line[0] == ' ' || line[0] == '\t') return "ctx-line-code";
     return "ctx-line";
 }
@@ -714,29 +689,19 @@ static void build_context_tab(Ca_Div *div, void *ud)
     CTX_UNUSED(div); CTX_UNUSED(ud);
 
     ca_div_begin(&(Ca_DivDesc){ .direction = CA_VERTICAL, .style = "ctx-shell" });
-        /* Playground explainer — this tab is a human-facing preview of exactly
-         * what an agent receives from the /context API; it does not call an LLM. */
         ca_text(&(Ca_TextDesc){
-            .text = "Playground — preview the budget-bounded context bundle an "
-                    "agent would get from GET /context. Pick a token budget and "
-                    "watch what gets packed vs. omitted. No LLM is called.",
+            .text = "Playground — preview the full relational context block an agent "
+                    "receives from GET /context. Deep graph traversal: call chains, "
+                    "reference sites, module structure. No token budget, no truncation. "
+                    "No LLM is called.",
             .style = "ctx-hint", .wrap = true });
 
         ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "ctx-bar" });
             s.ctx_query_input = ca_input(&(Ca_InputDesc){
                 .text        = s.ctx_query[0] ? s.ctx_query : NULL,
-                .placeholder = "Describe a task — e.g. how are semantic edges resolved",
+                .placeholder = "Describe a task — e.g. how does culling work",
                 .on_change   = on_ctx_query_change,
                 .style       = "ctx-input",
-            });
-            ca_text(&(Ca_TextDesc){ .text = "Budget", .style = "ctx-hint" });
-            ca_select(&(Ca_SelectDesc){
-                .options       = g_ctx_budget_labels,
-                .option_count  = CTX_BUDGET_COUNT,
-                .selected      = s.ctx_budget_idx,
-                .width         = 120.0f,
-                .on_change     = on_ctx_budget_change,
-                .style         = "ctx-select",
             });
             ca_btn_begin(&(Ca_BtnDesc){
                 .style = "ctx-run-btn", .direction = CA_HORIZONTAL,
@@ -746,27 +711,23 @@ static void build_context_tab(Ca_Div *div, void *ud)
             ca_btn_end();
         ca_div_end();
 
-        /* Enter in the focused field submits the query. */
         if (s.ctx_query_input &&
             ca_input_key_pressed(s.ctx_query_input, CTX_KEY_ENTER))
             run_ctx_query();
 
         if (!s.ctx_result) {
             ca_text(&(Ca_TextDesc){
-                .text = "Type a task and press Enter (or click Retrieve). The bundle "
-                        "lists ranked symbols, source snippets, caller/callee/reference "
-                        "relationships, and anything omitted to stay within budget.",
+                .text = "Type a task and press Enter (or click Retrieve).",
                 .style = "ctx-hint", .wrap = true });
             ca_div_end();
             return;
         }
 
-        /* Render the markdown bundle line-by-line, bounded for layout safety. */
         ca_div_begin(&(Ca_DivDesc){ .direction = CA_VERTICAL, .style = "ctx-result" });
             const char *p = s.ctx_result;
             char line[512];
             int rendered = 0;
-            while (*p && rendered < 200) {
+            while (*p && rendered < 400) {
                 const char *nl = strchr(p, '\n');
                 size_t len = nl ? (size_t)(nl - p) : strlen(p);
                 if (len >= sizeof(line)) len = sizeof(line) - 1;
@@ -811,7 +772,6 @@ static void build_content(Ca_Div *div, void *ud)
 bool ctx_ui_run(void)
 {
     s.active_tab = 0;
-    s.ctx_budget_idx = 2;   /* default 2000-token budget */
     s.force_graph = ctx_force_graph_create();
     if (!s.force_graph) {
         CTX_LOG_ERROR("Failed to allocate graph viewport");

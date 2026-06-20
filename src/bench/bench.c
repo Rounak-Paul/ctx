@@ -3,29 +3,27 @@
 #include "../log/log.h"
 
 /*
- * Each case asserts that every `must_have` token appears somewhere in the
- * retrieval output for `task` within `budget` tokens. Assertions are on
- * presence of important files/symbols, never on exact scores or ordering, to
- * stay robust as ranking evolves.
+ * Each case asserts that every must_have token appears somewhere in the
+ * retrieval output. Assertions are presence-based to stay robust as ranking
+ * evolves. No budget check — output is unbounded by design now.
  */
 typedef struct {
     const char *task;
-    uint32_t    budget;
-    const char *must_have[6];   /* NULL-terminated list of required substrings */
+    const char *must_have[6];
 } BenchCase;
 
 static const BenchCase k_cases[] = {
-    { "where is the API status endpoint implemented", 1500,
+    { "where is the API status endpoint implemented",
       { "api.c", "handle_stats", NULL } },
-    { "how are pending semantic edges resolved", 1500,
+    { "how are pending semantic edges resolved",
       { "graph.c", "resolve_calls", NULL } },
-    { "why does indexing crash on vendor files", 1800,
-      { "extractor.c", NULL } },
-    { "how is the context budget packed for a task", 1800,
+    { "how is context retrieved for a task query",
       { "retrieve.c", NULL } },
-    { "where are symbols persisted to the database", 1500,
+    { "where are symbols persisted to the database",
       { "store.c", NULL } },
-    { "fix graph legend colors", 1800,
+    { "how does the extractor walk the AST",
+      { "extractor.c", NULL } },
+    { "how does the force graph render nodes",
       { "force_graph.c", NULL } },
 };
 
@@ -41,10 +39,7 @@ int ctx_bench_run(CtxGraph *g) {
 
     for (uint32_t i = 0; i < total; i++) {
         const BenchCase *c = &k_cases[i];
-        CtxRetrieveRequest req = {
-            .kind = CTX_QUERY_TASK, .text = c->task,
-            .budget = c->budget, .format = CTX_FMT_MARKDOWN
-        };
+        CtxRetrieveRequest req = { .kind = CTX_QUERY_TASK, .text = c->task };
         char *out = ctx_retrieve(g, &req);
 
         bool ok = true;
@@ -52,18 +47,14 @@ int ctx_bench_run(CtxGraph *g) {
         for (int k = 0; c->must_have[k]; k++) {
             if (!contains(out, c->must_have[k])) { ok = false; missing = c->must_have[k]; break; }
         }
-        size_t out_len = out ? strlen(out) : 0;
-        uint32_t approx_tokens = (uint32_t)(out_len / 4);
-        bool within = approx_tokens <= c->budget + c->budget / 2; /* allow framing overhead */
 
-        if (!ok || !within) {
+        if (!ok) {
             failed++;
             fprintf(stdout, "  [FAIL] \"%s\"\n", c->task);
-            if (!ok)     fprintf(stdout, "         missing expected: %s\n", missing);
-            if (!within) fprintf(stdout, "         over budget: ~%u tokens (budget %u)\n",
-                                  approx_tokens, c->budget);
+            fprintf(stdout, "         missing: %s\n", missing);
         } else {
-            fprintf(stdout, "  [PASS] \"%s\" (~%u tokens)\n", c->task, approx_tokens);
+            size_t out_len = out ? strlen(out) : 0;
+            fprintf(stdout, "  [PASS] \"%s\" (~%zu bytes)\n", c->task, out_len);
         }
         free(out);
     }

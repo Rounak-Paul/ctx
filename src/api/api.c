@@ -132,32 +132,9 @@ static void handle_reindex(int fd) {
     send_json(fd, 200, "{\"status\":\"reindex_started\"}");
 }
 
-/* Parses ?budget= (tokens) and ?format=json|markdown from a query string. */
-static uint32_t parse_budget(const char *query) {
-    char *b = get_param(query, "budget");
-    uint32_t budget = 0;
-    if (b) { long v = strtol(b, NULL, 10); if (v > 0) budget = (uint32_t)v; free(b); }
-    return budget;
-}
-
-static CtxFormat parse_format(const char *query) {
-    char *f = get_param(query, "format");
-    CtxFormat fmt = CTX_FMT_MARKDOWN;
-    if (f) { if (!strcasecmp(f, "json")) fmt = CTX_FMT_JSON; free(f); }
-    return fmt;
-}
-
-static void send_retrieval(int fd, char *result, CtxFormat fmt) {
-    if (fmt == CTX_FMT_JSON) send_json(fd, 200, result);
-    else send_text(fd, result);
-    free(result);
-}
-
 static void handle_context(int fd, const char *query, const char *route) {
-    /* route: NULL → task; "symbol"/"file" → anchored */
-    CtxFormat fmt = parse_format(query);
-    uint32_t budget = parse_budget(query);
-    CtxRetrieveRequest req = { .budget = budget, .format = fmt };
+    /* route: NULL → task; "symbol" → symbol anchor; "file" → file anchor */
+    CtxRetrieveRequest req = {0};
     char *arg = NULL;
 
     if (!route) {
@@ -178,7 +155,8 @@ static void handle_context(int fd, const char *query, const char *route) {
     }
     req.text = arg;
     char *result = ctx_retrieve(get_graph(), &req);
-    send_retrieval(fd, result, fmt);
+    send_text(fd, result);
+    free(result);
     ctx_stats_record_query(route ? route : "/context", 0);
     free(arg);
 }
