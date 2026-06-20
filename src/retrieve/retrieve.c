@@ -271,16 +271,102 @@ static const char *kind_str(CtxSymbolKind k) {
 }
 
 /* ======================================================================== */
-/* BFS graph traversal — both directions, all edge kinds                    */
+/* adjacency list — built once per query, makes BFS O(degree) not O(edges)  */
+/* ======================================================================== */
+
+#define ADJ_BUCKETS 65536u  /* power of 2, covers 400k+ symbols */
+
+typedef struct AdjEdge {
+    uint64_t        other_id;
+    CtxEdgeKind     kind;
+    bool            outgoing;
+    struct AdjEdge *next;
+} AdjEdge;
+
+typedef struct AdjEntry {
+    uint64_t        sym_id;
+    AdjEdge        *edges;
+    uint32_t        degree;   /* total edge count — used for hub scoring */
+    struct AdjEntry *next;
+} AdjEntry;
+
+typedef struct {
+    AdjEntry  *buckets[ADJ_BUCKETS];
+    AdjEntry  *entry_pool;
+    AdjEdge   *edge_pool;
+    uint32_t   entry_count, entry_cap;
+    uint32_t   edge_count,  edge_cap;
+} AdjList;
+
+static AdjList *adj_build(CtxGraph *g) {
+    uint32_t sym_count  = HASH_COUNT(g->symbols);
+    uint32_t edge_count = HASH_COUNT(g->edges);
+    AdjList *al = calloc(1, sizeof(AdjList));
+    if (!al) return NULL;
+    al->entry_cap = sym_count < 64 ? 64 : sym_count;
+    al->edge_cap  = edge_count * 2 + 64; /* ×2: each edge appears at both endpoints */
+    al->entry_pool = malloc(al->entry_cap * sizeof(AdjEntry));
+    al->edge_pool  = malloc(al->edge_cap  * sizeof(AdjEdge));
+    if (!al->entry_pool || !al->edge_pool) { free(al->entry_pool); free(al->edge_pool); free(al); return NULL; }
+
+    /* Helper: get or create entry for a symbol id */
+    #define adj_get_or_create(al_, id_) ({                                       \
+        uint32_t _sl = (uint32_t)((id_) & (ADJ_BUCKETS - 1u));                  \
+        AdjEntry *_e = NULL;                                                     \
+        for (AdjEntry *_p = (al_)->buckets[_sl]; _p; _p = _p->next)             \
+            if (_p->sym_id == (id_)) { _e = _p; break; }                        \
+        if (!_e && (al_)->entry_count < (al_)->entry_cap) {                     \
+            _e = &(al_)->entry_pool[(al_)->entry_count++];                       \
+            _e->sym_id = (id_); _e->edges = NULL; _e->degree = 0;               \
+            _e->next = (al_)->buckets[_sl];                                      \
+            (al_)->buckets[_sl] = _e;                                            \
+        }                                                                        \
+        _e;                                                                      \
+    })
+
+    CtxEdgeEntry *e, *etmp;
+    HASH_ITER(hh, g->edges, e, etmp) {
+        if (al->edge_count + 2 > al->edge_cap) break;
+        AdjEntry *fe = adj_get_or_create(al, e->from_id);
+        AdjEntry *te = adj_get_or_create(al, e->to_id);
+        if (fe) {
+            AdjEdge *ae = &al->edge_pool[al->edge_count++];
+            ae->other_id = e->to_id; ae->kind = e->kind; ae->outgoing = true;
+            ae->next = fe->edges; fe->edges = ae; fe->degree++;
+        }
+        if (te) {
+            AdjEdge *ae = &al->edge_pool[al->edge_count++];
+            ae->other_id = e->from_id; ae->kind = e->kind; ae->outgoing = false;
+            ae->next = te->edges; te->edges = ae; te->degree++;
+        }
+    }
+    #undef adj_get_or_create
+    return al;
+}
+
+static AdjEntry *adj_get(AdjList *al, uint64_t id) {
+    if (!al) return NULL;
+    uint32_t sl = (uint32_t)(id & (ADJ_BUCKETS - 1u));
+    for (AdjEntry *e = al->buckets[sl]; e; e = e->next)
+        if (e->sym_id == id) return e;
+    return NULL;
+}
+
+static void adj_free(AdjList *al) {
+    if (!al) return;
+    free(al->entry_pool); free(al->edge_pool); free(al);
+}
+
+/* ======================================================================== */
+/* BFS graph traversal using adjacency list — O(degree) per hop             */
 /* ======================================================================== */
 /*
- * Walks the call/reference/inheritance graph outward from seed_id in both
- * directions up to CTX_TRAVERSAL_DEPTH hops. Adds every reachable non-vendor
- * symbol into ss. Caller must hold the graph read lock.
+ * Walks the graph from seed_id up to max_depth hops. Uses the pre-built
+ * adjacency list so each hop is O(degree) not O(all_edges).
+ * Depth-decayed scoring: hop 0 scores 50, each hop loses 10 points.
  */
-static void traverse_from(CtxGraph *g, uint64_t seed_id, const char *seed_file,
-                           SymSet *ss, int max_depth) {
-    /* BFS queue of (id, depth) pairs */
+static void traverse_from(AdjList *al, CtxGraph *g, uint64_t seed_id,
+                           const char *seed_file, SymSet *ss, int max_depth) {
     typedef struct { uint64_t id; int depth; } QEntry;
     QEntry *queue = (QEntry *)malloc(CTX_MAX_TRAVERSAL * 2 * sizeof(QEntry));
     if (!queue) return;
@@ -296,39 +382,261 @@ static void traverse_from(CtxGraph *g, uint64_t seed_id, const char *seed_file,
         QEntry cur = queue[head++];
         if (cur.depth >= max_depth) continue;
 
-        /* Scan all edges for any that touch cur.id */
-        for (CtxEdgeEntry *e = g->edges; e; e = (CtxEdgeEntry *)e->hh.next) {
-            uint64_t other = 0;
-            bool outgoing = false;
-            if (e->from_id == cur.id) { other = e->to_id;   outgoing = true;  }
-            else if (e->to_id == cur.id) { other = e->from_id; outgoing = false; }
-            else continue;
+        AdjEntry *ae = adj_get(al, cur.id);
+        if (!ae) continue;
 
-            const CtxSymbol *os = ctx_graph_find_by_id_locked(g, other);
+        for (AdjEdge *edge = ae->edges; edge; edge = edge->next) {
+            if (edge->kind == CTX_EDGE_REFERENCES && !edge->outgoing) continue;
+
+            const CtxSymbol *os = ctx_graph_find_by_id_locked(g, edge->other_id);
             if (!os || os->kind == CTX_SYM_UNKNOWN) continue;
-
-            /* Suppress cross-vendor reference noise */
-            if (e->kind == CTX_EDGE_REFERENCES && !seed_is_vendor && is_vendor_path(os->file))
+            if (edge->kind == CTX_EDGE_REFERENCES && !seed_is_vendor && is_vendor_path(os->file))
                 continue;
 
-            const char *reason = outgoing
-                ? (e->kind == CTX_EDGE_CALLS ? "callee" :
-                   e->kind == CTX_EDGE_INHERITS ? "base" :
-                   e->kind == CTX_EDGE_REFERENCES ? "refs" : "related")
-                : (e->kind == CTX_EDGE_CALLS ? "caller" :
-                   e->kind == CTX_EDGE_INHERITS ? "derived" :
-                   e->kind == CTX_EDGE_REFERENCES ? "ref'd by" : "related");
+            double sc = 50.0 - cur.depth * 10.0;
+            symset_add(ss, os, sc, edge->outgoing ? "callee" : "caller");
 
-            double sc = 50.0 - cur.depth * 8.0;
-            symset_add(ss, os, sc, reason);
-
-            if (!idset_has(&visited, other) && tail < CTX_MAX_TRAVERSAL * 2) {
-                idset_add(&visited, other);
-                queue[tail++] = (QEntry){ other, cur.depth + 1 };
+            if (!idset_has(&visited, edge->other_id) && tail < CTX_MAX_TRAVERSAL * 2) {
+                idset_add(&visited, edge->other_id);
+                queue[tail++] = (QEntry){ edge->other_id, cur.depth + 1 };
             }
         }
     }
     free(queue);
+}
+
+/* ======================================================================== */
+/* inverted token index — maps token → candidate symbols, O(1) per term     */
+/* ======================================================================== */
+
+#define INV_BUCKETS 32768u
+
+typedef struct InvEntry {
+    char             token[64];
+    const CtxSymbol **syms;
+    double           *scores;  /* pre-scored per-symbol contribution for this token */
+    uint32_t          count, cap;
+    struct InvEntry  *next;
+} InvEntry;
+
+typedef struct {
+    InvEntry *buckets[INV_BUCKETS];
+    InvEntry *pool;
+    uint32_t  pool_count, pool_cap;
+} InvIndex;
+
+static uint32_t inv_hash(const char *tok) {
+    uint32_t h = 2166136261u;
+    for (const char *p = tok; *p; p++) h = (h ^ (unsigned char)tolower((unsigned char)*p)) * 16777619u;
+    return h & (INV_BUCKETS - 1u);
+}
+
+/*
+ * Tokenises a symbol's searchable fields into the set of query-matchable tokens.
+ * Splits on _, /, camelCase boundaries and lowercases everything.
+ * out[] must have room for at least 32 tokens of 64 bytes each.
+ * Returns count of tokens written.
+ */
+static uint32_t symbol_tokens(const CtxSymbol *s, char out[][64], uint32_t max) {
+    uint32_t n = 0;
+    /* Helper: emit one token if non-empty, non-duplicate, and long enough */
+    #define emit_tok(w_, wl_) do {                                      \
+        if ((wl_) >= 2 && n < max) {                                    \
+            char _tmp[64]; uint32_t _l = (wl_) < 63 ? (wl_) : 63;     \
+            memcpy(_tmp, (w_), _l); _tmp[_l] = '\0';                   \
+            for (char *_p = _tmp; *_p; _p++)                            \
+                *_p = (char)tolower((unsigned char)*_p);                \
+            bool _dup = false;                                           \
+            for (uint32_t _i = 0; _i < n; _i++)                        \
+                if (!strcmp(out[_i], _tmp)) { _dup = true; break; }    \
+            if (!_dup) { memcpy(out[n++], _tmp, _l + 1); }             \
+        }                                                                \
+    } while (0)
+
+    /* name: split on _ and camelCase */
+    const char *nm = s->name;
+    uint32_t wstart = 0;
+    for (uint32_t i = 0; ; i++) {
+        unsigned char c = (unsigned char)nm[i];
+        bool boundary = !c || c == '_' || (i > wstart && isupper(c) && islower((unsigned char)nm[i-1]));
+        if (boundary) {
+            if (i > wstart) emit_tok(nm + wstart, i - wstart);
+            wstart = (c == '_') ? i + 1 : i;
+        }
+        if (!c) break;
+    }
+    /* full lowercased name as one token */
+    emit_tok(nm, strlen(nm));
+
+    /* filename without extension */
+    const char *base = path_basename(s->file);
+    const char *dot  = strrchr(base, '.');
+    emit_tok(base, dot ? (uint32_t)(dot - base) : (uint32_t)strlen(base));
+
+    /* scope (enclosing class/ns) */
+    if (s->scope[0]) emit_tok(s->scope, strlen(s->scope));
+
+    #undef emit_tok
+    return n;
+}
+
+/*
+ * Builds an inverted index mapping lowercase tokens to matching symbols.
+ * Built in a single O(n) pass over all non-UNKNOWN symbols.
+ * Caller holds read lock.
+ */
+static InvIndex *inv_build(CtxGraph *g, AdjList *al) {
+    uint32_t sym_count = HASH_COUNT(g->symbols);
+    InvIndex *ix = calloc(1, sizeof(InvIndex));
+    if (!ix) return NULL;
+    ix->pool_cap = sym_count / 4 + 256;
+    ix->pool = calloc(ix->pool_cap, sizeof(InvEntry));
+    if (!ix->pool) { free(ix); return NULL; }
+
+    char toks[32][64];
+    CtxSymbol *s, *stmp;
+    HASH_ITER(hh, g->symbols, s, stmp) {
+        if (s->kind == CTX_SYM_UNKNOWN) continue;
+        uint32_t ntoks = symbol_tokens(s, toks, 32);
+        /* degree from adjacency list — hub bonus */
+        AdjEntry *ae = al ? adj_get(al, s->id) : NULL;
+        double hub = ae ? (double)ae->degree * 0.08 : 0.0;
+        if (hub > 6.0) hub = 6.0;
+
+        for (uint32_t t = 0; t < ntoks; t++) {
+            uint32_t h = inv_hash(toks[t]);
+            InvEntry *ie = NULL;
+            for (InvEntry *p = ix->buckets[h]; p; p = p->next)
+                if (!strcmp(p->token, toks[t])) { ie = p; break; }
+            if (!ie) {
+                if (ix->pool_count >= ix->pool_cap) continue;
+                ie = &ix->pool[ix->pool_count++];
+                strncpy(ie->token, toks[t], 63);
+                ie->cap = 8; ie->count = 0;
+                ie->syms   = malloc(ie->cap * sizeof(CtxSymbol *));
+                ie->scores = malloc(ie->cap * sizeof(double));
+                if (!ie->syms || !ie->scores) { free(ie->syms); free(ie->scores); continue; }
+                ie->next = ix->buckets[h]; ix->buckets[h] = ie;
+            }
+            /* grow if needed */
+            if (ie->count >= ie->cap) {
+                uint32_t nc = ie->cap * 2;
+                const CtxSymbol **ns = realloc((void*)ie->syms, nc * sizeof(CtxSymbol *));
+                double *nd           = realloc(ie->scores,       nc * sizeof(double));
+                if (!ns || !nd) { free(ns); free(nd); continue; }
+                ie->syms = ns; ie->scores = nd; ie->cap = nc;
+            }
+            /* base score for this token: exact name match >> substring >> filename */
+            double sc = 0;
+            if (!strcasecmp(s->name, toks[t]))          sc = 40;
+            else if (!strncasecmp(s->name, toks[t], strlen(toks[t]))) sc = 22;
+            else if (!strcasecmp(path_basename(s->file), toks[t]))    sc = 10;
+            else                                                        sc = 8;
+            sc += kind_importance(s->kind) + hub;
+            if (s->is_definition) sc += 6;
+            if (is_vendor_path(s->file)) sc *= 0.3;
+            ie->syms[ie->count]   = s;
+            ie->scores[ie->count] = sc;
+            ie->count++;
+        }
+    }
+    return ix;
+}
+
+static void inv_free(InvIndex *ix) {
+    if (!ix) return;
+    for (uint32_t i = 0; i < ix->pool_count; i++) {
+        free((void*)ix->pool[i].syms);
+        free(ix->pool[i].scores);
+    }
+    free(ix->pool); free(ix);
+}
+
+/*
+ * Queries the inverted index for all terms in q, accumulating scores.
+ * Uses a flat score accumulator keyed by symbol pointer (via id hash).
+ * Returns heap-allocated Seed array sorted by score descending.
+ */
+#define SCORE_BUCKETS 8192u
+
+typedef struct ScoreEntry { const CtxSymbol *sym; double score; uint32_t hits; } ScoreEntry;
+
+static uint32_t inv_query(InvIndex *ix, const QueryTerms *q,
+                          ScoreEntry *out, uint32_t max_out) {
+    /* Open-addressed accumulator: score per symbol across all matching terms */
+    ScoreEntry *acc = calloc(SCORE_BUCKETS, sizeof(ScoreEntry));
+    if (!acc) return 0;
+
+    for (uint32_t t = 0; t < q->count; t++) {
+        /* exact token */
+        uint32_t h = inv_hash(q->terms[t]);
+        for (InvEntry *ie = ix->buckets[h]; ie; ie = ie->next) {
+            if (strcmp(ie->token, q->terms[t])) continue;
+            for (uint32_t i = 0; i < ie->count; i++) {
+                uint64_t id = ie->syms[i]->id;
+                uint32_t sl = (uint32_t)(id & (SCORE_BUCKETS - 1u));
+                for (uint32_t probe = 0; probe < SCORE_BUCKETS; probe++) {
+                    uint32_t s = (sl + probe) & (SCORE_BUCKETS - 1u);
+                    if (!acc[s].sym) {
+                        acc[s].sym = ie->syms[i]; acc[s].score = ie->scores[i]; acc[s].hits = 1;
+                        break;
+                    }
+                    if (acc[s].sym->id == id) {
+                        acc[s].score += ie->scores[i]; acc[s].hits++;
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+        /* prefix match: also check tokens that start with this term (e.g. "rend"→"render") */
+        size_t tl = strlen(q->terms[t]);
+        if (tl >= 4) {
+            for (uint32_t bkt = 0; bkt < INV_BUCKETS; bkt++) {
+                for (InvEntry *ie = ix->buckets[bkt]; ie; ie = ie->next) {
+                    if (strncmp(ie->token, q->terms[t], tl)) continue;
+                    if (!strcmp(ie->token, q->terms[t])) continue; /* already counted */
+                    for (uint32_t i = 0; i < ie->count; i++) {
+                        uint64_t id = ie->syms[i]->id;
+                        uint32_t sl = (uint32_t)(id & (SCORE_BUCKETS - 1u));
+                        for (uint32_t probe = 0; probe < SCORE_BUCKETS; probe++) {
+                            uint32_t s2 = (sl + probe) & (SCORE_BUCKETS - 1u);
+                            if (!acc[s2].sym) {
+                                acc[s2].sym = ie->syms[i]; acc[s2].score = ie->scores[i] * 0.5; acc[s2].hits = 1;
+                                break;
+                            }
+                            if (acc[s2].sym->id == id) {
+                                acc[s2].score += ie->scores[i] * 0.5;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* coverage bonus: symbols matching more query terms rank higher */
+    for (uint32_t i = 0; i < SCORE_BUCKETS; i++) {
+        if (!acc[i].sym) continue;
+        acc[i].score += acc[i].hits * 8.0;
+    }
+
+    /* Collect top-max_out by score */
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < SCORE_BUCKETS; i++) {
+        if (!acc[i].sym || acc[i].score < CTX_MIN_SCORE) continue;
+        if (count < max_out) {
+            out[count++] = acc[i];
+        } else {
+            uint32_t min_i = 0;
+            for (uint32_t j = 1; j < count; j++)
+                if (out[j].score < out[min_i].score) min_i = j;
+            if (acc[i].score > out[min_i].score) out[min_i] = acc[i];
+        }
+    }
+    free(acc);
+    return count;
 }
 
 /* ======================================================================== */
@@ -676,76 +984,79 @@ char *ctx_retrieve(CtxGraph *g, const CtxRetrieveRequest *req) {
         return sb.buf;
     }
 
-    /* ---- 2. score every symbol → ranked seeds ---- */
-    typedef struct { const CtxSymbol *sym; double score; } Seed;
-    Seed *seeds = (Seed *)malloc(CTX_MAX_SEEDS * sizeof(Seed));
-    if (!seeds) goto err_oom;
-    uint32_t seed_count = 0;
-
+    /* ---- 2. build indexes (one pass each, under read lock) ---- */
     ctx_graph_rlock(g);
 
-    {
+    /* Adjacency list: O(edges) build, makes BFS O(degree) per hop */
+    AdjList  *al = adj_build(g);
+    /* Inverted token index: O(symbols) build, makes scoring O(matching) */
+    InvIndex *ix = inv_build(g, al);
+    /* File index: O(symbols) build, O(1) per-file lookup */
+    FileIndex *fi = fi_build(g);
+
+    /* ---- 3. score via inverted index → ranked seeds ---- */
+    typedef struct { const CtxSymbol *sym; double score; } Seed;
+    Seed *seeds = (Seed *)malloc(CTX_MAX_SEEDS * sizeof(Seed));
+    if (!seeds) { ctx_graph_runlock(g); adj_free(al); inv_free(ix); fi_free(fi); goto err_oom; }
+    uint32_t seed_count = 0;
+
+    if (req->kind == CTX_QUERY_FILE || req->kind == CTX_QUERY_SYMBOL) {
+        /* Anchor queries: still need a full scan but these are rare and fast with small q */
         CtxSymbol *s, *tmp_s;
         HASH_ITER(hh, g->symbols, s, tmp_s) {
             double sc = 0;
             if (req->kind == CTX_QUERY_FILE) {
                 if (strcmp(s->file, req->text) == 0)
                     sc = 200 + kind_importance(s->kind);
-            } else if (req->kind == CTX_QUERY_SYMBOL) {
-                /* trim and whitespace-clean the anchor */
+            } else {
                 char anchor[512]; strncpy(anchor, req->text, sizeof(anchor)-1);
                 for (char *p = anchor; *p; p++) if (isspace((unsigned char)*p)) { *p='\0'; break; }
-                if (!strcasecmp(s->name, anchor))
-                    sc = 200 + kind_importance(s->kind);
-                else if (ci_substr(s->name, anchor) || ci_substr(anchor, s->name))
-                    sc = 100 + kind_importance(s->kind);
-                else
-                    sc = score_symbol(s, &q);
-            } else {
-                sc = score_symbol(s, &q);
+                if (!strcasecmp(s->name, anchor))       sc = 200 + kind_importance(s->kind);
+                else if (ci_substr(s->name, anchor))    sc = 100 + kind_importance(s->kind);
+                else                                    sc = score_symbol(s, &q);
             }
             if (sc < CTX_MIN_SCORE) continue;
-
-            if (seed_count < CTX_MAX_SEEDS) {
-                seeds[seed_count++] = (Seed){ s, sc };
-            } else {
-                /* replace lowest if better */
-                uint32_t min_i = 0;
-                for (uint32_t i = 1; i < seed_count; i++)
-                    if (seeds[i].score < seeds[min_i].score) min_i = i;
-                if (sc > seeds[min_i].score)
-                    seeds[min_i] = (Seed){ s, sc };
+            if (seed_count < CTX_MAX_SEEDS) { seeds[seed_count++] = (Seed){ s, sc }; }
+            else {
+                uint32_t mi = 0;
+                for (uint32_t i = 1; i < seed_count; i++) if (seeds[i].score < seeds[mi].score) mi = i;
+                if (sc > seeds[mi].score) seeds[mi] = (Seed){ s, sc };
             }
+        }
+    } else if (ix) {
+        /* Task query: use inverted index — O(matching symbols) not O(all symbols) */
+        ScoreEntry *scored = malloc(CTX_MAX_SEEDS * sizeof(ScoreEntry));
+        if (scored) {
+            uint32_t n = inv_query(ix, &q, scored, CTX_MAX_SEEDS);
+            for (uint32_t i = 0; i < n; i++)
+                seeds[seed_count++] = (Seed){ scored[i].sym, scored[i].score };
+            free(scored);
         }
     }
 
-    /* ---- 3. build full symbol set via graph traversal + file siblings ---- */
+    /* ---- 4. BFS expansion via adjacency list ---- */
     SymSet *ss = (SymSet *)calloc(1, sizeof(SymSet));
-    if (!ss) { ctx_graph_runlock(g); free(seeds); goto err_oom; }
+    if (!ss) { ctx_graph_runlock(g); adj_free(al); inv_free(ix); fi_free(fi); free(seeds); goto err_oom; }
 
-    /* Add seeds themselves */
     for (uint32_t i = 0; i < seed_count; i++)
         symset_add(ss, seeds[i].sym, seeds[i].score, "query match");
 
-    /* BFS from each seed */
-    for (uint32_t i = 0; i < seed_count && ss->count < CTX_MAX_TRAVERSAL; i++)
-        traverse_from(g, seeds[i].sym->id, seeds[i].sym->file, ss, CTX_TRAVERSAL_DEPTH);
+    if (al) {
+        for (uint32_t i = 0; i < seed_count && ss->count < CTX_MAX_TRAVERSAL; i++)
+            traverse_from(al, g, seeds[i].sym->id, seeds[i].sym->file, ss, CTX_TRAVERSAL_DEPTH);
+    }
 
-    /* Build file index once (under read lock) for O(1) per-file lookups */
-    FileIndex *fi = fi_build(g);
-
-    /* Pull co-file siblings for top seeds (structural locality) */
+    /* Pull co-file siblings and include-chain for top seeds */
     uint32_t top = seed_count < 8 ? seed_count : 8;
     if (fi) {
         for (uint32_t i = 0; i < top && ss->count < CTX_MAX_TRAVERSAL; i++)
             collect_file_siblings(fi, seeds[i].sym, ss);
-
-        /* Pull include-chain symbols for top seeds (import hierarchy signal) */
         for (uint32_t i = 0; i < top && ss->count < CTX_MAX_TRAVERSAL; i++)
             collect_include_chain(g, fi, seeds[i].sym, ss);
     }
 
     ctx_graph_runlock(g);
+    adj_free(al); inv_free(ix);
     free(seeds);
 
     if (ss->count == 0) {
