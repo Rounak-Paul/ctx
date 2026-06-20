@@ -24,9 +24,13 @@ CtxAppConfig ctx_app_parse_args(int argc, char **argv)
         } else if (!strcmp(argv[i], "--no-api")) {
             cfg.no_api = true;
         } else if (!strcmp(argv[i], "--bench")) {
-            cfg.bench   = true;
+            cfg.bench    = true;
             cfg.gui_mode = false;
-            cfg.no_api  = true;
+            cfg.no_api   = true;
+        } else if (!strcmp(argv[i], "--mcp")) {
+            cfg.mcp_mode = true;
+            cfg.gui_mode = false;
+            cfg.no_api   = true;
         } else if (!strcmp(argv[i], "--project") && i + 1 < argc) {
             strncpy(cfg.project_path, argv[++i], sizeof(cfg.project_path) - 1);
         } else if (!strcmp(argv[i], "--api-port") && i + 1 < argc) {
@@ -41,7 +45,8 @@ CtxAppConfig ctx_app_parse_args(int argc, char **argv)
 #endif
 
     CTX_LOG_INFO("Project path : %s", cfg.project_path);
-    CTX_LOG_INFO("GUI mode     : %s", cfg.gui_mode ? "yes" : "no");
+    CTX_LOG_INFO("GUI mode     : %s", cfg.gui_mode  ? "yes" : "no");
+    CTX_LOG_INFO("MCP mode     : %s", cfg.mcp_mode  ? "yes" : "no");
     CTX_LOG_INFO("API enabled  : %s (port %d)", cfg.no_api ? "no" : "yes", cfg.api_port);
     return cfg;
 }

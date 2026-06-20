@@ -59,6 +59,8 @@ add_ts_grammar(ts_grammar_python   vendors/tree-sitter-python)
 add_ts_grammar(ts_grammar_js       vendors/tree-sitter-javascript)
 add_ts_grammar(ts_grammar_ts       vendors/tree-sitter-typescript/typescript)
 add_ts_grammar(ts_grammar_tsx      vendors/tree-sitter-typescript/tsx)
+add_ts_grammar(ts_grammar_go       vendors/tree-sitter-go)
+add_ts_grammar(ts_grammar_rust     vendors/tree-sitter-rust)
 
 # --------------------------------------------------------------------------
 # SQLite
@@ -167,6 +169,8 @@ target_link_libraries(ctx PRIVATE
     ts_grammar_js
     ts_grammar_ts
     ts_grammar_tsx
+    ts_grammar_go
+    ts_grammar_rust
     ctx_sqlite
     cjson
     uthash

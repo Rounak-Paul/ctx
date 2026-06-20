@@ -7,8 +7,8 @@
 /* tunables                                                                  */
 /* ======================================================================== */
 #define CTX_MAX_QUERY_TERMS    24
-#define CTX_MAX_SEEDS          64    /* top text-scored entry points          */
-#define CTX_MAX_TRAVERSAL      96    /* max symbols collected via graph walk  */
+#define CTX_MAX_SEEDS          128   /* top text-scored entry points          */
+#define CTX_MAX_TRAVERSAL      128   /* max symbols collected via graph walk  */
 #define CTX_TRAVERSAL_DEPTH    4     /* BFS hop limit in each direction       */
 #define CTX_MODULE_SIBLINGS    8     /* max co-file symbols pulled per seed   */
 #define CTX_DIR_PEERS          8     /* max peer-file names pulled per module */
@@ -476,6 +476,14 @@ static uint32_t symbol_tokens(const CtxSymbol *s, char out[][64], uint32_t max) 
     /* scope (enclosing class/ns) */
     if (s->scope[0]) emit_tok(s->scope, strlen(s->scope));
 
+    /* return type / leading keyword from signature — reveals visibility and type */
+    if (s->signature[0]) {
+        const char *sig = s->signature;
+        uint32_t wl = 0;
+        while (sig[wl] && !isspace((unsigned char)sig[wl]) && sig[wl] != '(' && wl < 32) wl++;
+        if (wl >= 2 && wl < 32) emit_tok(sig, wl);
+    }
+
     #undef emit_tok
     return n;
 }
@@ -500,8 +508,8 @@ static InvIndex *inv_build(CtxGraph *g, AdjList *al) {
         uint32_t ntoks = symbol_tokens(s, toks, 32);
         /* degree from adjacency list — hub bonus */
         AdjEntry *ae = al ? adj_get(al, s->id) : NULL;
-        double hub = ae ? (double)ae->degree * 0.08 : 0.0;
-        if (hub > 6.0) hub = 6.0;
+        double hub = ae ? (double)ae->degree * 0.15 : 0.0;
+        if (hub > 12.0) hub = 12.0;
 
         for (uint32_t t = 0; t < ntoks; t++) {
             uint32_t h = inv_hash(toks[t]);

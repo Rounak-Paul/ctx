@@ -1,6 +1,14 @@
 #include "parser.h"
 #include "../log/log.h"
 
+extern const TSLanguage *tree_sitter_c(void);
+extern const TSLanguage *tree_sitter_cpp(void);
+extern const TSLanguage *tree_sitter_python(void);
+extern const TSLanguage *tree_sitter_javascript(void);
+extern const TSLanguage *tree_sitter_typescript(void);
+extern const TSLanguage *tree_sitter_go(void);
+extern const TSLanguage *tree_sitter_rust(void);
+
 static TSParser *s_parsers[CTX_LANG_UNKNOWN];
 
 static uint32_t count_error_nodes(TSNode node) {
@@ -20,6 +28,8 @@ bool ctx_parser_init(void) {
         tree_sitter_python(),
         tree_sitter_javascript(),
         tree_sitter_typescript(),
+        tree_sitter_go(),
+        tree_sitter_rust(),
     };
     for (int i = 0; i < CTX_LANG_UNKNOWN; i++) {
         s_parsers[i] = ts_parser_new();
@@ -29,7 +39,7 @@ bool ctx_parser_init(void) {
             return false;
         }
     }
-    CTX_LOG_DEBUG("Parser system initialised (5 languages)");
+    CTX_LOG_DEBUG("Parser system initialised (7 languages)");
     return true;
 }
 
@@ -50,6 +60,8 @@ CtxLanguage ctx_lang_from_path(const char *path) {
     if (!strcmp(dot, "py")) return CTX_LANG_PYTHON;
     if (!strcmp(dot, "js") || !strcmp(dot, "mjs") || !strcmp(dot, "jsx")) return CTX_LANG_JS;
     if (!strcmp(dot, "ts") || !strcmp(dot, "tsx")) return CTX_LANG_TS;
+    if (!strcmp(dot, "go")) return CTX_LANG_GO;
+    if (!strcmp(dot, "rs")) return CTX_LANG_RUST;
     return CTX_LANG_UNKNOWN;
 }
 

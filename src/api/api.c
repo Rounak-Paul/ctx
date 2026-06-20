@@ -32,7 +32,14 @@ static void send_response(int fd, int status, const char *content_type, const ch
         status == 200 ? "OK" : status == 404 ? "Not Found" : "Bad Request",
         content_type, body_len);
     send(fd, header, (size_t)hlen, MSG_NOSIGNAL);
-    if (body && body_len > 0) send(fd, body, body_len, MSG_NOSIGNAL);
+    if (body && body_len > 0) {
+        size_t sent = 0;
+        while (sent < body_len) {
+            ssize_t n = send(fd, body + sent, body_len - sent, MSG_NOSIGNAL);
+            if (n <= 0) break;
+            sent += (size_t)n;
+        }
+    }
 }
 
 static void send_json(int fd, int status, const char *json) {

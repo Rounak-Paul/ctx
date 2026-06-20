@@ -20,6 +20,7 @@ typedef struct {
     bool  gui_mode;         /* true → start causality window */
     bool  no_api;           /* true → don't start HTTP API server */
     bool  bench;            /* true → run retrieval benchmark, then exit */
+    bool  mcp_mode;         /* true → run MCP server on stdio, no API, no GUI */
     int   api_port;         /* default 8765 */
     char  project_path[4096]; /* path to index; "" → cwd */
     int   argc;

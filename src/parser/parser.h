@@ -7,6 +7,8 @@ typedef enum {
     CTX_LANG_PYTHON,
     CTX_LANG_JS,
     CTX_LANG_TS,
+    CTX_LANG_GO,
+    CTX_LANG_RUST,
     CTX_LANG_UNKNOWN
 } CtxLanguage;
 

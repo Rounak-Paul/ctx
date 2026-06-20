@@ -94,7 +94,8 @@ static bool is_identifier_type(const char *type) {
                     !strcmp(type, "property_identifier") ||
                     !strcmp(type, "dotted_name") ||
                     !strcmp(type, "qualified_identifier") ||
-                    !strcmp(type, "scoped_identifier"));
+                    !strcmp(type, "scoped_identifier") ||
+                    !strcmp(type, "package_identifier")); /* Go package-qualified names */
 }
 
 static bool is_inheritance_container(const char *type) {
@@ -228,6 +229,7 @@ static bool is_variable_decl(const char *ntype) {
 
 /* ---- symbol kind from node type string ---- */
 static CtxSymbolKind sym_kind_for(const char *ntype) {
+    /* C / C++ / Python / JS / TS */
     if (!strcmp(ntype, "function_definition") || !strcmp(ntype, "function_declaration"))
         return CTX_SYM_FUNCTION;
     if (!strcmp(ntype, "method_definition") || !strcmp(ntype, "method_declaration"))
@@ -245,6 +247,23 @@ static CtxSymbolKind sym_kind_for(const char *ntype) {
         !strcmp(ntype, "import_from_statement"))
         return CTX_SYM_INCLUDE;
     if (!strcmp(ntype, "namespace_definition")) return CTX_SYM_NAMESPACE;
+    /* Go */
+    if (!strcmp(ntype, "function_declaration")) return CTX_SYM_FUNCTION; /* already above */
+    if (!strcmp(ntype, "method_declaration"))   return CTX_SYM_METHOD;   /* already above */
+    if (!strcmp(ntype, "import_declaration"))   return CTX_SYM_INCLUDE;
+    if (!strcmp(ntype, "const_declaration") || !strcmp(ntype, "var_declaration"))
+        return CTX_SYM_VARIABLE;
+    /* Go type_declaration wraps struct_type / interface_type — handled in process_node */
+    if (!strcmp(ntype, "type_declaration"))     return CTX_SYM_TYPEDEF;
+    /* Rust */
+    if (!strcmp(ntype, "function_item"))        return CTX_SYM_FUNCTION;
+    if (!strcmp(ntype, "struct_item"))          return CTX_SYM_STRUCT;
+    if (!strcmp(ntype, "enum_item"))            return CTX_SYM_ENUM;
+    if (!strcmp(ntype, "trait_item"))           return CTX_SYM_CLASS;
+    if (!strcmp(ntype, "type_item"))            return CTX_SYM_TYPEDEF;
+    if (!strcmp(ntype, "macro_definition"))     return CTX_SYM_MACRO;
+    if (!strcmp(ntype, "use_declaration"))      return CTX_SYM_INCLUDE;
+    if (!strcmp(ntype, "impl_item"))            return CTX_SYM_NAMESPACE; /* scope container */
     return CTX_SYM_UNKNOWN;
 }
 
@@ -351,6 +370,7 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
             node_text(ctx->source, name_node, namebuf, sizeof(namebuf));
             /* signature = trim source of function node up to body */
             TSNode body = find_child(node, "compound_statement");
+            if (ts_node_is_null(body)) body = find_child(node, "block");
             if (!ts_node_is_null(body)) {
                 uint32_t sig_end = ts_node_start_byte(body);
                 uint32_t sig_start = ts_node_start_byte(node);
@@ -362,12 +382,38 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
             }
             emit_sym = (namebuf[0] != '\0');
         }
-        /* Python / JS: name field is directly "name" */
+        /* Python / JS / Go / Rust: name field is directly "name" or "identifier" */
         if (!emit_sym) {
             TSNode name_node2 = find_child(node, "name");
             if (ts_node_is_null(name_node2)) name_node2 = find_child(node, "identifier");
             if (!ts_node_is_null(name_node2)) {
                 node_text(ctx->source, name_node2, namebuf, sizeof(namebuf));
+                /* Go method receiver → scope */
+                if (!strcmp(ntype, "method_declaration")) {
+                    TSNode recv = find_child(node, "parameter_list");
+                    if (!ts_node_is_null(recv)) {
+                        TSNode rtype = find_child(recv, "type_identifier");
+                        if (ts_node_is_null(rtype)) rtype = find_child(recv, "pointer_type");
+                        if (!ts_node_is_null(rtype)) {
+                            char recvbuf[128] = {0};
+                            symbol_name_from_node(ctx->source, rtype, recvbuf, sizeof(recvbuf));
+                            if (recvbuf[0]) strncpy(sigbuf, recvbuf, sizeof(sigbuf) - 1);
+                        }
+                    }
+                }
+                /* Rust function_item: grab signature up to body block */
+                if (!strcmp(ntype, "function_item")) {
+                    TSNode body = find_child(node, "block");
+                    if (!ts_node_is_null(body)) {
+                        uint32_t sig_end = ts_node_start_byte(body);
+                        uint32_t sig_start = ts_node_start_byte(node);
+                        uint32_t sig_len = sig_end - sig_start;
+                        if (sig_len >= sizeof(sigbuf)) sig_len = (uint32_t)(sizeof(sigbuf) - 1);
+                        memcpy(sigbuf, ctx->source + sig_start, sig_len);
+                        sigbuf[sig_len] = '\0';
+                        for (size_t i = 0; sigbuf[i]; i++) if (sigbuf[i]=='\n'||sigbuf[i]=='\t') sigbuf[i]=' ';
+                    }
+                }
                 emit_sym = (namebuf[0] != '\0');
             }
         }
@@ -378,6 +424,53 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
         if (!ts_node_is_null(name_node)) {
             node_text(ctx->source, name_node, namebuf, sizeof(namebuf));
             emit_sym = (namebuf[0] != '\0');
+        }
+    } else if (kind == CTX_SYM_TYPEDEF) {
+        /* Go type_declaration: contains a type_spec with the real name and underlying type */
+        if (!strcmp(ntype, "type_declaration")) {
+            TSNode spec = find_child(node, "type_spec");
+            if (!ts_node_is_null(spec)) {
+                TSNode name_node = find_child(spec, "type_identifier");
+                if (ts_node_is_null(name_node)) name_node = find_child(spec, "identifier");
+                if (!ts_node_is_null(name_node)) {
+                    node_text(ctx->source, name_node, namebuf, sizeof(namebuf));
+                    /* Detect if underlying type is struct or interface → upgrade kind */
+                    TSNode underlying = find_child(spec, "struct_type");
+                    if (!ts_node_is_null(underlying)) kind = CTX_SYM_STRUCT;
+                    else {
+                        underlying = find_child(spec, "interface_type");
+                        if (!ts_node_is_null(underlying)) kind = CTX_SYM_CLASS;
+                    }
+                    emit_sym = (namebuf[0] != '\0');
+                }
+            }
+        } else {
+            /* Rust type_item */
+            TSNode name_node = find_child(node, "type_identifier");
+            if (ts_node_is_null(name_node)) name_node = find_child(node, "identifier");
+            if (!ts_node_is_null(name_node)) {
+                node_text(ctx->source, name_node, namebuf, sizeof(namebuf));
+                emit_sym = (namebuf[0] != '\0');
+            }
+        }
+    } else if (kind == CTX_SYM_NAMESPACE) {
+        /* Rust impl_item: "impl Foo" or "impl Trait for Foo" — use the type name as scope */
+        TSNode type_node = find_child(node, "type_identifier");
+        if (ts_node_is_null(type_node)) type_node = find_child(node, "generic_type");
+        if (!ts_node_is_null(type_node)) {
+            symbol_name_from_node(ctx->source, type_node, namebuf, sizeof(namebuf));
+            emit_sym = (namebuf[0] != '\0');
+        }
+    } else if (kind == CTX_SYM_VARIABLE) {
+        /* Go const_declaration / var_declaration */
+        TSNode spec = find_child(node, "const_spec");
+        if (ts_node_is_null(spec)) spec = find_child(node, "var_spec");
+        if (!ts_node_is_null(spec)) {
+            TSNode name_node = find_child(spec, "identifier");
+            if (!ts_node_is_null(name_node)) {
+                node_text(ctx->source, name_node, namebuf, sizeof(namebuf));
+                emit_sym = (namebuf[0] != '\0' && !is_noise_identifier(namebuf));
+            }
         }
     } else if (kind == CTX_SYM_MACRO) {
         TSNode name_node = find_child(node, "identifier");
@@ -445,7 +538,17 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
         sym.is_definition = (!strcmp(ntype, "function_definition") ||
                              !strcmp(ntype, "class_definition")    ||
                              !strcmp(ntype, "struct_specifier")    ||
-                             !strcmp(ntype, "enum_specifier"));
+                             !strcmp(ntype, "enum_specifier")      ||
+                             /* Go */
+                             !strcmp(ntype, "function_declaration") ||
+                             !strcmp(ntype, "method_declaration")   ||
+                             !strcmp(ntype, "type_declaration")     ||
+                             /* Rust */
+                             !strcmp(ntype, "function_item")        ||
+                             !strcmp(ntype, "struct_item")          ||
+                             !strcmp(ntype, "enum_item")            ||
+                             !strcmp(ntype, "trait_item")           ||
+                             !strcmp(ntype, "impl_item"));
         ctx_graph_add_symbol(ctx->graph, &sym);
         if (kind == CTX_SYM_CLASS || kind == CTX_SYM_STRUCT) {
             emit_inheritance_edges(ctx->graph, ctx->source, ctx->filepath,
@@ -468,7 +571,11 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
      * scope tagging. Both use the same save/restore mechanism in walk_tree. */
     bool entered_fn = (kind == CTX_SYM_FUNCTION || kind == CTX_SYM_METHOD) && namebuf[0];
     bool entered_scope = (kind == CTX_SYM_CLASS || kind == CTX_SYM_STRUCT ||
-                          kind == CTX_SYM_NAMESPACE) && namebuf[0];
+                          kind == CTX_SYM_NAMESPACE ||
+                          /* Rust impl_item and Go type_declaration act as scope containers */
+                          (!strcmp(ntype, "impl_item") && namebuf[0]) ||
+                          (!strcmp(ntype, "type_declaration") &&
+                           (kind == CTX_SYM_STRUCT || kind == CTX_SYM_CLASS))) && namebuf[0];
     if (entered_fn || entered_scope) {
         strncpy(pushed_name, namebuf, 255);
         pushed_name[255] = '\0';

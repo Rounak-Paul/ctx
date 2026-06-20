@@ -35,15 +35,25 @@ Complete rewrite — no budget, no truncation, no format switching.
 1. Tokenize query: stopword-filtered, light stemming (-ing/-ed/-s). Symbol/file
    anchors also split on `_`/`/` so `qs_renderer_create` → `qs renderer create`
    + full name as extra term.
-2. Score every symbol: exact name=40, substr=18, filename=10, sig=5, scope=4,
-   coverage ×8, kind importance, definition +6, vendor ×0.3. Top 128 seeds.
-3. BFS traversal from each seed, both directions, all edge kinds, depth 6.
-   Up to 512 total symbols. Cross-vendor reference edges suppressed.
-4. File sibling pull: top-8 seeds → all co-file definition symbols added
-   (structural locality signal).
-5. Sort by score, emit grouped by module directory → file → symbol.
-   Per-file: peer filenames in same directory. Per-symbol: kind, name, file:line,
-   scope, signature, full edge inventory (calls/called-by/refs/ref'd-by/inherits).
+2. Build per-query indexes (all O(n) single-pass, under read lock):
+   - **Adjacency list** (`AdjList`): keyed by symbol id, makes BFS O(degree) per
+     hop instead of O(all_edges). Built from `g->edges` in one HASH_ITER pass.
+   - **Inverted token index** (`InvIndex`): maps lowercase tokens → matching symbols
+     with pre-scored contributions. Tokens come from: name (camelCase + `_` split),
+     full lowercased name, filename stem, scope, and leading return-type word from
+     signature. Makes scoring O(matching_symbols × terms) not O(all_symbols).
+   - **File index** (`FileIndex`): hash-bucketed per-file symbol lists for O(1)
+     sibling/peer lookups.
+3. Score via inverted index: top 128 seeds selected. Hub bonus: degree × 0.15,
+   capped at 12.0 — ensures high-connectivity architectural symbols rank higher.
+   Coverage bonus: symbols matching more query terms get +8 per term hit.
+4. Prefix matching: terms ≥4 chars also match index tokens that start with the
+   term (e.g. "rend" → "render") at 0.5× score — fuzzy without false positives.
+5. BFS traversal via adjacency list from each seed, depth 4, up to 128 symbols.
+   Incoming reference edges suppressed (high-volume noise). Cross-vendor refs
+   suppressed. Score decays 10 points per hop.
+6. File sibling pull + include-chain pull for top-8 seeds (structural locality).
+7. Sort by score, emit grouped by module directory → file → symbol.
 
 **API:** `/context?task=`, `/context/symbol?name=`, `/context/file?path=`.
 No budget or format params. Output: plain structured text, always complete.
@@ -94,9 +104,11 @@ Key format rules:
 - Modules ordered by relevance (first appearance in score-sorted list).
 
 ## Retrieval engine — scoring
-- `score_symbol()`: exact=40, substr=18, filename=10, dir path match=6,
-  sig=5, scope=4, coverage×8, kind importance, definition+6, scope depth+2, vendor×0.3.
-- After BFS + file siblings, also runs `collect_include_chain()` for top-8 seeds.
+- Inverted index pre-scores: exact name match=40, prefix name=22, filename=10, else=8.
+  Plus: `kind_importance()`, definition+6, hub bonus (degree×0.15, cap 12.0), vendor×0.3.
+- Coverage bonus: +8 per query term that the symbol matched across all index hits.
+- `score_symbol()` still used for FILE/SYMBOL anchor queries (rare, fast enough).
+- Tunables: seeds=128, traversal=128, depth=4, min_score=6.0, siblings=8, peers=8.
 
 ## Store (`store/store.h`, `store/store.c`)
 - Added `CtxFileRecord` struct: path, lang, mtime, size, error_count, sym_count.
