@@ -16,6 +16,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 # --------------------------------------------------------------------------
 if(APPLE)
     add_compile_definitions(CTX_PLATFORM_MACOS)
+    enable_language(OBJC)
 elseif(WIN32)
     add_compile_definitions(CTX_PLATFORM_WINDOWS NOMINMAX WIN32_LEAN_AND_MEAN)
 elseif(UNIX)
