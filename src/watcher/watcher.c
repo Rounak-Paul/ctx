@@ -655,3 +655,32 @@ void ctx_watcher_remove(CtxWatchHandle handle)
 #else
 #   error "Unsupported platform — define CTX_PLATFORM_LINUX, CTX_PLATFORM_MACOS, or CTX_PLATFORM_WINDOWS"
 #endif
+
+bool ctx_watcher_is_running(void)
+{
+    return s_watcher.running;
+}
+
+uint32_t ctx_watcher_active_count(void)
+{
+    if (!s_watcher.running) return 0;
+
+#if defined(CTX_PLATFORM_WINDOWS)
+    EnterCriticalSection(&s_watcher.lock);
+#else
+    pthread_mutex_lock(&s_watcher.lock);
+#endif
+
+    uint32_t active = 0;
+    for (uint32_t i = 0; i < s_watcher.count; ++i)
+        if (s_watcher.entries[i].active)
+            active++;
+
+#if defined(CTX_PLATFORM_WINDOWS)
+    LeaveCriticalSection(&s_watcher.lock);
+#else
+    pthread_mutex_unlock(&s_watcher.lock);
+#endif
+
+    return active;
+}

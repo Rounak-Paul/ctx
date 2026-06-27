@@ -65,3 +65,22 @@ Platform watcher notes:
 - Linux inotify keeps one entry per watch descriptor, so nested file events use
   the correct directory path and new directories get watches dynamically.
 - `POST /reindex` submits a background job; it should not block the API thread.
+
+API/MCP readiness contract:
+- `/health` and `/status` expose `ready`, `cache_loaded`, `indexing`,
+  `progress_done`, `progress_total`, `graph_generation`,
+  `last_update_unix_ms`, `watcher_running`, and `watch_count`.
+- `/stats` and MCP `get_stats` include the same freshness fields plus graph
+  counts. MCP also exposes `get_status` for a smaller readiness-only payload.
+- `ready` means the initial index pass has completed and no index mutation is
+  currently running. `cache_loaded` can be true while `ready` is still false.
+- `graph_generation` increments whenever the live graph publishes an update,
+  including no-op initial checks, full reindexes, incremental changes, and
+  deletions.
+
+Regression coverage:
+- `tests/live_update_smoke.sh` is registered as CTest on Unix platforms.
+- It starts a real `ctx` API server on a temporary project, waits for readiness,
+  validates watcher/status fields, adds a symbol, confirms it is retrievable
+  without restart, removes it, and confirms stale symbol text is no longer
+  returned.

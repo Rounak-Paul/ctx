@@ -1,6 +1,7 @@
 #include "mcp.h"
 #include "../retrieve/retrieve.h"
 #include "../indexer/indexer.h"
+#include "../watcher/watcher.h"
 #include "../stats/stats.h"
 #include "../log/log.h"
 #include "../../vendors/cjson/cJSON.h"
@@ -124,7 +125,20 @@ static cJSON *build_tools_array(void) {
         cJSON *t = cJSON_CreateObject();
         cJSON_AddStringToObject(t, "name", "get_stats");
         cJSON_AddStringToObject(t, "description",
-            "Get indexing statistics — symbol count, edge count, file count.");
+            "Get indexing statistics, freshness state, and watcher readiness.");
+        cJSON *schema = cJSON_CreateObject();
+        cJSON_AddStringToObject(schema, "type", "object");
+        cJSON_AddItemToObject(schema, "properties", cJSON_CreateObject());
+        cJSON_AddItemToObject(t, "inputSchema", schema);
+        cJSON_AddItemToArray(tools, t);
+    }
+
+    /* get_status */
+    {
+        cJSON *t = cJSON_CreateObject();
+        cJSON_AddStringToObject(t, "name", "get_status");
+        cJSON_AddStringToObject(t, "description",
+            "Get readiness, indexing progress, graph generation, and file watcher status.");
         cJSON *schema = cJSON_CreateObject();
         cJSON_AddStringToObject(schema, "type", "object");
         cJSON_AddItemToObject(schema, "properties", cJSON_CreateObject());
@@ -178,6 +192,48 @@ static cJSON *retrieve_to_content(CtxQueryKind kind, const char *text) {
     return content;
 }
 
+static char *build_status_text(bool include_counts) {
+    CtxIndexStatus is = {0};
+    CtxGraphStats gs = {0};
+    ctx_indexer_get_status(&is);
+    ctx_indexer_get_stats(&gs);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "status",
+        is.ready ? "ready" : is.progress.running ? "indexing" : "starting");
+    cJSON_AddBoolToObject(root, "ready", is.ready);
+    cJSON_AddBoolToObject(root, "cache_loaded", is.cache_loaded);
+    cJSON_AddBoolToObject(root, "indexing", is.progress.running);
+    cJSON_AddNumberToObject(root, "progress_done", (double)is.progress.done);
+    cJSON_AddNumberToObject(root, "progress_total", (double)is.progress.total);
+    cJSON_AddNumberToObject(root, "graph_generation", (double)is.graph_generation);
+    cJSON_AddNumberToObject(root, "last_update_unix_ms", (double)is.last_update_unix_ms);
+    cJSON_AddBoolToObject(root, "watcher_running", ctx_watcher_is_running());
+    cJSON_AddNumberToObject(root, "watch_count", (double)ctx_watcher_active_count());
+
+    if (include_counts) {
+        cJSON_AddNumberToObject(root, "files", (double)gs.files);
+        cJSON_AddNumberToObject(root, "symbols", (double)gs.symbols);
+        cJSON_AddNumberToObject(root, "edges", (double)gs.edges);
+        cJSON_AddNumberToObject(root, "errors", (double)gs.errors);
+        cJSON_AddNumberToObject(root, "last_index_ms", (double)gs.duration_ms);
+    }
+
+    char *text = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return text;
+}
+
+static cJSON *text_to_content(char *text) {
+    cJSON *content = cJSON_CreateArray();
+    cJSON *item = cJSON_CreateObject();
+    cJSON_AddStringToObject(item, "type", "text");
+    cJSON_AddStringToObject(item, "text", text ? text : "");
+    free(text);
+    cJSON_AddItemToArray(content, item);
+    return content;
+}
+
 static void handle_tools_call(cJSON *id, cJSON *params) {
     if (!params) { send_error(id, JSONRPC_INVALID_PARAMS, "missing params"); return; }
 
@@ -207,22 +263,10 @@ static void handle_tools_call(cJSON *id, cJSON *params) {
         content = retrieve_to_content(CTX_QUERY_FILE, path->valuestring);
 
     } else if (!strcmp(tool, "get_stats")) {
-        CtxGraphStats gs = {0};
-        ctx_indexer_get_stats(&gs);
-        CtxGraph *g = ctx_indexer_get_graph();
-        char stats_json[256];
-        snprintf(stats_json, sizeof(stats_json),
-            "{\"files\":%u,\"symbols\":%u,\"edges\":%u,\"errors\":%u,\"last_index_ms\":%" PRId64 "}",
-            gs.files,
-            g ? ctx_graph_symbol_count(g) : 0,
-            g ? ctx_graph_edge_count(g)   : 0,
-            gs.errors,
-            gs.duration_ms);
-        content = cJSON_CreateArray();
-        cJSON *item = cJSON_CreateObject();
-        cJSON_AddStringToObject(item, "type", "text");
-        cJSON_AddStringToObject(item, "text", stats_json);
-        cJSON_AddItemToArray(content, item);
+        content = text_to_content(build_status_text(true));
+
+    } else if (!strcmp(tool, "get_status")) {
+        content = text_to_content(build_status_text(false));
 
     } else {
         send_error(id, JSONRPC_METHOD_NOT_FOUND, "unknown tool");

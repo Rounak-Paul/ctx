@@ -1,6 +1,7 @@
 #include "api.h"
 #include "../retrieve/retrieve.h"
 #include "../indexer/indexer.h"
+#include "../watcher/watcher.h"
 #include "../stats/stats.h"
 #include "../log/log.h"
 #include "../jobs/jobs.h"
@@ -19,6 +20,16 @@ static int s_server_fd = -1;
 /* ---- minimal HTTP/1.1 helpers ---- */
 static CtxGraph *get_graph(void) { return ctx_indexer_get_graph(); }
 
+static const char *status_text(int status) {
+    switch (status) {
+    case 200: return "OK";
+    case 400: return "Bad Request";
+    case 404: return "Not Found";
+    case 503: return "Service Unavailable";
+    default:  return "Error";
+    }
+}
+
 static void send_response(int fd, int status, const char *content_type, const char *body) {
     size_t body_len = body ? strlen(body) : 0;
     char header[512];
@@ -30,7 +41,7 @@ static void send_response(int fd, int status, const char *content_type, const ch
         "Access-Control-Allow-Origin: *\r\n"
         "\r\n",
         status,
-        status == 200 ? "OK" : status == 404 ? "Not Found" : "Bad Request",
+        status_text(status),
         content_type, body_len);
     send(fd, header, (size_t)hlen, MSG_NOSIGNAL);
     if (body && body_len > 0) {
@@ -117,20 +128,66 @@ static char *get_param(const char *query, const char *key) {
 }
 
 /* ---- route handlers ---- */
+static void build_status_json(char *json, size_t json_size, bool include_counts) {
+    CtxIndexStatus is = {0};
+    CtxGraphStats gs = {0};
+    ctx_indexer_get_status(&is);
+    ctx_indexer_get_stats(&gs);
+
+    uint32_t watchers = ctx_watcher_active_count();
+    const char *state = is.ready ? "ready" : is.progress.running ? "indexing" : "starting";
+
+    if (include_counts) {
+        snprintf(json, json_size,
+            "{\"status\":\"%s\",\"ready\":%s,\"cache_loaded\":%s,"
+            "\"indexing\":%s,\"progress_done\":%u,\"progress_total\":%u,"
+            "\"graph_generation\":%"PRIu64",\"last_update_unix_ms\":%"PRId64","
+            "\"watcher_running\":%s,\"watch_count\":%u,"
+            "\"files\":%u,\"symbols\":%u,\"edges\":%u,\"errors\":%u,"
+            "\"last_index_ms\":%"PRId64"}",
+            state,
+            is.ready ? "true" : "false",
+            is.cache_loaded ? "true" : "false",
+            is.progress.running ? "true" : "false",
+            is.progress.done,
+            is.progress.total,
+            is.graph_generation,
+            is.last_update_unix_ms,
+            ctx_watcher_is_running() ? "true" : "false",
+            watchers,
+            gs.files,
+            gs.symbols,
+            gs.edges,
+            gs.errors,
+            gs.duration_ms);
+    } else {
+        snprintf(json, json_size,
+            "{\"status\":\"%s\",\"ready\":%s,\"cache_loaded\":%s,"
+            "\"indexing\":%s,\"progress_done\":%u,\"progress_total\":%u,"
+            "\"graph_generation\":%"PRIu64",\"last_update_unix_ms\":%"PRId64","
+            "\"watcher_running\":%s,\"watch_count\":%u}",
+            state,
+            is.ready ? "true" : "false",
+            is.cache_loaded ? "true" : "false",
+            is.progress.running ? "true" : "false",
+            is.progress.done,
+            is.progress.total,
+            is.graph_generation,
+            is.last_update_unix_ms,
+            ctx_watcher_is_running() ? "true" : "false",
+            watchers);
+    }
+}
+
 static void handle_health(int fd) {
-    send_json(fd, 200, "{\"status\":\"ok\"}");
+    char json[768];
+    build_status_json(json, sizeof(json), false);
+    send_json(fd, 200, json);
 }
 
 static void handle_stats(int fd) {
-    CtxGraph *g = get_graph();
-    CtxGraphStats gs = {0};
-    ctx_indexer_get_stats(&gs);
-    char json[512];
-    uint32_t syms = g ? ctx_graph_symbol_count(g) : 0;
-    uint32_t edgs = g ? ctx_graph_edge_count(g) : 0;
-    snprintf(json, sizeof(json),
-        "{\"files\":%u,\"symbols\":%u,\"edges\":%u,\"errors\":%u,\"last_index_ms\":%"PRId64"}",
-        gs.files, syms, edgs, gs.errors, gs.duration_ms);
+    char json[1024];
+    build_status_json(json, sizeof(json), true);
     send_json(fd, 200, json);
     ctx_stats_record_query("/stats", 0);
 }
@@ -187,6 +244,7 @@ static void handle_request(int fd) {
     else if (!strcmp(req.path, "/context/symbol")) handle_context(fd, req.query, "symbol");
     else if (!strcmp(req.path, "/context/file"))   handle_context(fd, req.query, "file");
     else if (!strcmp(req.path, "/stats"))          handle_stats(fd);
+    else if (!strcmp(req.path, "/status"))         handle_health(fd);
     else if (!strcmp(req.path, "/reindex") && !strcmp(req.method, "POST")) handle_reindex(fd);
     else send_json(fd, 404, "{\"error\":\"not found\"}");
 

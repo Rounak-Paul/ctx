@@ -42,6 +42,12 @@ typedef struct {
 bool ctx_watcher_init(void);
 void ctx_watcher_shutdown(void);
 
+/* Returns true while the platform watcher thread is running. */
+bool ctx_watcher_is_running(void);
+
+/* Returns the number of active platform watch entries. */
+uint32_t ctx_watcher_active_count(void);
+
 /* --------------------------------------------------------------------------
  * Watch / unwatch
  * -------------------------------------------------------------------------- */

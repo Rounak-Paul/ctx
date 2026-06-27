@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(ctx C)
+enable_testing()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -256,4 +257,11 @@ if(MSVC)
     target_compile_options(ctx PRIVATE /W4 /WX /wd4996)
 else()
     target_compile_options(ctx PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+
+if(UNIX)
+    add_test(
+        NAME live_update_smoke
+        COMMAND /bin/sh ${CMAKE_SOURCE_DIR}/tests/live_update_smoke.sh $<TARGET_FILE:ctx>
+    )
 endif()

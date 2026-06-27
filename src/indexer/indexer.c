@@ -14,17 +14,24 @@
 static CtxGraph     *s_graph    = NULL;
 static char          s_root[4096] = {0};
 static CtxGraphStats s_stats    = {0};
+static CtxIndexStatus s_status  = {0};
 
 #define CTX_SEMANTIC_INDEX_VERSION "4"
 
 #if defined(CTX_PLATFORM_WINDOWS)
 static CRITICAL_SECTION s_index_lock;
+static CRITICAL_SECTION s_status_lock;
 static void index_lock(void) { EnterCriticalSection(&s_index_lock); }
 static void index_unlock(void) { LeaveCriticalSection(&s_index_lock); }
+static void status_lock(void) { EnterCriticalSection(&s_status_lock); }
+static void status_unlock(void) { LeaveCriticalSection(&s_status_lock); }
 #else
 static pthread_mutex_t s_index_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t s_status_lock = PTHREAD_MUTEX_INITIALIZER;
 static void index_lock(void) { pthread_mutex_lock(&s_index_lock); }
 static void index_unlock(void) { pthread_mutex_unlock(&s_index_lock); }
+static void status_lock(void) { pthread_mutex_lock(&s_status_lock); }
+static void status_unlock(void) { pthread_mutex_unlock(&s_status_lock); }
 #endif
 
 /* Progress — written by indexer thread, read by UI/CLI */
@@ -52,6 +59,23 @@ static int64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int64_t unix_ms(void) {
+    return (int64_t)time(NULL) * 1000;
+}
+
+static void status_set_progress(uint32_t total, uint32_t done, bool running) {
+    s_prog_total = total;
+    s_prog_done = done;
+    s_prog_running = running;
+
+    status_lock();
+    s_status.progress.total = total;
+    s_status.progress.done = done;
+    s_status.progress.running = running;
+    s_status.ready = !running;
+    status_unlock();
 }
 
 typedef struct FileList { char **paths; uint32_t count; uint32_t cap; } FileList;
@@ -101,6 +125,12 @@ static void emit_graph_updated(void) {
     CtxGraphStats gs = {0};
     gs.symbols = ctx_graph_symbol_count(s_graph);
     gs.edges   = ctx_graph_edge_count(s_graph);
+    status_lock();
+    s_status.graph_generation++;
+    s_status.last_update_unix_ms = unix_ms();
+    s_status.cache_loaded = s_graph != NULL;
+    s_status.ready = !s_status.progress.running;
+    status_unlock();
     ctx_event_emit(CTX_EVENT_GRAPH_UPDATED, &gs, sizeof(gs));
 }
 
@@ -108,6 +138,7 @@ bool ctx_indexer_init(const char *root_path) {
     if (!root_path) return false;
 #if defined(CTX_PLATFORM_WINDOWS)
     InitializeCriticalSection(&s_index_lock);
+    InitializeCriticalSection(&s_status_lock);
 #endif
     strncpy(s_root, root_path, sizeof(s_root) - 1);
 
@@ -119,6 +150,12 @@ bool ctx_indexer_init(const char *root_path) {
     if (!ctx_store_open(db_path)) return false;
 
     ctx_store_load_graph(s_graph);
+    status_lock();
+    s_status.cache_loaded = true;
+    s_status.ready = false;
+    s_status.graph_generation = ctx_graph_symbol_count(s_graph) || ctx_graph_edge_count(s_graph) ? 1 : 0;
+    s_status.last_update_unix_ms = 0;
+    status_unlock();
     CTX_LOG_INFO("Loaded %u symbols, %u edges from cache",
                  ctx_graph_symbol_count(s_graph), ctx_graph_edge_count(s_graph));
     return true;
@@ -131,6 +168,7 @@ void ctx_indexer_shutdown(void) {
         s_graph = NULL;
     }
 #if defined(CTX_PLATFORM_WINDOWS)
+    DeleteCriticalSection(&s_status_lock);
     DeleteCriticalSection(&s_index_lock);
 #endif
 }
@@ -176,9 +214,7 @@ void ctx_indexer_index_all(void) {
     }
     free(stored_files);
 
-    s_prog_total   = stale.count;
-    s_prog_done    = 0;
-    s_prog_running = (stale.count > 0);
+    status_set_progress(stale.count, 0, true);
 
     if (stale.count == 0) {
         CTX_LOG_INFO("Index up to date: %u files, %u symbols, %u edges",
@@ -189,6 +225,7 @@ void ctx_indexer_index_all(void) {
         s_stats.duration_ms = now_ms() - t0;
         fl_free(&fl);
         fl_free(&stale);
+        status_set_progress(stale.count, 0, false);
         emit_graph_updated();
         index_unlock();
         return;
@@ -213,8 +250,7 @@ void ctx_indexer_index_all(void) {
             errors++;
         }
 
-        /* Atomic-ish increment — single writer, readers just sample */
-        s_prog_done = i + 1;
+        status_set_progress(stale.count, i + 1, true);
     }
 
     ctx_jobs_wait_all();
@@ -246,7 +282,7 @@ void ctx_indexer_index_all(void) {
     ctx_store_increment_stat("errors_encountered",   (int64_t)errors);
     ctx_store_increment_stat("last_index_duration_ms", dur);
 
-    s_prog_running = false;
+    status_set_progress(stale.count, stale.count, false);
 
     fl_free(&fl);
     fl_free(&stale);
@@ -266,11 +302,13 @@ void ctx_indexer_update_file(const char *path) {
 
     index_lock();
     CTX_LOG_DEBUG("Incremental update: %s", path);
+    status_set_progress(1, 0, true);
     ctx_graph_remove_file(s_graph, path);
 
     struct stat st;
     if (stat(path, &st) != 0) {
         ctx_store_remove_file(path);
+        status_set_progress(1, 1, false);
         emit_graph_updated();
         index_unlock();
         return;
@@ -288,6 +326,7 @@ void ctx_indexer_update_file(const char *path) {
     }
     s_stats.symbols = ctx_graph_symbol_count(s_graph);
     s_stats.edges   = ctx_graph_edge_count(s_graph);
+    status_set_progress(1, 1, false);
     emit_graph_updated();
     index_unlock();
 }
@@ -300,7 +339,14 @@ void ctx_indexer_get_stats(CtxGraphStats *out) {
 
 void ctx_indexer_get_progress(CtxIndexProgress *out) {
     if (!out) return;
-    out->total   = s_prog_total;
-    out->done    = s_prog_done;
-    out->running = s_prog_running;
+    status_lock();
+    *out = s_status.progress;
+    status_unlock();
+}
+
+void ctx_indexer_get_status(CtxIndexStatus *out) {
+    if (!out) return;
+    status_lock();
+    *out = s_status;
+    status_unlock();
 }
