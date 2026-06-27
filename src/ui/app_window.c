@@ -8,6 +8,7 @@
 #include "../retrieve/retrieve.h"
 #include "../store/store.h"
 #include "../jobs/jobs.h"
+#include "../parser/parser.h"
 #include "force_graph.h"
 
 #include <ctype.h>
@@ -765,11 +766,13 @@ static const char *edge_name(CtxEdgeKind kind)
 static const char *lang_abbrev(int lang)
 {
     switch (lang) {
-    case 1: return "C";
-    case 2: return "C++";
-    case 3: return "Py";
-    case 4: return "JS";
-    case 5: return "TS";
+    case CTX_LANG_C:      return "C";
+    case CTX_LANG_CPP:    return "C++";
+    case CTX_LANG_PYTHON: return "Py";
+    case CTX_LANG_JS:     return "JS";
+    case CTX_LANG_TS:     return "TS";
+    case CTX_LANG_GO:     return "Go";
+    case CTX_LANG_RUST:   return "Rust";
     default: return "?";
     }
 }

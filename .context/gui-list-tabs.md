@@ -20,6 +20,8 @@ Tabs:
 - `3 Context`: retrieval playground. The query input flexes to fill remaining
   width after the Retrieve button.
 - `4 Files`: indexed files, searchable by path and language.
+- File language display must use `CtxLanguage` enum values from
+  `parser/parser.h`; `CTX_LANG_C` starts at 0. Avoid hard-coded 1-based mappings.
 
 Async UI rules:
 - Context retrieval is submitted to the shared job system and publishes back to

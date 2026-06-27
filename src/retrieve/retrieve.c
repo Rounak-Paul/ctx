@@ -1,6 +1,7 @@
 #include "retrieve.h"
 #include "../store/store.h"
 #include "../log/log.h"
+#include "../parser/parser.h"
 #include <ctype.h>
 
 /* ======================================================================== */
@@ -817,11 +818,13 @@ static uint32_t collect_all_edges(CtxGraph *g, uint64_t sym_id,
 
 static const char *lang_name(int lang) {
     switch (lang) {
-    case 1: return "C";
-    case 2: return "C++";
-    case 3: return "Python";
-    case 4: return "JavaScript";
-    case 5: return "TypeScript";
+    case CTX_LANG_C:      return "C";
+    case CTX_LANG_CPP:    return "C++";
+    case CTX_LANG_PYTHON: return "Python";
+    case CTX_LANG_JS:     return "JavaScript";
+    case CTX_LANG_TS:     return "TypeScript";
+    case CTX_LANG_GO:     return "Go";
+    case CTX_LANG_RUST:   return "Rust";
     default: return "unknown";
     }
 }
