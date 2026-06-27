@@ -45,3 +45,23 @@ The updated Causality vendor adds Apple Objective-C platform sources
 (`src/platform/mouse_state_mac.m`). `ctx` must enable CMake's `OBJC` language on
 Apple before adding the vendor tree; otherwise the static archive step references
 `mouse_state_mac.m.o` without a valid Objective-C compile rule.
+
+## Live Context Freshness
+
+Watcher events must never call indexing synchronously from the watcher thread.
+`main.c` copies `CtxFileEvent` payloads into `FileChangeJob` objects and submits
+them to the job system. Directory-level watcher events request a debounced full
+reindex because macOS kqueue reports directory changes without the child path.
+
+`ctx_indexer_index_all()` and `ctx_indexer_update_file()` are serialized by the
+indexer lock. Full reindex removes stored files that no longer exist in the
+collected project file list, so deleted symbols cannot remain retrievable.
+Incremental updates remove the old graph entries first; if parsing fails, the
+store row is also removed to avoid serving stale content.
+
+Platform watcher notes:
+- macOS kqueue keeps one active descriptor per recursive file/directory path and
+  refreshes child watches on directory write/link events.
+- Linux inotify keeps one entry per watch descriptor, so nested file events use
+  the correct directory path and new directories get watches dynamically.
+- `POST /reindex` submits a background job; it should not block the API thread.

@@ -17,6 +17,16 @@ static CtxGraphStats s_stats    = {0};
 
 #define CTX_SEMANTIC_INDEX_VERSION "4"
 
+#if defined(CTX_PLATFORM_WINDOWS)
+static CRITICAL_SECTION s_index_lock;
+static void index_lock(void) { EnterCriticalSection(&s_index_lock); }
+static void index_unlock(void) { LeaveCriticalSection(&s_index_lock); }
+#else
+static pthread_mutex_t s_index_lock = PTHREAD_MUTEX_INITIALIZER;
+static void index_lock(void) { pthread_mutex_lock(&s_index_lock); }
+static void index_unlock(void) { pthread_mutex_unlock(&s_index_lock); }
+#endif
+
 /* Progress — written by indexer thread, read by UI/CLI */
 static volatile uint32_t s_prog_total   = 0;
 static volatile uint32_t s_prog_done    = 0;
@@ -60,6 +70,13 @@ static void fl_free(FileList *fl) {
     fl->paths = NULL; fl->count = fl->cap = 0;
 }
 
+static bool fl_contains(const FileList *fl, const char *path) {
+    if (!fl || !path) return false;
+    for (uint32_t i = 0; i < fl->count; i++)
+        if (!strcmp(fl->paths[i], path)) return true;
+    return false;
+}
+
 static void collect_files(const char *dir, FileList *fl) {
     DIR *d = opendir(dir);
     if (!d) return;
@@ -89,6 +106,9 @@ static void emit_graph_updated(void) {
 
 bool ctx_indexer_init(const char *root_path) {
     if (!root_path) return false;
+#if defined(CTX_PLATFORM_WINDOWS)
+    InitializeCriticalSection(&s_index_lock);
+#endif
     strncpy(s_root, root_path, sizeof(s_root) - 1);
 
     s_graph = ctx_graph_create();
@@ -110,14 +130,24 @@ void ctx_indexer_shutdown(void) {
         ctx_graph_destroy(s_graph);
         s_graph = NULL;
     }
+#if defined(CTX_PLATFORM_WINDOWS)
+    DeleteCriticalSection(&s_index_lock);
+#endif
 }
 
 void ctx_indexer_index_all(void) {
     if (!s_graph) return;
+    index_lock();
     int64_t t0 = now_ms();
 
     FileList fl = {0};
     collect_files(s_root, &fl);
+
+    CtxGraphStats prev_stats;
+    ctx_indexer_get_stats(&prev_stats);
+    uint32_t store_cap = prev_stats.files ? prev_stats.files + 1024u : fl.count + 1024u;
+    CtxFileRecord *stored_files = calloc(store_cap ? store_cap : 1024u, sizeof(*stored_files));
+    uint32_t stored_count = stored_files ? ctx_store_enumerate_files(stored_files, store_cap, NULL) : 0;
 
     char index_version[32] = {0};
     bool force_reindex = !ctx_store_get_meta("semantic_index_version",
@@ -138,6 +168,14 @@ void ctx_indexer_index_all(void) {
         fl_push(&stale, fl.paths[i]);
     }
 
+    for (uint32_t i = 0; i < stored_count; i++) {
+        if (fl_contains(&fl, stored_files[i].path)) continue;
+        CTX_LOG_DEBUG("Removing deleted indexed file: %s", stored_files[i].path);
+        ctx_graph_remove_file(s_graph, stored_files[i].path);
+        ctx_store_remove_file(stored_files[i].path);
+    }
+    free(stored_files);
+
     s_prog_total   = stale.count;
     s_prog_done    = 0;
     s_prog_running = (stale.count > 0);
@@ -152,6 +190,7 @@ void ctx_indexer_index_all(void) {
         fl_free(&fl);
         fl_free(&stale);
         emit_graph_updated();
+        index_unlock();
         return;
     }
 
@@ -212,12 +251,20 @@ void ctx_indexer_index_all(void) {
     fl_free(&fl);
     fl_free(&stale);
     emit_graph_updated();
+    index_unlock();
 }
 
 void ctx_indexer_update_file(const char *path) {
     if (!s_graph || !path) return;
-    if (ctx_lang_from_path(path) == CTX_LANG_UNKNOWN) return;
+    if (ctx_lang_from_path(path) == CTX_LANG_UNKNOWN) {
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            ctx_indexer_index_all();
+        }
+        return;
+    }
 
+    index_lock();
     CTX_LOG_DEBUG("Incremental update: %s", path);
     ctx_graph_remove_file(s_graph, path);
 
@@ -225,6 +272,7 @@ void ctx_indexer_update_file(const char *path) {
     if (stat(path, &st) != 0) {
         ctx_store_remove_file(path);
         emit_graph_updated();
+        index_unlock();
         return;
     }
 
@@ -234,8 +282,14 @@ void ctx_indexer_update_file(const char *path) {
                               (int64_t)st.st_size, NULL,
                               (int)ctx_lang_from_path(path), 0);
         ctx_store_save_graph(s_graph);
+    } else {
+        ctx_store_remove_file(path);
+        ctx_store_save_graph(s_graph);
     }
+    s_stats.symbols = ctx_graph_symbol_count(s_graph);
+    s_stats.edges   = ctx_graph_edge_count(s_graph);
     emit_graph_updated();
+    index_unlock();
 }
 
 CtxGraph *ctx_indexer_get_graph(void) { return s_graph; }

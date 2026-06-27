@@ -3,6 +3,7 @@
 #include "../indexer/indexer.h"
 #include "../stats/stats.h"
 #include "../log/log.h"
+#include "../jobs/jobs.h"
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -134,9 +135,17 @@ static void handle_stats(int fd) {
     ctx_stats_record_query("/stats", 0);
 }
 
-static void handle_reindex(int fd) {
+static void api_reindex_job(void *user_data)
+{
+    CTX_UNUSED(user_data);
     ctx_indexer_index_all();
-    send_json(fd, 200, "{\"status\":\"reindex_started\"}");
+}
+
+static void handle_reindex(int fd) {
+    if (ctx_job_submit(api_reindex_job, NULL, CTX_JOB_PRIORITY_LOW))
+        send_json(fd, 200, "{\"status\":\"reindex_started\"}");
+    else
+        send_json(fd, 503, "{\"error\":\"job queue full\"}");
 }
 
 static void handle_context(int fd, const char *query, const char *route) {

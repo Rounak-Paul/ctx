@@ -16,6 +16,74 @@
 static volatile sig_atomic_t s_quit = 0;
 static void on_sigint(int sig) { CTX_UNUSED(sig); s_quit = 1; }
 
+typedef struct {
+    CtxFileEventKind kind;
+    char path[CTX_WATCHER_PATH_MAX];
+    char old_path[CTX_WATCHER_PATH_MAX];
+} FileChangeJob;
+
+static pthread_mutex_t s_reindex_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool s_reindex_pending = false;
+static bool s_reindex_again = false;
+
+static bool is_dir_path(const char *path)
+{
+    if (!path || !path[0]) return false;
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void reindex_job_fn(void *user_data)
+{
+    CTX_UNUSED(user_data);
+    for (;;) {
+        ctx_indexer_index_all();
+        pthread_mutex_lock(&s_reindex_lock);
+        if (!s_reindex_again) {
+            s_reindex_pending = false;
+            pthread_mutex_unlock(&s_reindex_lock);
+            break;
+        }
+        s_reindex_again = false;
+        pthread_mutex_unlock(&s_reindex_lock);
+    }
+}
+
+static void request_full_reindex(void)
+{
+    pthread_mutex_lock(&s_reindex_lock);
+    if (s_reindex_pending) {
+        s_reindex_again = true;
+        pthread_mutex_unlock(&s_reindex_lock);
+        return;
+    }
+    s_reindex_pending = true;
+    pthread_mutex_unlock(&s_reindex_lock);
+
+    if (!ctx_job_submit(reindex_job_fn, NULL, CTX_JOB_PRIORITY_LOW)) {
+        pthread_mutex_lock(&s_reindex_lock);
+        s_reindex_pending = false;
+        pthread_mutex_unlock(&s_reindex_lock);
+    }
+}
+
+static void file_change_job_fn(void *user_data)
+{
+    FileChangeJob *job = user_data;
+    if (!job) return;
+
+    if (is_dir_path(job->path)) {
+        request_full_reindex();
+        free(job);
+        return;
+    }
+
+    if (job->kind == CTX_FILE_EVENT_RENAMED && job->old_path[0])
+        ctx_indexer_update_file(job->old_path);
+    ctx_indexer_update_file(job->path);
+    free(job);
+}
+
 static void on_file_change(const CtxEvent *ev, void *user_data)
 {
     CTX_UNUSED(user_data);
@@ -23,7 +91,13 @@ static void on_file_change(const CtxEvent *ev, void *user_data)
     if (!fe) return;
     if (fe->kind == CTX_FILE_EVENT_CREATED  || fe->kind == CTX_FILE_EVENT_MODIFIED ||
         fe->kind == CTX_FILE_EVENT_DELETED  || fe->kind == CTX_FILE_EVENT_RENAMED) {
-        ctx_indexer_update_file(fe->path);
+        FileChangeJob *job = calloc(1, sizeof(*job));
+        if (!job) return;
+        job->kind = fe->kind;
+        snprintf(job->path, sizeof(job->path), "%s", fe->path);
+        snprintf(job->old_path, sizeof(job->old_path), "%s", fe->old_path);
+        if (!ctx_job_submit(file_change_job_fn, job, CTX_JOB_PRIORITY_HIGH))
+            free(job);
     }
 }
 

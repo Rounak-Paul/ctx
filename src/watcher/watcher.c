@@ -94,13 +94,27 @@ static CtxWatchEntry *find_by_wd(int wd)
     return NULL;
 }
 
-static void add_inotify_watch_recursive(CtxWatchEntry *entry, const char *path)
+static void add_inotify_watch_recursive(CtxWatchHandle handle,
+                                        const char *path,
+                                        bool recursive)
 {
     int wd = inotify_add_watch(s_watcher.inotify_fd, path, INOTIFY_FLAGS);
     if (wd < 0) return;
-    if (entry->wd < 0) entry->wd = wd; /* store primary wd */
 
-    if (!entry->recursive) return;
+    if (s_watcher.count >= CTX_WATCHER_MAX_WATCHES) {
+        inotify_rm_watch(s_watcher.inotify_fd, wd);
+        return;
+    }
+
+    CtxWatchEntry *entry = &s_watcher.entries[s_watcher.count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->wd = wd;
+    entry->handle = handle;
+    entry->recursive = recursive;
+    entry->active = true;
+    strncpy(entry->path, path, CTX_WATCHER_PATH_MAX - 1);
+
+    if (!recursive) return;
 
     DIR *dir = opendir(path);
     if (!dir) return;
@@ -110,7 +124,7 @@ static void add_inotify_watch_recursive(CtxWatchEntry *entry, const char *path)
         if (de->d_type == DT_DIR) {
             char sub[CTX_WATCHER_PATH_MAX];
             snprintf(sub, sizeof(sub), "%s/%s", path, de->d_name);
-            add_inotify_watch_recursive(entry, sub);
+            add_inotify_watch_recursive(handle, sub, recursive);
         }
     }
     closedir(dir);
@@ -163,7 +177,12 @@ static void *watcher_thread_linux(void *arg)
                 full_path[sizeof(full_path) - 1] = '\0';
             }
 
-            if (ie->mask & IN_CREATE)
+            if ((ie->mask & IN_CREATE) && (ie->mask & IN_ISDIR) && entry->recursive) {
+                pthread_mutex_lock(&s_watcher.lock);
+                add_inotify_watch_recursive(entry->handle, full_path, true);
+                pthread_mutex_unlock(&s_watcher.lock);
+                emit_file_event(CTX_FILE_EVENT_CREATED, full_path, NULL);
+            } else if (ie->mask & IN_CREATE)
                 emit_file_event(CTX_FILE_EVENT_CREATED, full_path, NULL);
             else if (ie->mask & (IN_MODIFY | IN_CLOSE_WRITE))
                 emit_file_event(CTX_FILE_EVENT_MODIFIED, full_path, NULL);
@@ -232,30 +251,27 @@ CtxWatchHandle ctx_watcher_add(const char *path, bool recursive)
         return CTX_WATCH_HANDLE_INVALID;
     }
 
-    CtxWatchEntry *entry = &s_watcher.entries[s_watcher.count++];
-    memset(entry, 0, sizeof(*entry));
-    entry->wd        = -1;
-    entry->handle    = s_watcher.next_handle++;
-    entry->recursive = recursive;
-    entry->active    = true;
-    strncpy(entry->path, path, CTX_WATCHER_PATH_MAX - 1);
+    uint32_t before_count = s_watcher.count;
+    CtxWatchHandle handle = s_watcher.next_handle++;
+    add_inotify_watch_recursive(handle, path, recursive);
 
-    add_inotify_watch_recursive(entry, path);
+    if (s_watcher.count == before_count) handle = CTX_WATCH_HANDLE_INVALID;
 
     pthread_mutex_unlock(&s_watcher.lock);
-    return entry->handle;
+    return handle;
 }
 
 void ctx_watcher_remove(CtxWatchHandle handle)
 {
     if (!handle) return;
     pthread_mutex_lock(&s_watcher.lock);
-    for (uint32_t i = 0; i < s_watcher.count; ++i) {
+    for (uint32_t i = 0; i < s_watcher.count;) {
         if (s_watcher.entries[i].handle == handle) {
             inotify_rm_watch(s_watcher.inotify_fd, s_watcher.entries[i].wd);
             s_watcher.entries[i] = s_watcher.entries[--s_watcher.count];
-            break;
+            continue;
         }
+        i++;
     }
     pthread_mutex_unlock(&s_watcher.lock);
 }
@@ -271,32 +287,55 @@ void ctx_watcher_remove(CtxWatchHandle handle)
 #define VNODE_FLAGS (NOTE_WRITE | NOTE_ATTRIB | NOTE_RENAME | \
                      NOTE_DELETE | NOTE_EXTEND | NOTE_LINK)
 
-static void add_kqueue_watch(CtxWatchEntry *entry, const char *path)
+static bool kqueue_path_is_watched(const char *path)
 {
-    int fd = open(path, O_RDONLY | O_EVTONLY | O_CLOEXEC);
-    if (fd < 0) return;
+    if (!path) return false;
+    for (uint32_t i = 0; i < s_watcher.count; i++)
+        if (s_watcher.entries[i].active && !strcmp(s_watcher.entries[i].path, path))
+            return true;
+    return false;
+}
 
-    struct kevent kev;
-    EV_SET(&kev, (uintptr_t)fd, EVFILT_VNODE, EV_ADD | EV_CLEAR,
-           VNODE_FLAGS, 0, entry);
-    kevent(s_watcher.kq, &kev, 1, NULL, 0, NULL);
+static void add_kqueue_watch_recursive(CtxWatchHandle handle,
+                                       const char *path,
+                                       bool recursive)
+{
+    bool already_watched = kqueue_path_is_watched(path);
 
-    if (entry->fd < 0) entry->fd = fd;
-    else close(fd); /* only store primary fd; recursive fds leak intentionally
-                       small — kqueue cleans up on close */
+    if (!already_watched) {
+        int fd = open(path, O_RDONLY | O_EVTONLY | O_CLOEXEC);
+        if (fd < 0) return;
 
-    if (!entry->recursive) return;
+        if (s_watcher.count >= CTX_WATCHER_MAX_WATCHES) {
+            close(fd);
+            return;
+        }
+
+        CtxWatchEntry *entry = &s_watcher.entries[s_watcher.count++];
+        memset(entry, 0, sizeof(*entry));
+        entry->fd = fd;
+        entry->handle = handle;
+        entry->recursive = recursive;
+        entry->active = true;
+        strncpy(entry->path, path, CTX_WATCHER_PATH_MAX - 1);
+
+        struct kevent kev;
+        EV_SET(&kev, (uintptr_t)fd, EVFILT_VNODE, EV_ADD | EV_CLEAR,
+               VNODE_FLAGS, 0, entry);
+        kevent(s_watcher.kq, &kev, 1, NULL, 0, NULL);
+    }
+
+    if (!recursive) return;
 
     DIR *dir = opendir(path);
     if (!dir) return;
     struct dirent *de;
     while ((de = readdir(dir))) {
         if (de->d_name[0] == '.') continue;
-        if (de->d_type == DT_DIR) {
-            char sub[CTX_WATCHER_PATH_MAX];
-            snprintf(sub, sizeof(sub), "%s/%s", path, de->d_name);
-            add_kqueue_watch(entry, sub);
-        }
+        char sub[CTX_WATCHER_PATH_MAX];
+        int n = snprintf(sub, sizeof(sub), "%s/%s", path, de->d_name);
+        if (n <= 0 || (size_t)n >= sizeof(sub)) continue;
+        add_kqueue_watch_recursive(handle, sub, recursive);
     }
     closedir(dir);
 }
@@ -328,8 +367,14 @@ static void *watcher_thread_macos(void *arg)
                 emit_file_event(CTX_FILE_EVENT_DELETED, entry->path, NULL);
             else if (fflags & NOTE_RENAME)
                 emit_file_event(CTX_FILE_EVENT_RENAMED, entry->path, NULL);
-            else if (fflags & (NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB))
+            else if (fflags & (NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_LINK)) {
+                if (entry->recursive) {
+                    pthread_mutex_lock(&s_watcher.lock);
+                    add_kqueue_watch_recursive(entry->handle, entry->path, true);
+                    pthread_mutex_unlock(&s_watcher.lock);
+                }
                 emit_file_event(CTX_FILE_EVENT_MODIFIED, entry->path, NULL);
+            }
         }
     }
 done:
@@ -388,31 +433,28 @@ CtxWatchHandle ctx_watcher_add(const char *path, bool recursive)
         return CTX_WATCH_HANDLE_INVALID;
     }
 
-    CtxWatchEntry *entry = &s_watcher.entries[s_watcher.count++];
-    memset(entry, 0, sizeof(*entry));
-    entry->fd        = -1;
-    entry->handle    = s_watcher.next_handle++;
-    entry->recursive = recursive;
-    entry->active    = true;
-    strncpy(entry->path, path, CTX_WATCHER_PATH_MAX - 1);
+    uint32_t before_count = s_watcher.count;
+    CtxWatchHandle handle = s_watcher.next_handle++;
+    add_kqueue_watch_recursive(handle, path, recursive);
 
-    add_kqueue_watch(entry, path);
+    if (s_watcher.count == before_count) handle = CTX_WATCH_HANDLE_INVALID;
 
     pthread_mutex_unlock(&s_watcher.lock);
-    return entry->handle;
+    return handle;
 }
 
 void ctx_watcher_remove(CtxWatchHandle handle)
 {
     if (!handle) return;
     pthread_mutex_lock(&s_watcher.lock);
-    for (uint32_t i = 0; i < s_watcher.count; ++i) {
+    for (uint32_t i = 0; i < s_watcher.count;) {
         if (s_watcher.entries[i].handle == handle) {
             if (s_watcher.entries[i].fd >= 0)
                 close(s_watcher.entries[i].fd);
             s_watcher.entries[i] = s_watcher.entries[--s_watcher.count];
-            break;
+            continue;
         }
+        i++;
     }
     pthread_mutex_unlock(&s_watcher.lock);
 }
