@@ -3,6 +3,8 @@
 #include "force_graph.h"
 #include "../log/log.h"
 
+#include <ca_gpu.h>
+
 #define CTX_FG_MAX_NODES 1200u
 #define CTX_FG_MAX_EDGES 6000u
 #define CTX_FG_NODE_SEGMENTS 10u
@@ -1296,7 +1298,7 @@ void ctx_force_graph_build(CtxForceGraph *view)
     view->viewport = ca_viewport(&(Ca_ViewportDesc){
         .width = 0.0f,
         .height = 0.0f,
-        .clear_color = { .float32 = { 0.035f, 0.039f, 0.047f, 1.0f } },
+        .clear_color = { 0.035f, 0.039f, 0.047f, 1.0f },
         .id = "ctx-force-graph",
     });
     ca_viewport_set_callbacks(view->viewport, graph_render, view, NULL, NULL);
