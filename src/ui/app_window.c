@@ -100,6 +100,10 @@ typedef struct {
     char query[512];
 } ContextJobData;
 
+typedef struct {
+    uint64_t generation;
+} GraphJobData;
+
 /* ============================================================
    State
    ============================================================ */
@@ -127,6 +131,8 @@ typedef struct {
 
     /* Interactive graph viewport */
     CtxForceGraph *force_graph;
+    CtxForceGraphSnapshot *pending_graph_snapshot;
+    uint64_t       graph_generation;
     float          mouse_x;
     float          mouse_y;
     bool           content_needs_rebuild;
@@ -150,6 +156,7 @@ static void ui_unlock(void) { pthread_mutex_unlock(&s_ui_lock); }
 static void build_tabs(Ca_Div *div, void *ud);
 static void build_content(Ca_Div *div, void *ud);
 static void request_list_refresh(int tab);
+static void request_graph_refresh(void);
 static void context_query_job(void *ud);
 
 typedef struct {
@@ -282,6 +289,13 @@ static const char *g_css =
     "  flex-grow: 1;"
     "  overflow: scroll;"
     "}"
+    ".content-pad-graph {"
+    "  background: #0d0d11;"
+    "  padding: 8px;"
+    "  gap: 6px;"
+    "  flex-grow: 1;"
+    "  overflow: hidden;"
+    "}"
     ".graph-shell {"
     "  background: #151518;"
     "  border-width: 1px;"
@@ -302,7 +316,7 @@ static const char *g_css =
     ".graph-grow { flex-grow: 1; }"
     ".graph-frame {"
     "  background: #0d0d11;"
-    "  min-height: 420px;"
+    "  height: 100%;"
     "  flex-grow: 1;"
     "  padding: 0px;"
     "  gap: 0px;"
@@ -399,8 +413,53 @@ static const char *g_css =
 static void on_graph_updated(const CtxEvent *ev, void *user_data)
 {
     CTX_UNUSED(ev); CTX_UNUSED(user_data);
+    ui_lock();
     s.graph_updated = true;
+    ui_unlock();
     ca_instance_wake();
+}
+
+static void publish_graph_snapshot(uint64_t generation, CtxForceGraphSnapshot *snapshot)
+{
+    bool should_wake = false;
+
+    ui_lock();
+    if (!s.closing && s.graph_generation == generation) {
+        ctx_force_graph_snapshot_destroy(s.pending_graph_snapshot);
+        s.pending_graph_snapshot = snapshot;
+        s.content_needs_rebuild = true;
+        snapshot = NULL;
+        should_wake = true;
+    }
+    ui_unlock();
+
+    ctx_force_graph_snapshot_destroy(snapshot);
+    if (should_wake) ca_instance_wake();
+}
+
+static void graph_snapshot_job(void *ud)
+{
+    GraphJobData *job = ud;
+    if (!job) return;
+
+    CtxForceGraphSnapshot *snapshot =
+        ctx_force_graph_snapshot_build(ctx_indexer_get_graph());
+    publish_graph_snapshot(job->generation, snapshot);
+    free(job);
+}
+
+static void request_graph_refresh(void)
+{
+    GraphJobData *job = calloc(1, sizeof(*job));
+    if (!job) return;
+
+    ui_lock();
+    job->generation = ++s.graph_generation;
+    ui_unlock();
+
+    if (!ctx_job_submit(graph_snapshot_job, job, CTX_JOB_PRIORITY_LOW)) {
+        free(job);
+    }
 }
 
 static void ca_on_close(const Ca_Event *ev, void *user_data)
@@ -554,9 +613,10 @@ static void status_bar_builder(Ca_Window *window, void *user_data)
 {
     CTX_UNUSED(window); CTX_UNUSED(user_data);
 
-    CtxGraph *g = ctx_indexer_get_graph();
     CtxIndexProgress prog;
+    CtxGraphStats stats;
     ctx_indexer_get_progress(&prog);
+    ctx_indexer_get_stats(&stats);
 
     float frac = 0.0f;
     if (prog.running && prog.total > 0)
@@ -566,8 +626,8 @@ static void status_bar_builder(Ca_Window *window, void *user_data)
 
     char sym_buf[32];
     char edge_buf[32];
-    snprintf(sym_buf,  sizeof(sym_buf),  "%u", g ? ctx_graph_symbol_count(g) : 0u);
-    snprintf(edge_buf, sizeof(edge_buf), "%u", g ? ctx_graph_edge_count(g)   : 0u);
+    snprintf(sym_buf,  sizeof(sym_buf),  "%u", stats.symbols);
+    snprintf(edge_buf, sizeof(edge_buf), "%u", stats.edges);
 
     ca_div_begin(&(Ca_DivDesc){ .direction = CA_HORIZONTAL, .style = "status-bar" });
 
@@ -590,10 +650,9 @@ static void status_bar_builder(Ca_Window *window, void *user_data)
             ca_text(&(Ca_TextDesc){ .text = edge_buf,  .style = "status-value" });
             /* Show parse-error count if any files had extraction errors */
             {
-                CtxGraphStats gs2; ctx_indexer_get_stats(&gs2);
-                if (gs2.errors > 0) {
+                if (stats.errors > 0) {
                     char errbuf[32];
-                    snprintf(errbuf, sizeof(errbuf), "%u err", gs2.errors);
+                    snprintf(errbuf, sizeof(errbuf), "%u err", stats.errors);
                     ca_text(&(Ca_TextDesc){ .text = errbuf, .style = "status-busy" });
                 }
             }
@@ -625,11 +684,29 @@ static void on_frame(void *ud)
         ca_instance_wake();
     }
 
+    CtxForceGraphSnapshot *pending_snapshot = NULL;
+    ui_lock();
+    pending_snapshot = s.pending_graph_snapshot;
+    s.pending_graph_snapshot = NULL;
+    ui_unlock();
+    if (pending_snapshot) {
+        if (s.force_graph)
+            ctx_force_graph_apply_snapshot(s.force_graph, pending_snapshot);
+        ctx_force_graph_snapshot_destroy(pending_snapshot);
+        if (s.win) ca_window_invalidate_status_bar(s.win);
+    }
+
+    bool graph_updated = false;
+    ui_lock();
     if (s.graph_updated) {
         s.graph_updated = false;
+        graph_updated = true;
+    }
+    ui_unlock();
+    if (graph_updated) {
         CtxGraph *g = ctx_indexer_get_graph();
         if (g) {
-            if (s.force_graph) ctx_force_graph_sync(s.force_graph, g);
+            if (s.force_graph) request_graph_refresh();
             if (s.active_tab == 1 || s.active_tab == 2 || s.active_tab == 4)
                 request_list_refresh(s.active_tab);
             s.content_needs_rebuild = true;
@@ -1514,7 +1591,7 @@ static void build_tabs(Ca_Div *div, void *ud)
 }
 
 /*
- * Builds the scrollable body for the active tab.
+ * Builds the body for the active tab.
  *
  * div  Unused content parent.
  * ud   Unused builder data.
@@ -1523,7 +1600,10 @@ static void build_content(Ca_Div *div, void *ud)
 {
     CTX_UNUSED(div); CTX_UNUSED(ud);
     int tab = s.active_tab;
-    ca_div_begin(&(Ca_DivDesc){ .direction = CA_VERTICAL, .style = "content-pad" });
+    ca_div_begin(&(Ca_DivDesc){
+        .direction = CA_VERTICAL,
+        .style = tab == 0 ? "content-pad-graph" : "content-pad",
+    });
         if      (tab == 0) build_graph_tab  (NULL, NULL);
         else if (tab == 1) build_symbols_tab(NULL, NULL);
         else if (tab == 2) build_calls_tab  (NULL, NULL);
@@ -1639,7 +1719,10 @@ bool ctx_ui_run(void)
 
     ui_lock();
     s.closing = true;
+    CtxForceGraphSnapshot *pending_snapshot = s.pending_graph_snapshot;
+    s.pending_graph_snapshot = NULL;
     ui_unlock();
+    ctx_force_graph_snapshot_destroy(pending_snapshot);
 
     ctx_force_graph_destroy(s.force_graph);
     s.force_graph = NULL;

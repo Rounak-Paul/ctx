@@ -89,6 +89,13 @@ struct CtxForceGraph {
     double energy;
 };
 
+struct CtxForceGraphSnapshot {
+    ForceNode *nodes;
+    ForceEdge *edges;
+    uint32_t node_count;
+    uint32_t edge_count;
+};
+
 typedef struct {
     float width;
     float height;
@@ -1290,6 +1297,61 @@ void ctx_force_graph_sync(CtxForceGraph *view, CtxGraph *graph)
     view->generation++;
     if (view->viewport)
         ca_viewport_request_redraw(view->viewport);
+}
+
+CtxForceGraphSnapshot *ctx_force_graph_snapshot_build(CtxGraph *graph)
+{
+    CtxForceGraphSnapshot *snapshot = calloc(1, sizeof(*snapshot));
+    if (!snapshot) return NULL;
+
+    CtxForceGraph tmp = {0};
+    tmp.nodes = calloc(CTX_FG_MAX_NODES, sizeof(*tmp.nodes));
+    tmp.edges = calloc(CTX_FG_MAX_EDGES, sizeof(*tmp.edges));
+    if (!tmp.nodes || !tmp.edges) {
+        free(tmp.nodes);
+        free(tmp.edges);
+        free(snapshot);
+        return NULL;
+    }
+
+    ctx_force_graph_sync(&tmp, graph);
+
+    snapshot->nodes = tmp.nodes;
+    snapshot->edges = tmp.edges;
+    snapshot->node_count = tmp.node_count;
+    snapshot->edge_count = tmp.edge_count;
+    return snapshot;
+}
+
+void ctx_force_graph_apply_snapshot(CtxForceGraph *view, const CtxForceGraphSnapshot *snapshot)
+{
+    if (!view || !snapshot) return;
+
+    view->node_count = snapshot->node_count < CTX_FG_MAX_NODES
+        ? snapshot->node_count : CTX_FG_MAX_NODES;
+    view->edge_count = snapshot->edge_count < CTX_FG_MAX_EDGES
+        ? snapshot->edge_count : CTX_FG_MAX_EDGES;
+
+    if (view->node_count > 0)
+        memcpy(view->nodes, snapshot->nodes, (size_t)view->node_count * sizeof(*view->nodes));
+    if (view->edge_count > 0)
+        memcpy(view->edges, snapshot->edges, (size_t)view->edge_count * sizeof(*view->edges));
+
+    view->energy = 1.0;
+    view->hover_node = -1;
+    view->selected_node = -1;
+    view->drag_node = -1;
+    view->generation++;
+    if (view->viewport)
+        ca_viewport_request_redraw(view->viewport);
+}
+
+void ctx_force_graph_snapshot_destroy(CtxForceGraphSnapshot *snapshot)
+{
+    if (!snapshot) return;
+    free(snapshot->nodes);
+    free(snapshot->edges);
+    free(snapshot);
 }
 
 void ctx_force_graph_build(CtxForceGraph *view)

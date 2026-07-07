@@ -219,10 +219,15 @@ void ctx_indexer_index_all(void) {
     if (stale.count == 0) {
         CTX_LOG_INFO("Index up to date: %u files, %u symbols, %u edges",
                      fl.count, ctx_graph_symbol_count(s_graph), ctx_graph_edge_count(s_graph));
-        s_stats.files       = fl.count;
-        s_stats.symbols     = ctx_graph_symbol_count(s_graph);
-        s_stats.edges       = ctx_graph_edge_count(s_graph);
-        s_stats.duration_ms = now_ms() - t0;
+        CtxGraphStats stats = {
+            .files = fl.count,
+            .symbols = ctx_graph_symbol_count(s_graph),
+            .edges = ctx_graph_edge_count(s_graph),
+            .duration_ms = now_ms() - t0,
+        };
+        status_lock();
+        s_stats = stats;
+        status_unlock();
         fl_free(&fl);
         fl_free(&stale);
         status_set_progress(stale.count, 0, false);
@@ -258,15 +263,20 @@ void ctx_indexer_index_all(void) {
     uint32_t resolved = ctx_graph_resolve_calls(s_graph);
 
     int64_t dur = now_ms() - t0;
-    s_stats.files       = fl.count;
-    s_stats.symbols     = ctx_graph_symbol_count(s_graph);
-    s_stats.edges       = ctx_graph_edge_count(s_graph);
-    s_stats.errors      = errors;
-    s_stats.duration_ms = dur;
+    CtxGraphStats stats = {
+        .files = fl.count,
+        .symbols = ctx_graph_symbol_count(s_graph),
+        .edges = ctx_graph_edge_count(s_graph),
+        .errors = errors,
+        .duration_ms = dur,
+    };
+    status_lock();
+    s_stats = stats;
+    status_unlock();
 
     CTX_LOG_INFO("Index done: %u symbols, %u edges, %u semantic edges resolved in %"PRId64"ms",
-                 s_stats.symbols, s_stats.edges, resolved, dur);
-    ctx_stats_record_index(stale.count, s_stats.symbols, (double)dur);
+                 stats.symbols, stats.edges, resolved, dur);
+    ctx_stats_record_index(stale.count, stats.symbols, (double)dur);
 
     ctx_store_save_graph(s_graph);
 
@@ -278,7 +288,7 @@ void ctx_indexer_index_all(void) {
     ctx_store_set_meta("root_path",    s_root);
     ctx_store_set_meta("semantic_index_version", CTX_SEMANTIC_INDEX_VERSION);
     ctx_store_increment_stat("files_indexed",       (int64_t)stale.count);
-    ctx_store_increment_stat("symbols_found",        (int64_t)s_stats.symbols);
+    ctx_store_increment_stat("symbols_found",        (int64_t)stats.symbols);
     ctx_store_increment_stat("errors_encountered",   (int64_t)errors);
     ctx_store_increment_stat("last_index_duration_ms", dur);
 
@@ -324,8 +334,12 @@ void ctx_indexer_update_file(const char *path) {
         ctx_store_remove_file(path);
         ctx_store_save_graph(s_graph);
     }
-    s_stats.symbols = ctx_graph_symbol_count(s_graph);
-    s_stats.edges   = ctx_graph_edge_count(s_graph);
+    uint32_t symbols = ctx_graph_symbol_count(s_graph);
+    uint32_t edges = ctx_graph_edge_count(s_graph);
+    status_lock();
+    s_stats.symbols = symbols;
+    s_stats.edges   = edges;
+    status_unlock();
     status_set_progress(1, 1, false);
     emit_graph_updated();
     index_unlock();
@@ -334,7 +348,10 @@ void ctx_indexer_update_file(const char *path) {
 CtxGraph *ctx_indexer_get_graph(void) { return s_graph; }
 
 void ctx_indexer_get_stats(CtxGraphStats *out) {
-    if (out) *out = s_stats;
+    if (!out) return;
+    status_lock();
+    *out = s_stats;
+    status_unlock();
 }
 
 void ctx_indexer_get_progress(CtxIndexProgress *out) {

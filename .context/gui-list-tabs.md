@@ -4,7 +4,9 @@
 
 - Static chrome root.
 - Sticky tab strip in `s.tabs_div`.
-- Rebuilt, scrollable active-panel body in `s.content_div`.
+- Rebuilt active-panel body in `s.content_div`.
+- Graph tab body uses `content-pad-graph` with `overflow: hidden`; list/context
+  bodies use the scrollable `content-pad`.
 
 List-style tabs use per-tab state in `s.list_query[]` and `s.list_page[]`.
 Filtering is applied across the full backing dataset before pagination in
@@ -26,10 +28,16 @@ Tabs:
 Async UI rules:
 - Context retrieval is submitted to the shared job system and publishes back to
   `s.ctx_result` behind `s_ui_lock`.
+- Graph updates enqueue a background force-graph projection job. The Causality
+  frame callback only applies the completed `CtxForceGraphSnapshot`; it must not
+  scan/sort the full graph on the UI thread.
 - Symbols, Calls, and Files render fixed-size snapshots from
   `s.list_snapshots[]`; workers build those snapshots from graph/store data.
 - UI builders may request a refresh, but must render the current snapshot or a
   loading state instead of doing graph/store scans directly.
+- Status-bar rendering reads `ctx_indexer_get_stats()` and
+  `ctx_indexer_get_progress()` snapshots, not live graph counts, so progress
+  refreshes do not contend with graph mutation during indexing.
 - Snapshot workers periodically cancel themselves when superseded by a newer
   query/page generation.
 - Page controls clamp to the current filtered count and request a fresh snapshot
