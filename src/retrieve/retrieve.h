@@ -6,13 +6,10 @@
  * Context retrieval engine.
  *
  * Given a natural-language query or an explicit symbol/file anchor, performs
- * deep graph traversal across the indexed codebase and returns a structured
- * relational context block. Output captures: matched symbols with full
- * signatures, transitive call/reference/inheritance chains, field usage sites
- * (write vs read), co-located symbols in the same file and directory module,
- * and structural hierarchy. No token budget, no truncation, no markdown
- * formatting — the goal is to give an agent the same picture it would have
- * after reading the entire relevant portion of the codebase itself.
+ * broad graph retrieval and returns a structured context packet. The default
+ * renderer favours symbol cards, relation summaries, and expansion handles over
+ * full source dumps so agents get enough current context without paying to
+ * reread the repository. Callers can request full detail explicitly.
  */
 
 typedef enum {
@@ -21,9 +18,16 @@ typedef enum {
     CTX_QUERY_FILE       /* anchored on a file path */
 } CtxQueryKind;
 
+typedef enum {
+    CTX_RETRIEVE_DETAIL_COMPACT = 0,
+    CTX_RETRIEVE_DETAIL_STANDARD,
+    CTX_RETRIEVE_DETAIL_FULL
+} CtxRetrieveDetail;
+
 typedef struct {
-    CtxQueryKind kind;
-    const char  *text;   /* task text, symbol name, or file path — must be non-NULL */
+    CtxQueryKind       kind;
+    CtxRetrieveDetail  detail;
+    const char        *text;   /* task text, symbol name, or file path — must be non-NULL */
 } CtxRetrieveRequest;
 
 /*
@@ -35,3 +39,20 @@ typedef struct {
  * req  Retrieval request.
  */
 char *ctx_retrieve(CtxGraph *g, const CtxRetrieveRequest *req);
+
+/*
+ * Expands a handle returned by ctx_retrieve().
+ *
+ * Supported handles:
+ *   expand:symbol:<id>
+ *   expand:file:<path>
+ *   expand:entrypoints:<path>
+ *   expand:source:<id>
+ *   expand:callers:<id>
+ *   expand:callees:<id>
+ *   expand:refs:<id>
+ *
+ * g       Live graph (may be NULL or empty — handled gracefully).
+ * handle  Expansion handle string.
+ */
+char *ctx_expand_context(CtxGraph *g, const char *handle);

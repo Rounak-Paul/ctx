@@ -16,7 +16,7 @@ static char          s_root[4096] = {0};
 static CtxGraphStats s_stats    = {0};
 static CtxIndexStatus s_status  = {0};
 
-#define CTX_SEMANTIC_INDEX_VERSION "4"
+#define CTX_SEMANTIC_INDEX_VERSION "5"
 
 #if defined(CTX_PLATFORM_WINDOWS)
 static CRITICAL_SECTION s_index_lock;

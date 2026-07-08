@@ -83,6 +83,32 @@ static TSNode find_child(TSNode parent, const char *type) {
     return null;
 }
 
+/*
+ * Finds the first descendant of a given type in source order.
+ *
+ * parent  Root node to search below.
+ * type    Tree-sitter node type to match.
+ * limit   Maximum nodes to visit.
+ */
+static TSNode find_descendant(TSNode parent, const char *type, uint32_t limit) {
+    TSNode null = {0};
+    if (ts_node_is_null(parent) || !type || limit == 0) return null;
+
+    TSNode stack[128];
+    uint32_t count = 0, visited = 0;
+    stack[count++] = parent;
+    while (count > 0 && visited++ < limit) {
+        TSNode cur = stack[--count];
+        if (!ts_node_is_null(cur) && !strcmp(ts_node_type(cur), type))
+            return cur;
+
+        uint32_t n = ts_node_child_count(cur);
+        for (uint32_t i = n; i > 0 && count < 128; --i)
+            stack[count++] = ts_node_child(cur, i - 1);
+    }
+    return null;
+}
+
 static bool type_contains(const char *type, const char *needle) {
     return type && needle && strstr(type, needle) != NULL;
 }
@@ -362,9 +388,9 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
 
     if (kind == CTX_SYM_FUNCTION || kind == CTX_SYM_METHOD) {
         /* C/C++: function_definition has a declarator child */
-        TSNode decl = find_child(node, "function_declarator");
+        TSNode decl = find_descendant(node, "function_declarator", 64);
         if (ts_node_is_null(decl)) decl = find_child(node, "declarator");
-        TSNode name_node = find_child(decl, "identifier");
+        TSNode name_node = find_descendant(decl, "identifier", 64);
         if (ts_node_is_null(name_node)) name_node = find_child(node, "identifier");
         if (!ts_node_is_null(name_node)) {
             node_text(ctx->source, name_node, namebuf, sizeof(namebuf));

@@ -62,6 +62,13 @@ static void send_text(int fd, const char *text) {
     send_response(fd, 200, "text/markdown", text);
 }
 
+static CtxRetrieveDetail parse_detail_param(const char *detail) {
+    if (!detail || !detail[0]) return CTX_RETRIEVE_DETAIL_COMPACT;
+    if (!strcmp(detail, "full")) return CTX_RETRIEVE_DETAIL_FULL;
+    if (!strcmp(detail, "standard")) return CTX_RETRIEVE_DETAIL_STANDARD;
+    return CTX_RETRIEVE_DETAIL_COMPACT;
+}
+
 /* ---- parse first line of HTTP request ---- */
 typedef struct { char method[8]; char path[512]; char query[512]; } HttpReq;
 
@@ -227,11 +234,28 @@ static void handle_context(int fd, const char *query, const char *route) {
         return;
     }
     req.text = arg;
+    char *detail = get_param(query, "detail");
+    req.detail = parse_detail_param(detail);
+    free(detail);
     char *result = ctx_retrieve(get_graph(), &req);
     send_text(fd, result);
     free(result);
     ctx_stats_record_query(route ? route : "/context", 0);
     free(arg);
+}
+
+static void handle_context_expand(int fd, const char *query) {
+    char *handle = get_param(query, "handle");
+    if (!handle || !handle[0]) {
+        free(handle);
+        send_json(fd, 400, "{\"error\":\"missing handle parameter\"}");
+        return;
+    }
+    char *result = ctx_expand_context(get_graph(), handle);
+    send_text(fd, result);
+    free(result);
+    ctx_stats_record_query("/context/expand", 0);
+    free(handle);
 }
 
 static void handle_request(int fd) {
@@ -243,6 +267,7 @@ static void handle_request(int fd) {
     else if (!strcmp(req.path, "/context"))        handle_context(fd, req.query, NULL);
     else if (!strcmp(req.path, "/context/symbol")) handle_context(fd, req.query, "symbol");
     else if (!strcmp(req.path, "/context/file"))   handle_context(fd, req.query, "file");
+    else if (!strcmp(req.path, "/context/expand")) handle_context_expand(fd, req.query);
     else if (!strcmp(req.path, "/stats"))          handle_stats(fd);
     else if (!strcmp(req.path, "/status"))         handle_health(fd);
     else if (!strcmp(req.path, "/reindex") && !strcmp(req.method, "POST")) handle_reindex(fd);

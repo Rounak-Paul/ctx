@@ -1,10 +1,11 @@
 # ctx Context Server — Architecture & Decisions
 
-Goal: a deep-graph LLM context server. Given a task/question, return a complete
-structured relational context block — all relevant symbols, transitive call/
-reference/inheritance chains, field usage sites, and module structure — so an
-agent has the same picture it would get after reading the entire relevant portion
-of the codebase itself. No token budget, no truncation, no markdown formatting.
+Goal: a token-efficient LLM context server. Given a task/question, return a
+compact, self-contained context packet with the files, symbols, relation paths,
+risks, and expansion handles an agent needs to decide the next action. ctx should
+avoid making the model reread the repository. Exact source and complete graph
+detail are available through explicit expansion/full-detail requests, not dumped
+by default.
 
 ## Data model (`graph/graph.h`)
 `CtxSymbol`: `name, file, line, end_line, col, kind, signature, scope, lang,
@@ -15,6 +16,8 @@ references, inherits, includes, defines.
 - Language-aware iterative AST walk (no recursion → no stack overflow on vendor).
 - First-class symbols: functions, methods, classes, structs, enums, typedefs,
   namespaces, macros, includes, module-level variables (no locals).
+- C/C++ function names use bounded descendant lookup, so wrapped declarators such
+  as pointer-return functions (`char *ctx_retrieve`) are indexed.
 - Pending edges: calls (from enclosing fn), references (enclosing fn → resolved
   identifier filtered by `is_noise_identifier`), inheritance.
 - `is_noise_identifier`: blocks identifiers < 5 chars, all C/C++ keywords, and
@@ -29,7 +32,10 @@ references, inherits, includes, defines.
   non-recursive).
 
 ## Retrieval engine (`retrieve/retrieve.c`)
-Complete rewrite — no budget, no truncation, no format switching.
+Default output is `CTX_PACKET`, a compact/adaptive packet. It is not governed by
+a hard token cap; the renderer downgrades low-marginal-value symbols to handles
+when they repeat files/modules/relations already represented. `detail=full`
+keeps the older complete grouped module/file/symbol output for explicit callers.
 
 **Pipeline:**
 1. Tokenize query: stopword-filtered, light stemming (-ing/-ed/-s). Symbol/file
@@ -47,20 +53,26 @@ Complete rewrite — no budget, no truncation, no format switching.
 3. Score via inverted index: top 128 seeds selected. Hub bonus: degree × 0.15,
    capped at 12.0 — ensures high-connectivity architectural symbols rank higher.
    Coverage bonus: symbols matching more query terms get +8 per term hit.
+   File-scope non-static definitions and function bodies are treated as public
+   entrypoints and get a ranking boost so API-generation/expansion questions
+   surface exported functions before dense helper clusters.
 4. Prefix matching: terms ≥4 chars also match index tokens that start with the
    term (e.g. "rend" → "render") at 0.5× score — fuzzy without false positives.
 5. BFS traversal via adjacency list from each seed, depth 4, up to 128 symbols.
    Incoming reference edges suppressed (high-volume noise). Cross-vendor refs
    suppressed. Score decays 10 points per hop.
-6. File sibling pull + include-chain pull for top-8 seeds (structural locality).
-7. Sort by score, emit grouped by module directory → file → symbol.
+6. File sibling pull + include-chain pull for top-16 seeds (structural locality),
+   then a bounded pass pulls public entrypoints from represented files.
+7. Sort by score, emit a packet with answer map, edit targets, relevant files,
+   symbol cards, omitted expandable handles, and accounting.
 
-**API:** `/context?task=`, `/context/symbol?name=`, `/context/file?path=`.
-No budget or format params. Output: plain structured text, always complete.
+**API:** `/context?task=&detail=compact|standard|full`,
+`/context/symbol?name=&detail=...`, `/context/file?path=&detail=...`, and
+`/context/expand?handle=expand:...`.
 
 ## Cache/versioning (`store/store.c`, `indexer/indexer.c`)
 - `CTX_STORE_SCHEMA_VERSION` → `migrate_schema` drops stale tables on mismatch.
-- `CTX_SEMANTIC_INDEX_VERSION` (currently "4") → forces re-extraction on change.
+- `CTX_SEMANTIC_INDEX_VERSION` (currently "5") → forces re-extraction on change.
 - Bump SCHEMA when CtxSymbol columns change; SEMANTIC when extraction changes.
 
 ## API (`api/api.c`)
@@ -70,45 +82,51 @@ No budget or format params. Output: plain structured text, always complete.
 
 ## Benchmark (`bench/bench.c`, `--bench`)
 - 6 presence-based cases asserting expected file/symbol names appear in output.
-- No budget assertion — output is unbounded by design.
+- Live smoke covers packet accounting, expansion handles, and `detail=full`.
 
-## Retrieval engine (`retrieve/retrieve.c`) — output format
-Output is optimised for LLM consumption — compact, structured, hierarchical:
+## Retrieval engine (`retrieve/retrieve.c`) — packet format
+Default output is optimised for LLM credit reduction:
 
 ```
+CTX_PACKET
 CODEBASE: /abs/path/to/root
-QUERY: how does culling work
-TERMS: cull frustum render
-SYMBOLS: 47 across 3 modules
+QUERY: fix graph UI freeze
+INTENT: debug
+DETAIL: compact-adaptive
 
-MODULES:
-  src/render/  18 syms  C  [also: shadow.c, material.c]
-  src/math/     8 syms  C  [also: vec.c]
-
-MODULE src/render/
-  FILE src/render/culling.c  [8 syms, C]
-    fn       ctx_cull_frustum(RenderList*, Frustum*)  :18-67
-      calls: frustum_test_sphere(frustum.c:44), ...
-      called-by: qs_renderer_submit_renderable(renderer.c:203)
-    struct   CullResult  :12
+ANSWER_MAP
+EDIT_TARGETS
+RELEVANT_FILES
+SYMBOL_CARDS
+OMITTED_EXPANDABLE
+ACCOUNTING
 ```
 
 Key format rules:
-- `CODEBASE:` from `ctx_store_get_meta("root_path")`.
-- `MODULES:` compact table — module path, sym count, lang, peer files not in ss.
-- `MODULE path/` at column 0; `  FILE fullpath  [N syms, lang]` at indent 2.
-- Symbol: `    kind  name(sig)  :line[-endline]` at indent 4.
-- Edges: `      label: name:line, cross(file.c:line)` at indent 6.
-  Same-file edges show `name:line`; cross-file show `name(basename:line)`.
-- No `(reason)` noise. No redundant file paths inside symbol lines.
-- Modules ordered by relevance (first appearance in score-sorted list).
+- Every packet is self-contained: query, intent, terms, represented files, symbol
+  cards, and accounting are present in each response.
+- Full source bodies are omitted by default. Use `expand:source:<id>` only when
+  exact code is needed.
+- `expand:entrypoints:<path>` lists public/top-level file entrypoints.
+- `expand:file:<path>` returns a compact file symbol map grouped into
+  entrypoints, internal symbols, and omitted expandable handles; it does not dump
+  whole source.
+- `expand:symbol:<id>`, `expand:source:<id>`, `expand:callers:<id>`,
+  `expand:callees:<id>`, and `expand:refs:<id>` resolve through `/context/expand`
+  or MCP `expand_context`.
+- `ACCOUNTING` reports estimated output tokens, represented files, symbol-card
+  count, source body count, and expandable handle count.
 
 ## Retrieval engine — scoring
 - Inverted index pre-scores: exact name match=40, prefix name=22, filename=10, else=8.
   Plus: `kind_importance()`, definition+6, hub bonus (degree×0.15, cap 12.0), vendor×0.3.
+- Public entrypoint boost: file-scope definitions/functions that are not marked
+  `static` receive +14, with an additional +6 for project-style public names
+  such as `ctx_*`/`Ctx*`.
 - Coverage bonus: +8 per query term that the symbol matched across all index hits.
 - `score_symbol()` still used for FILE/SYMBOL anchor queries (rare, fast enough).
-- Tunables: seeds=128, traversal=128, depth=4, min_score=6.0, siblings=8, peers=8.
+- Tunables: seeds=128, traversal=128, depth=4, min_score=6.0, siblings=8,
+  seed-locality-window=16, peers=8.
 
 ## Store (`store/store.h`, `store/store.c`)
 - Added `CtxFileRecord` struct: path, lang, mtime, size, error_count, sym_count.

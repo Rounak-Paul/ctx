@@ -1508,9 +1508,9 @@ static void build_context_tab(Ca_Div *div, void *ud)
 
     ca_div_begin(&(Ca_DivDesc){ .direction = CA_VERTICAL, .style = "ctx-shell" });
         ca_text(&(Ca_TextDesc){
-            .text = "Playground — preview the full relational context block an agent "
-                    "receives from GET /context. Deep graph traversal: call chains, "
-                    "reference sites, module structure. No token budget, no truncation. "
+            .text = "Playground — preview the compact context packet an agent "
+                    "receives from GET /context. Deep graph retrieval, symbol cards, "
+                    "relationship summaries, accounting, and expansion handles. "
                     "No LLM is called.",
             .style = "ctx-hint", .wrap = true });
 

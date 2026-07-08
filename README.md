@@ -1,11 +1,11 @@
 # ctx — LLM Context Server
 
 `ctx` indexes a codebase with tree-sitter, builds a semantic symbol graph
-(calls, references, inheritance, includes), and serves **compact, explainable,
-budget-aware context bundles** over HTTP. It exists to keep coding agents from
-burning tokens scanning large repositories: ask for a task and get back the
-relevant files, symbols, snippets, and relationships — within a token budget,
-with stable `file:line` citations.
+(calls, references, inheritance, includes), and serves **compact, explainable
+context packets** over HTTP. It exists to keep coding agents from burning tokens
+scanning large repositories: ask for a task and get back the relevant files,
+symbols, relationships, accounting, and expansion handles with stable
+`file:line` citations.
 
 The graph visualizer (GUI) is a debugging aid. The product is the context API.
 
@@ -28,17 +28,16 @@ indexed by default.
 
 ## Context API
 
-All retrieval endpoints accept `budget` (approx token budget, default 2000) and
-`format` (`markdown` | `json`, default `markdown`). Markdown is for direct
-prompt inclusion; JSON is for programmatic agents. Output is deterministic and
-never dumps whole files — the highest-value slices are packed first and
-remaining matches are listed under "omitted".
+Retrieval endpoints accept `detail=compact|standard|full`. Compact/adaptive is
+the default. Output is deterministic and avoids whole-file/source dumps unless
+the caller explicitly expands a handle or asks for `detail=full`.
 
 | Method | Endpoint | Description |
 |---|---|---|
-| GET | `/context?task=<text>&budget=<n>&format=<fmt>` | Rank context for a natural-language task |
-| GET | `/context/symbol?name=<sym>&budget=<n>&format=<fmt>` | Context anchored on a symbol |
-| GET | `/context/file?path=<path>&budget=<n>&format=<fmt>` | Context anchored on a file |
+| GET | `/context?task=<text>&detail=<mode>` | Compact context packet for a natural-language task |
+| GET | `/context/symbol?name=<sym>&detail=<mode>` | Context packet anchored on a symbol |
+| GET | `/context/file?path=<path>&detail=<mode>` | Context packet anchored on a file |
+| GET | `/context/expand?handle=<handle>` | Expand a handle returned by a context packet |
 | GET | `/stats` | Index counters (files, symbols, edges) |
 | GET | `/health` | Liveness probe |
 | POST | `/reindex` | Trigger a re-index |
@@ -46,22 +45,28 @@ remaining matches are listed under "omitted".
 ### Example
 
 ```sh
-curl 'http://127.0.0.1:8765/context?task=where+is+the+API+status+endpoint&budget=1500&format=json'
+curl 'http://127.0.0.1:8765/context?task=where+is+the+API+status+endpoint'
 ```
 
-Each selected item carries: `name`, `kind`, `file`, `line`/`end_line`, `scope`,
-`signature`, `relevance`, `reason`, a `citation` (`file:line`), an optional
-source `snippet` with `snippet_lines`, and `relationships` (callers/callees/
-references/inheritance with their own citations).
+The default response is a `CTX_PACKET`: answer map, likely edit targets,
+relevant files, symbol cards, omitted expandable handles, and accounting. It is
+self-contained for the current request but avoids full source bodies unless the
+caller explicitly expands a handle such as `expand:source:<id>`.
+`expand:entrypoints:<path>` returns exported/top-level entrypoints for a file.
+`expand:file:<path>` returns a compact file symbol map with omitted symbols left
+as handles; it is not a whole-file source dump.
+
+Use `detail=full` on the context endpoints for the older complete grouped
+module/file/symbol output.
 
 ## Retrieval model
 
 Symbols are scored by a blend of: text match over name/signature/file/scope,
-query-term coverage, symbol-kind importance, definition preference, and a vendor
-penalty. The top-ranked seeds are expanded with their call/reference/inheritance
-neighborhoods, snippets are read on demand from disk (bounded line ranges), and
-the result is greedily packed into the token budget — snippets are dropped to a
-reference-only entry before a symbol is omitted entirely.
+query-term coverage, symbol-kind importance, definition preference, graph hub
+score, and a vendor penalty. The top-ranked seeds are expanded with their
+call/reference/inheritance neighborhoods. Rendering is compact/adaptive by
+default: repeated or low-marginal-value items become expansion handles instead
+of source dumps. There is no hard context-length cap in the default policy.
 
 ## Architecture
 
@@ -76,7 +81,7 @@ reference-only entry before a symbol is omitted entirely.
   symbol kind.
 - `store/` — SQLite cache with schema/semantic versioning; stale caches rebuild
   automatically on version change (no manual delete).
-- `retrieve/` — the retrieval + budget-packing + JSON/Markdown formatting engine.
+- `retrieve/` — graph retrieval, compact context-packet rendering, and expansion handles.
 - `api/` — minimal HTTP server exposing the endpoints above.
 - `indexer/`, `watcher/`, `jobs/`, `event/` — indexing pipeline and live updates.
 - `bench/` — built-in retrieval benchmark (`--bench`).

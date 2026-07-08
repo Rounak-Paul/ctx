@@ -14,6 +14,22 @@
 #define CTX_MODULE_SIBLINGS    8     /* max co-file symbols pulled per seed   */
 #define CTX_DIR_PEERS          8     /* max peer-file names pulled per module */
 #define CTX_MIN_SCORE          6.0   /* ignore symbols below this text score  */
+#define CTX_PACKET_EDIT_TARGETS 6
+#define CTX_PACKET_SYMBOL_CARDS 24
+#define CTX_PACKET_FILE_ROWS    12
+#define CTX_PACKET_EDGE_GROUP   4
+#define CTX_FILE_EXPAND_ENTRYPOINTS 24
+#define CTX_FILE_EXPAND_INTERNALS   32
+#define CTX_FILE_EXPAND_OMITTED     24
+
+typedef enum {
+    CTX_INTENT_UNKNOWN = 0,
+    CTX_INTENT_EXPLAIN,
+    CTX_INTENT_EDIT,
+    CTX_INTENT_DEBUG,
+    CTX_INTENT_REVIEW,
+    CTX_INTENT_TRACE
+} CtxContextIntent;
 
 /* ======================================================================== */
 /* string builder                                                            */
@@ -162,6 +178,46 @@ static int kind_importance(CtxSymbolKind k) {
     }
 }
 
+/*
+ * Returns true when a symbol signature carries an explicit static marker.
+ *
+ * signature  Extracted source signature for a symbol.
+ */
+static bool has_static_storage_marker(const char *signature) {
+    if (!signature || !*signature) return false;
+    return ci_substr(signature, "static ") || ci_substr(signature, " static ") ||
+           ci_substr(signature, "static\t");
+}
+
+/*
+ * Classifies externally useful file-scope definitions for ranking and expansion.
+ *
+ * s  Symbol to classify.
+ */
+static bool symbol_is_public_entrypoint(const CtxSymbol *s) {
+    if (!s) return false;
+    if (is_vendor_path(s->file)) return false;
+    if (s->scope[0]) return false;
+    if (s->kind == CTX_SYM_FUNCTION || s->kind == CTX_SYM_METHOD) {
+        if (s->end_line <= s->line) return false;
+    } else if (s->kind == CTX_SYM_CLASS || s->kind == CTX_SYM_STRUCT ||
+               s->kind == CTX_SYM_ENUM || s->kind == CTX_SYM_TYPEDEF) {
+        if (!s->is_definition) return false;
+    } else {
+        return false;
+    }
+    return !has_static_storage_marker(s->signature);
+}
+
+/*
+ * Detects project-style public names that should break ties toward API symbols.
+ *
+ * name  Symbol name.
+ */
+static bool name_has_public_prefix(const char *name) {
+    return name && (strncmp(name, "ctx_", 4) == 0 || strncmp(name, "Ctx", 3) == 0);
+}
+
 static double score_symbol(const CtxSymbol *s, const QueryTerms *q) {
     if (s->kind == CTX_SYM_UNKNOWN) return 0;
     double score = 0;
@@ -184,6 +240,8 @@ static double score_symbol(const CtxSymbol *s, const QueryTerms *q) {
     score += covered * 8;
     score += kind_importance(s->kind);
     if (s->is_definition) score += 6;
+    if (symbol_is_public_entrypoint(s)) score += 14;
+    if (name_has_public_prefix(s->name)) score += 6;
     /* scope depth bonus: symbol in a matching scope is more specific */
     if (s->scope[0]) score += 2;
     if (is_vendor_path(s->file)) score *= 0.3;
@@ -543,6 +601,8 @@ static InvIndex *inv_build(CtxGraph *g, AdjList *al) {
             else                                                        sc = 8;
             sc += kind_importance(s->kind) + hub;
             if (s->is_definition) sc += 6;
+            if (symbol_is_public_entrypoint(s)) sc += 14;
+            if (name_has_public_prefix(s->name)) sc += 6;
             if (is_vendor_path(s->file)) sc *= 0.3;
             ie->syms[ie->count]   = s;
             ie->scores[ie->count] = sc;
@@ -749,7 +809,45 @@ static void collect_file_siblings(FileIndex *fi, const CtxSymbol *sym, SymSet *s
     for (uint32_t i = 0; i < fe->sym_count && added < CTX_MODULE_SIBLINGS; i++) {
         const CtxSymbol *s = fe->syms[i];
         if (s->id == sym->id) continue;
+        if (!symbol_is_public_entrypoint(s)) continue;
+        if (symset_add(ss, s, 45.0, "co-file entrypoint")) added++;
+    }
+    for (uint32_t i = 0; i < fe->sym_count && added < CTX_MODULE_SIBLINGS; i++) {
+        const CtxSymbol *s = fe->syms[i];
+        if (s->id == sym->id) continue;
+        if (symbol_is_public_entrypoint(s)) continue;
         if (symset_add(ss, s, 20.0, "co-file")) added++;
+    }
+}
+
+/*
+ * Pulls public entrypoints from files already represented in the symbol set.
+ *
+ * fi  Per-file symbol index.
+ * ss  Collected symbol set to enrich.
+ */
+static void collect_represented_file_entrypoints(FileIndex *fi, SymSet *ss) {
+    if (!fi || !ss) return;
+    char seen[32][4096];
+    uint32_t seen_count = 0;
+
+    uint32_t initial_count = ss->count;
+    for (uint32_t i = 0; i < initial_count && seen_count < 32 && ss->count < CTX_MAX_TRAVERSAL; i++) {
+        const char *file = ss->items[i].sym->file;
+        bool dup = false;
+        for (uint32_t j = 0; j < seen_count; j++)
+            if (!strcmp(seen[j], file)) { dup = true; break; }
+        if (dup) continue;
+        strncpy(seen[seen_count], file, sizeof(seen[0]) - 1);
+        seen[seen_count][sizeof(seen[0]) - 1] = '\0';
+        seen_count++;
+
+        FileEntry *fe = fi_get(fi, file);
+        if (!fe) continue;
+        for (uint32_t s = 0; s < fe->sym_count && ss->count < CTX_MAX_TRAVERSAL; s++) {
+            if (!symbol_is_public_entrypoint(fe->syms[s])) continue;
+            symset_add(ss, fe->syms[s], 46.0, "file entrypoint");
+        }
     }
 }
 
@@ -945,6 +1043,188 @@ static void emit_edges(SB *sb, CtxGraph *g, const CtxSymbol *s, const char *cur_
     }
 }
 
+static const char *intent_str(CtxContextIntent intent) {
+    switch (intent) {
+    case CTX_INTENT_EXPLAIN: return "explain";
+    case CTX_INTENT_EDIT:    return "edit";
+    case CTX_INTENT_DEBUG:   return "debug";
+    case CTX_INTENT_REVIEW:  return "review";
+    case CTX_INTENT_TRACE:   return "trace";
+    default:                 return "unknown";
+    }
+}
+
+static bool text_has_ci(const char *text, const char *needle) {
+    return text && needle && ci_substr(text, needle);
+}
+
+/*
+ * Classifies the retrieval query into a coarse context-packing intent.
+ *
+ * req  Retrieval request.
+ * Returns a deterministic intent used only for rendering policy.
+ */
+static CtxContextIntent detect_intent(const CtxRetrieveRequest *req) {
+    if (!req || !req->text) return CTX_INTENT_UNKNOWN;
+    if (req->kind == CTX_QUERY_SYMBOL || req->kind == CTX_QUERY_FILE)
+        return CTX_INTENT_TRACE;
+    const char *q = req->text;
+    if (text_has_ci(q, "review") || text_has_ci(q, "audit"))
+        return CTX_INTENT_REVIEW;
+    if (text_has_ci(q, "fix") || text_has_ci(q, "implement") ||
+        text_has_ci(q, "refactor") || text_has_ci(q, "change") ||
+        text_has_ci(q, "add ") || text_has_ci(q, "remove"))
+        return CTX_INTENT_EDIT;
+    if (text_has_ci(q, "bug") || text_has_ci(q, "crash") ||
+        text_has_ci(q, "freeze") || text_has_ci(q, "debug") ||
+        text_has_ci(q, "why") || text_has_ci(q, "failing"))
+        return CTX_INTENT_DEBUG;
+    if (text_has_ci(q, "trace") || text_has_ci(q, "path") ||
+        text_has_ci(q, "call chain") || text_has_ci(q, "flow"))
+        return CTX_INTENT_TRACE;
+    if (text_has_ci(q, "how") || text_has_ci(q, "explain") ||
+        text_has_ci(q, "where") || text_has_ci(q, "what"))
+        return CTX_INTENT_EXPLAIN;
+    return CTX_INTENT_UNKNOWN;
+}
+
+static size_t estimate_tokens_from_bytes(size_t bytes) {
+    return bytes / 4u + 1u;
+}
+
+static bool symbol_is_edit_target(CtxContextIntent intent, const CollectedSym *item) {
+    if (!item || !item->sym) return false;
+    if (item->sym->kind == CTX_SYM_INCLUDE || item->sym->kind == CTX_SYM_UNKNOWN)
+        return false;
+    if (intent == CTX_INTENT_EDIT || intent == CTX_INTENT_DEBUG || intent == CTX_INTENT_REVIEW)
+        return item->score >= 40.0 || !strcmp(item->reason, "query match");
+    return !strcmp(item->reason, "query match") && item->score >= 80.0;
+}
+
+static const char *handle_prefix_for_edge(const EdgeRef *ref) {
+    if (!ref) return "expand:symbol";
+    if (ref->kind == CTX_EDGE_CALLS)
+        return ref->outgoing ? "expand:callees" : "expand:callers";
+    if (ref->kind == CTX_EDGE_REFERENCES)
+        return "expand:refs";
+    return "expand:symbol";
+}
+
+static void emit_symbol_card(SB *sb, CtxGraph *g, const CollectedSym *item,
+                             CtxContextIntent intent) {
+    const CtxSymbol *s = item->sym;
+    bool edit_target = symbol_is_edit_target(intent, item);
+    sb_printf(sb, "- %s       %s", kind_str(s->kind), s->name);
+    if (s->signature[0] && s->kind != CTX_SYM_UNKNOWN)
+        sb_printf(sb, "(%s)", s->signature);
+    sb_printf(sb, "  %s:%u", s->file, s->line);
+    if (s->end_line > s->line) sb_printf(sb, "-%u", s->end_line);
+    sb_printf(sb, "  score=%.1f", item->score);
+    if (edit_target) sb_puts(sb, "  edit-target");
+    sb_puts(sb, "\n");
+    sb_printf(sb, "  role: %s", item->reason ? item->reason : "related");
+    if (s->scope[0]) sb_printf(sb, " in %s", s->scope);
+    if (is_vendor_path(s->file)) sb_puts(sb, " vendor-penalized");
+    sb_puts(sb, "\n");
+
+    EdgeRef refs[64];
+    uint32_t n = collect_all_edges(g, s->id, refs, 64);
+    uint32_t emitted = 0;
+    for (uint32_t i = 0; i < n && emitted < CTX_PACKET_EDGE_GROUP; i++) {
+        if (refs[i].kind == CTX_EDGE_REFERENCES && !refs[i].outgoing) continue;
+        sb_printf(sb, "  relation: %s %s %s:%u\n",
+                  refs[i].outgoing ? "out" : "in",
+                  refs[i].sym->name,
+                  path_basename(refs[i].sym->file),
+                  refs[i].sym->line);
+        emitted++;
+    }
+    if (n > emitted)
+        sb_printf(sb, "  more: %s:%"PRIu64"\n", handle_prefix_for_edge(n ? &refs[0] : NULL), s->id);
+    sb_printf(sb, "  expand: expand:symbol:%"PRIu64" | expand:source:%"PRIu64"\n",
+              s->id, s->id);
+}
+
+static void emit_context_packet(SB *sb, CtxGraph *g, const CtxRetrieveRequest *req,
+                                const QueryTerms *q, const SymSet *ss,
+                                char modules[][4096], uint32_t mod_count) {
+    CtxContextIntent intent = detect_intent(req);
+    char root[4096] = {0};
+    ctx_store_get_meta("root_path", root, sizeof(root));
+
+    sb_puts(sb, "CTX_PACKET\n");
+    if (root[0]) sb_printf(sb, "CODEBASE: %s\n", root);
+    sb_printf(sb, "QUERY: %s\n", req->text);
+    sb_printf(sb, "INTENT: %s\n", intent_str(intent));
+    sb_puts(sb, "DETAIL: compact-adaptive\n");
+    sb_puts(sb, "TERMS:");
+    for (uint32_t i = 0; i < q->count; i++) sb_printf(sb, " %s", q->terms[i]);
+    sb_puts(sb, "\n\n");
+
+    sb_puts(sb, "ANSWER_MAP\n");
+    sb_printf(sb, "- retrieved_symbols: %u\n", ss->count);
+    sb_printf(sb, "- represented_modules: %u\n", mod_count);
+    sb_puts(sb, "- source_policy: source bodies omitted by default; use expand:source:<id> for exact code\n");
+    sb_puts(sb, "- expansion_handles: stable per current index generation; each response remains self-contained\n\n");
+
+    sb_puts(sb, "EDIT_TARGETS\n");
+    uint32_t targets = 0;
+    for (uint32_t i = 0; i < ss->count && targets < CTX_PACKET_EDIT_TARGETS; i++) {
+        if (!symbol_is_edit_target(intent, &ss->items[i])) continue;
+        const CtxSymbol *s = ss->items[i].sym;
+        sb_printf(sb, "- %s %s  %s:%u  expand:source:%"PRIu64"\n",
+                  kind_str(s->kind), s->name, s->file, s->line, s->id);
+        targets++;
+    }
+    if (targets == 0) sb_puts(sb, "- none confidently identified; inspect top symbol cards\n");
+    sb_puts(sb, "\n");
+
+    sb_puts(sb, "RELEVANT_FILES\n");
+    uint32_t files = 0;
+    for (uint32_t m = 0; m < mod_count && files < CTX_PACKET_FILE_ROWS; m++) {
+        for (uint32_t i = 0; i < ss->count && files < CTX_PACKET_FILE_ROWS; i++) {
+            char mod[4096]; path_module(ss->items[i].sym->file, mod, sizeof(mod));
+            if (strcmp(mod, modules[m]) != 0) continue;
+            bool seen = false;
+            for (uint32_t j = 0; j < i; j++)
+                if (!strcmp(ss->items[j].sym->file, ss->items[i].sym->file)) { seen = true; break; }
+            if (seen) continue;
+            sb_printf(sb, "- %s  module=%s  expand:entrypoints:%s | expand:file:%s\n",
+                      ss->items[i].sym->file, modules[m],
+                      ss->items[i].sym->file, ss->items[i].sym->file);
+            files++;
+        }
+    }
+    sb_puts(sb, "\n");
+
+    sb_puts(sb, "SYMBOL_CARDS\n");
+    uint32_t card_count = ss->count < CTX_PACKET_SYMBOL_CARDS ? ss->count : CTX_PACKET_SYMBOL_CARDS;
+    for (uint32_t i = 0; i < card_count; i++)
+        emit_symbol_card(sb, g, &ss->items[i], intent);
+    sb_puts(sb, "\n");
+
+    sb_puts(sb, "OMITTED_EXPANDABLE\n");
+    if (ss->count > card_count) {
+        sb_printf(sb, "- symbols_omitted: %u\n", ss->count - card_count);
+        for (uint32_t i = card_count; i < ss->count && i < card_count + 16; i++) {
+            const CtxSymbol *s = ss->items[i].sym;
+            sb_printf(sb, "- %s %s  %s:%u  expand:symbol:%"PRIu64"\n",
+                      kind_str(s->kind), s->name, s->file, s->line, s->id);
+        }
+    } else {
+        sb_puts(sb, "- none\n");
+    }
+    sb_puts(sb, "\n");
+
+    sb_puts(sb, "ACCOUNTING\n");
+    sb_printf(sb, "- estimated_output_tokens: %zu\n", estimate_tokens_from_bytes(sb->len));
+    sb_printf(sb, "- symbol_cards: %u\n", card_count);
+    sb_printf(sb, "- files_represented: %u\n", files);
+    sb_printf(sb, "- source_bodies: 0\n");
+    sb_printf(sb, "- expandable_handles: %u\n", ss->count + files);
+    sb_puts(sb, "- largest_section: SYMBOL_CARDS\n");
+}
+
 /* ======================================================================== */
 /* comparison for qsort — sort collected symbols by score descending        */
 /* ======================================================================== */
@@ -1057,13 +1337,14 @@ char *ctx_retrieve(CtxGraph *g, const CtxRetrieveRequest *req) {
             traverse_from(al, g, seeds[i].sym->id, seeds[i].sym->file, ss, CTX_TRAVERSAL_DEPTH);
     }
 
-    /* Pull co-file siblings and include-chain for top seeds */
-    uint32_t top = seed_count < 8 ? seed_count : 8;
+    /* Pull co-file siblings and include-chain for the strongest seed files. */
+    uint32_t top = seed_count < 16 ? seed_count : 16;
     if (fi) {
         for (uint32_t i = 0; i < top && ss->count < CTX_MAX_TRAVERSAL; i++)
             collect_file_siblings(fi, seeds[i].sym, ss);
         for (uint32_t i = 0; i < top && ss->count < CTX_MAX_TRAVERSAL; i++)
             collect_include_chain(g, fi, seeds[i].sym, ss);
+        collect_represented_file_entrypoints(fi, ss);
     }
 
     ctx_graph_runlock(g);
@@ -1097,6 +1378,18 @@ char *ctx_retrieve(CtxGraph *g, const CtxRetrieveRequest *req) {
             if (!strcmp(modules[m], mod)) { dup = true; break; }
         if (!dup && mod_count < 64)
             strncpy(modules[mod_count++], mod, sizeof(PathBuf) - 1);
+    }
+
+    if (req->detail != CTX_RETRIEVE_DETAIL_FULL) {
+        SB packet; sb_init(&packet);
+        emit_context_packet(&packet, g, req, &q, ss, modules, mod_count);
+        ctx_graph_runlock(g);
+        free(modules);
+        CTX_LOG_DEBUG("retrieve packet '%s': %u symbols across %u modules",
+                      req->text, ss->count, mod_count);
+        fi_free(fi);
+        free(ss);
+        return packet.buf;
     }
 
     /* ---- 5. build output ---- */
@@ -1211,4 +1504,260 @@ err_oom: {
     sb_puts(&sb, "ERROR: out of memory\n");
     return sb.buf;
 }
+}
+
+static bool parse_u64(const char *text, uint64_t *out) {
+    if (!text || !*text || !out) return false;
+    char *end = NULL;
+    errno = 0;
+    uint64_t v = strtoull(text, &end, 10);
+    if (errno != 0 || !end || *end != '\0') return false;
+    *out = v;
+    return true;
+}
+
+static void emit_source_range(SB *sb, const char *file, uint32_t start, uint32_t end) {
+    FILE *fp = fopen(file, "r");
+    if (!fp) {
+        sb_printf(sb, "ERROR: cannot open source file: %s\n", file);
+        return;
+    }
+    if (end < start) end = start;
+    sb_printf(sb, "SOURCE %s:%u-%u\n", file, start, end);
+    char line[4096];
+    uint32_t lineno = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        lineno++;
+        if (lineno < start) continue;
+        if (lineno > end) break;
+        sb_printf(sb, "%5u | %s", lineno, line);
+        size_t len = strlen(line);
+        if (len == 0 || line[len - 1] != '\n') sb_puts(sb, "\n");
+    }
+    fclose(fp);
+}
+
+static void emit_symbol_expansion(SB *sb, CtxGraph *g, const CtxSymbol *s) {
+    CollectedSym item = { .sym = s, .score = 0.0, .reason = "expanded" };
+    sb_puts(sb, "CTX_EXPANSION\n");
+    emit_symbol_card(sb, g, &item, CTX_INTENT_TRACE);
+}
+
+/*
+ * Emits one compact expansion row with navigation handles.
+ *
+ * sb  Destination string builder.
+ * s   Symbol to render.
+ */
+static void emit_expand_symbol_row(SB *sb, const CtxSymbol *s) {
+    sb_printf(sb, "- %s %s", kind_str(s->kind), s->name);
+    if (s->signature[0]) sb_printf(sb, "(%s)", s->signature);
+    sb_printf(sb, "  :%u", s->line);
+    if (s->end_line > s->line) sb_printf(sb, "-%u", s->end_line);
+    sb_printf(sb, "  expand:symbol:%"PRIu64" expand:source:%"PRIu64"\n", s->id, s->id);
+}
+
+static void emit_file_expansion(SB *sb, CtxGraph *g, const char *path) {
+    sb_puts(sb, "CTX_EXPANSION\n");
+    sb_printf(sb, "FILE: %s\n", path);
+    sb_puts(sb, "DETAIL: compact-file-map\n");
+    sb_puts(sb, "SOURCE_POLICY: no source bodies; use expand:source:<id> for exact code\n\n");
+
+    const CtxSymbol *entrypoints[CTX_FILE_EXPAND_ENTRYPOINTS];
+    const CtxSymbol *internals[CTX_FILE_EXPAND_INTERNALS];
+    const CtxSymbol *omitted[CTX_FILE_EXPAND_OMITTED];
+    uint32_t entry_count = 0, internal_count = 0, omitted_count = 0;
+    uint32_t total = 0, total_entrypoints = 0, total_internals = 0;
+
+    CtxSymbol *s, *tmp;
+    HASH_ITER(hh, g->symbols, s, tmp) {
+        if (strcmp(s->file, path) != 0) continue;
+        if (s->kind == CTX_SYM_UNKNOWN) continue;
+        if (s->kind == CTX_SYM_INCLUDE) continue;
+        total++;
+        if (symbol_is_public_entrypoint(s)) {
+            total_entrypoints++;
+            if (entry_count < CTX_FILE_EXPAND_ENTRYPOINTS) {
+                entrypoints[entry_count++] = s;
+            } else if (omitted_count < CTX_FILE_EXPAND_OMITTED) {
+                omitted[omitted_count++] = s;
+            }
+            continue;
+        }
+        total_internals++;
+        if (internal_count < CTX_FILE_EXPAND_INTERNALS) {
+            internals[internal_count++] = s;
+        } else if (omitted_count < CTX_FILE_EXPAND_OMITTED) {
+            omitted[omitted_count++] = s;
+        }
+    }
+
+    sb_puts(sb, "ENTRYPOINTS\n");
+    if (entry_count == 0) {
+        sb_puts(sb, "- none\n");
+    } else {
+        for (uint32_t i = 0; i < entry_count; i++) emit_expand_symbol_row(sb, entrypoints[i]);
+    }
+    sb_puts(sb, "\nINTERNAL_SYMBOLS\n");
+    if (internal_count == 0) {
+        sb_puts(sb, "- none\n");
+    } else {
+        for (uint32_t i = 0; i < internal_count; i++) emit_expand_symbol_row(sb, internals[i]);
+    }
+
+    uint32_t listed = entry_count + internal_count;
+    uint32_t omitted_total = total > listed ? total - listed : 0;
+    sb_puts(sb, "\nOMITTED_EXPANDABLE\n");
+    if (omitted_total == 0) {
+        sb_puts(sb, "- none\n");
+    } else {
+        sb_printf(sb, "- symbols_omitted: %u\n", omitted_total);
+        for (uint32_t i = 0; i < omitted_count; i++) emit_expand_symbol_row(sb, omitted[i]);
+    }
+
+    sb_printf(sb, "\nACCOUNTING\n- symbols_total: %u\n- entrypoints_total: %u\n- internal_symbols_total: %u\n",
+              total, total_entrypoints, total_internals);
+    sb_printf(sb, "- symbols_listed: %u\n- symbols_omitted: %u\n", listed, omitted_total);
+    sb_printf(sb, "- bytes_before_accounting: %zu\n- estimated_output_tokens: %zu\n",
+              sb->len, estimate_tokens_from_bytes(sb->len));
+}
+
+/*
+ * Emits only the public entrypoints for a file.
+ *
+ * sb    Destination string builder.
+ * g     Live graph, already read-locked by caller.
+ * path  File path to inspect.
+ */
+static void emit_entrypoints_expansion(SB *sb, CtxGraph *g, const char *path) {
+    sb_puts(sb, "CTX_EXPANSION\n");
+    sb_printf(sb, "FILE: %s\n", path);
+    sb_puts(sb, "DETAIL: entrypoints-only\n\n");
+
+    uint32_t total = 0, listed = 0;
+    CtxSymbol *s, *tmp;
+    HASH_ITER(hh, g->symbols, s, tmp) {
+        if (strcmp(s->file, path) != 0) continue;
+        if (!symbol_is_public_entrypoint(s)) continue;
+        total++;
+        if (listed < CTX_FILE_EXPAND_ENTRYPOINTS) {
+            emit_expand_symbol_row(sb, s);
+            listed++;
+        }
+    }
+
+    if (total == 0)
+        sb_puts(sb, "- none; use expand:file:<path> for the compact file symbol map\n");
+    if (total > listed)
+        sb_printf(sb, "- entrypoints_omitted: %u; use expand:file:%s for additional handles\n",
+                  total - listed, path);
+    sb_printf(sb, "\nACCOUNTING\n- entrypoints_total: %u\n- entrypoints_listed: %u\n",
+              total, listed);
+    sb_printf(sb, "- bytes_before_accounting: %zu\n- estimated_output_tokens: %zu\n",
+              sb->len, estimate_tokens_from_bytes(sb->len));
+}
+
+static void emit_relation_expansion(SB *sb, CtxGraph *g, uint64_t id,
+                                    const char *title, CtxEdgeKind kind,
+                                    int direction) {
+    sb_puts(sb, "CTX_EXPANSION\n");
+    sb_printf(sb, "%s: %"PRIu64"\n", title, id);
+    uint32_t count = 0;
+    CtxEdgeEntry *e, *tmp;
+    HASH_ITER(hh, g->edges, e, tmp) {
+        bool match = false;
+        uint64_t other_id = 0;
+        if (direction > 0 && e->from_id == id) {
+            match = true; other_id = e->to_id;
+        } else if (direction < 0 && e->to_id == id) {
+            match = true; other_id = e->from_id;
+        } else if (direction == 0 && (e->from_id == id || e->to_id == id)) {
+            match = true; other_id = e->from_id == id ? e->to_id : e->from_id;
+        }
+        if (!match || e->kind != kind) continue;
+        CtxSymbol *s = ctx_graph_find_by_id_locked(g, other_id);
+        if (!s || s->kind == CTX_SYM_UNKNOWN) continue;
+        sb_printf(sb, "- %s %s  %s:%u  expand:symbol:%"PRIu64"\n",
+                  kind_str(s->kind), s->name, s->file, s->line, s->id);
+        count++;
+    }
+    sb_printf(sb, "ACCOUNTING\n- relations: %u\n- estimated_output_tokens: %zu\n",
+              count, estimate_tokens_from_bytes(sb->len));
+}
+
+char *ctx_expand_context(CtxGraph *g, const char *handle) {
+    SB sb; sb_init(&sb);
+    if (!g) {
+        sb_puts(&sb, "ERROR: no graph available\n");
+        return sb.buf;
+    }
+    if (!handle || strncmp(handle, "expand:", 7) != 0) {
+        sb_puts(&sb, "ERROR: invalid expansion handle\n");
+        return sb.buf;
+    }
+
+    const char *rest = handle + 7;
+    const char *sep = strchr(rest, ':');
+    if (!sep) {
+        sb_puts(&sb, "ERROR: invalid expansion handle\n");
+        return sb.buf;
+    }
+    char kind[32];
+    size_t kind_len = (size_t)(sep - rest);
+    if (kind_len >= sizeof(kind)) kind_len = sizeof(kind) - 1;
+    memcpy(kind, rest, kind_len);
+    kind[kind_len] = '\0';
+    const char *value = sep + 1;
+
+    ctx_graph_rlock(g);
+    if (!strcmp(kind, "file")) {
+        emit_file_expansion(&sb, g, value);
+        ctx_graph_runlock(g);
+        return sb.buf;
+    } else if (!strcmp(kind, "entrypoints")) {
+        emit_entrypoints_expansion(&sb, g, value);
+        ctx_graph_runlock(g);
+        return sb.buf;
+    }
+
+    uint64_t id = 0;
+    if (!parse_u64(value, &id)) {
+        ctx_graph_runlock(g);
+        sb_puts(&sb, "ERROR: invalid expansion id\n");
+        return sb.buf;
+    }
+    CtxSymbol *s = ctx_graph_find_by_id_locked(g, id);
+    if (!s) {
+        ctx_graph_runlock(g);
+        sb_printf(&sb, "ERROR: symbol not found for handle: %s\n", handle);
+        return sb.buf;
+    }
+
+    if (!strcmp(kind, "symbol")) {
+        emit_symbol_expansion(&sb, g, s);
+        ctx_graph_runlock(g);
+    } else if (!strcmp(kind, "source")) {
+        char file[4096];
+        uint32_t start = s->line;
+        uint32_t end = s->end_line > s->line ? s->end_line : s->line;
+        strncpy(file, s->file, sizeof(file) - 1);
+        file[sizeof(file) - 1] = '\0';
+        ctx_graph_runlock(g);
+        emit_source_range(&sb, file, start, end);
+        sb_printf(&sb, "ACCOUNTING\n- source_bodies: 1\n- estimated_output_tokens: %zu\n",
+                  estimate_tokens_from_bytes(sb.len));
+    } else if (!strcmp(kind, "callers")) {
+        emit_relation_expansion(&sb, g, id, "CALLERS", CTX_EDGE_CALLS, -1);
+        ctx_graph_runlock(g);
+    } else if (!strcmp(kind, "callees")) {
+        emit_relation_expansion(&sb, g, id, "CALLEES", CTX_EDGE_CALLS, 1);
+        ctx_graph_runlock(g);
+    } else if (!strcmp(kind, "refs")) {
+        emit_relation_expansion(&sb, g, id, "REFERENCES", CTX_EDGE_REFERENCES, 0);
+        ctx_graph_runlock(g);
+    } else {
+        ctx_graph_runlock(g);
+        sb_puts(&sb, "ERROR: unknown expansion handle kind\n");
+    }
+    return sb.buf;
 }

@@ -5,7 +5,7 @@
 /*
  * Each case asserts that every must_have token appears somewhere in the
  * retrieval output. Assertions are presence-based to stay robust as ranking
- * evolves. No budget check — output is unbounded by design now.
+ * evolves. Accounting and expansion-handle behavior are covered by live smoke.
  */
 typedef struct {
     const char *task;
@@ -19,6 +19,8 @@ static const BenchCase k_cases[] = {
       { "graph.c", "resolve_calls", NULL } },
     { "how is context retrieved for a task query",
       { "retrieve.c", NULL } },
+    { "how does the compact CTX_PACKET get generated and expanded",
+      { "ctx_retrieve", "ctx_expand_context", "expand:entrypoints", NULL } },
     { "where are symbols persisted to the database",
       { "store.c", NULL } },
     { "how does the extractor walk the AST",

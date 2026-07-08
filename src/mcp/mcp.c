@@ -58,6 +58,15 @@ static cJSON *build_tool_schema_string_prop(const char *desc) {
     return prop;
 }
 
+static CtxRetrieveDetail parse_detail_arg(cJSON *args) {
+    cJSON *detail = args ? cJSON_GetObjectItemCaseSensitive(args, "detail") : NULL;
+    if (!cJSON_IsString(detail) || !detail->valuestring)
+        return CTX_RETRIEVE_DETAIL_COMPACT;
+    if (!strcmp(detail->valuestring, "full")) return CTX_RETRIEVE_DETAIL_FULL;
+    if (!strcmp(detail->valuestring, "standard")) return CTX_RETRIEVE_DETAIL_STANDARD;
+    return CTX_RETRIEVE_DETAIL_COMPACT;
+}
+
 static cJSON *build_tools_array(void) {
     cJSON *tools = cJSON_CreateArray();
 
@@ -67,12 +76,14 @@ static cJSON *build_tools_array(void) {
         cJSON_AddStringToObject(t, "name", "get_context");
         cJSON_AddStringToObject(t, "description",
             "Retrieve structured codebase context for a task or question. "
-            "Returns all relevant symbols, call graphs, type hierarchies, and module relationships.");
+            "Returns a compact packet with symbol cards, relation summaries, and expansion handles by default.");
         cJSON *schema = cJSON_CreateObject();
         cJSON_AddStringToObject(schema, "type", "object");
         cJSON *props = cJSON_CreateObject();
         cJSON_AddItemToObject(props, "task",
             build_tool_schema_string_prop("The task or question to get context for"));
+        cJSON_AddItemToObject(props, "detail",
+            build_tool_schema_string_prop("Optional detail mode: compact, standard, or full"));
         cJSON_AddItemToObject(schema, "properties", props);
         cJSON *req = cJSON_CreateArray();
         cJSON_AddItemToArray(req, cJSON_CreateString("task"));
@@ -87,12 +98,14 @@ static cJSON *build_tools_array(void) {
         cJSON_AddStringToObject(t, "name", "get_symbol");
         cJSON_AddStringToObject(t, "description",
             "Retrieve context anchored to a specific symbol name — its definition, "
-            "callers, callees, and related types.");
+            "callers, callees, related types, and expansion handles.");
         cJSON *schema = cJSON_CreateObject();
         cJSON_AddStringToObject(schema, "type", "object");
         cJSON *props = cJSON_CreateObject();
         cJSON_AddItemToObject(props, "name",
             build_tool_schema_string_prop("Symbol name to look up"));
+        cJSON_AddItemToObject(props, "detail",
+            build_tool_schema_string_prop("Optional detail mode: compact, standard, or full"));
         cJSON_AddItemToObject(schema, "properties", props);
         cJSON *req = cJSON_CreateArray();
         cJSON_AddItemToArray(req, cJSON_CreateString("name"));
@@ -106,15 +119,36 @@ static cJSON *build_tools_array(void) {
         cJSON *t = cJSON_CreateObject();
         cJSON_AddStringToObject(t, "name", "get_file");
         cJSON_AddStringToObject(t, "description",
-            "Retrieve all symbols defined in a specific file and their relationships.");
+            "Retrieve symbols defined in a specific file and their relationship handles.");
         cJSON *schema = cJSON_CreateObject();
         cJSON_AddStringToObject(schema, "type", "object");
         cJSON *props = cJSON_CreateObject();
         cJSON_AddItemToObject(props, "path",
             build_tool_schema_string_prop("Absolute path to the file"));
+        cJSON_AddItemToObject(props, "detail",
+            build_tool_schema_string_prop("Optional detail mode: compact, standard, or full"));
         cJSON_AddItemToObject(schema, "properties", props);
         cJSON *req = cJSON_CreateArray();
         cJSON_AddItemToArray(req, cJSON_CreateString("path"));
+        cJSON_AddItemToObject(schema, "required", req);
+        cJSON_AddItemToObject(t, "inputSchema", schema);
+        cJSON_AddItemToArray(tools, t);
+    }
+
+    /* expand_context */
+    {
+        cJSON *t = cJSON_CreateObject();
+        cJSON_AddStringToObject(t, "name", "expand_context");
+        cJSON_AddStringToObject(t, "description",
+            "Expand a handle returned by get_context/get_symbol/get_file, such as expand:source:<id>, expand:entrypoints:<path>, or expand:file:<path>.");
+        cJSON *schema = cJSON_CreateObject();
+        cJSON_AddStringToObject(schema, "type", "object");
+        cJSON *props = cJSON_CreateObject();
+        cJSON_AddItemToObject(props, "handle",
+            build_tool_schema_string_prop("Expansion handle returned by ctx"));
+        cJSON_AddItemToObject(schema, "properties", props);
+        cJSON *req = cJSON_CreateArray();
+        cJSON_AddItemToArray(req, cJSON_CreateString("handle"));
         cJSON_AddItemToObject(schema, "required", req);
         cJSON_AddItemToObject(t, "inputSchema", schema);
         cJSON_AddItemToArray(tools, t);
@@ -179,9 +213,21 @@ static void handle_ping(cJSON *id) {
     send_response(r);
 }
 
-static cJSON *retrieve_to_content(CtxQueryKind kind, const char *text) {
-    CtxRetrieveRequest req = { .kind = kind, .text = text };
+static cJSON *retrieve_to_content(CtxQueryKind kind, const char *text, CtxRetrieveDetail detail) {
+    CtxRetrieveRequest req = { .kind = kind, .detail = detail, .text = text };
     char *output = ctx_retrieve(ctx_indexer_get_graph(), &req);
+
+    cJSON *content = cJSON_CreateArray();
+    cJSON *item = cJSON_CreateObject();
+    cJSON_AddStringToObject(item, "type", "text");
+    cJSON_AddStringToObject(item, "text", output ? output : "");
+    free(output);
+    cJSON_AddItemToArray(content, item);
+    return content;
+}
+
+static cJSON *expand_to_content(const char *handle) {
+    char *output = ctx_expand_context(ctx_indexer_get_graph(), handle);
 
     cJSON *content = cJSON_CreateArray();
     cJSON *item = cJSON_CreateObject();
@@ -250,17 +296,22 @@ static void handle_tools_call(cJSON *id, cJSON *params) {
     if (!strcmp(tool, "get_context")) {
         cJSON *task = args ? cJSON_GetObjectItemCaseSensitive(args, "task") : NULL;
         if (!cJSON_IsString(task)) { send_error(id, JSONRPC_INVALID_PARAMS, "missing 'task'"); return; }
-        content = retrieve_to_content(CTX_QUERY_TASK, task->valuestring);
+        content = retrieve_to_content(CTX_QUERY_TASK, task->valuestring, parse_detail_arg(args));
 
     } else if (!strcmp(tool, "get_symbol")) {
         cJSON *sym = args ? cJSON_GetObjectItemCaseSensitive(args, "name") : NULL;
         if (!cJSON_IsString(sym)) { send_error(id, JSONRPC_INVALID_PARAMS, "missing 'name'"); return; }
-        content = retrieve_to_content(CTX_QUERY_SYMBOL, sym->valuestring);
+        content = retrieve_to_content(CTX_QUERY_SYMBOL, sym->valuestring, parse_detail_arg(args));
 
     } else if (!strcmp(tool, "get_file")) {
         cJSON *path = args ? cJSON_GetObjectItemCaseSensitive(args, "path") : NULL;
         if (!cJSON_IsString(path)) { send_error(id, JSONRPC_INVALID_PARAMS, "missing 'path'"); return; }
-        content = retrieve_to_content(CTX_QUERY_FILE, path->valuestring);
+        content = retrieve_to_content(CTX_QUERY_FILE, path->valuestring, parse_detail_arg(args));
+
+    } else if (!strcmp(tool, "expand_context")) {
+        cJSON *handle = args ? cJSON_GetObjectItemCaseSensitive(args, "handle") : NULL;
+        if (!cJSON_IsString(handle)) { send_error(id, JSONRPC_INVALID_PARAMS, "missing 'handle'"); return; }
+        content = expand_to_content(handle->valuestring);
 
     } else if (!strcmp(tool, "get_stats")) {
         content = text_to_content(build_status_text(true));

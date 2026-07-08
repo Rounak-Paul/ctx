@@ -5,7 +5,7 @@
 /*
  * Runs the built-in retrieval benchmark against the live graph: a fixed set of
  * representative tasks, each asserting that expected files/symbols appear in the
- * returned context within a small token budget. Prints a pass/fail report.
+ * compact context packet. Prints a pass/fail report.
  *
  * Returns the number of failed cases (0 = all passed).
  */

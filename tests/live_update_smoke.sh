@@ -56,6 +56,22 @@ int ctx_live_beta(void) {
 SRC
 
 wait_for "new symbol" "curl -fsS 'http://127.0.0.1:$port/context/symbol?name=ctx_live_beta' | grep 'fn       ctx_live_beta'"
+curl -fsS "http://127.0.0.1:$port/context?task=fix+ctx_live_beta" > "$tmpdir/context.txt"
+grep '^CTX_PACKET' "$tmpdir/context.txt" >/dev/null
+grep '^ACCOUNTING' "$tmpdir/context.txt" >/dev/null
+grep 'expand:source:' "$tmpdir/context.txt" >/dev/null
+grep 'expand:entrypoints:' "$tmpdir/context.txt" >/dev/null
+handle=$(sed -n 's/.*\(expand:source:[0-9][0-9]*\).*/\1/p' "$tmpdir/context.txt" | head -1)
+test -n "$handle"
+curl -fsS "http://127.0.0.1:$port/context/expand?handle=$handle" | grep 'SOURCE .*live.c' >/dev/null
+curl -fsS "http://127.0.0.1:$port/context/expand?handle=expand:entrypoints:$tmpdir/live.c" > "$tmpdir/entrypoints.txt"
+grep '^DETAIL: entrypoints-only' "$tmpdir/entrypoints.txt" >/dev/null
+grep 'ctx_live_beta' "$tmpdir/entrypoints.txt" >/dev/null
+curl -fsS "http://127.0.0.1:$port/context/expand?handle=expand:file:$tmpdir/live.c" > "$tmpdir/file-expand.txt"
+grep '^DETAIL: compact-file-map' "$tmpdir/file-expand.txt" >/dev/null
+grep '^ENTRYPOINTS' "$tmpdir/file-expand.txt" >/dev/null
+grep 'symbols_total' "$tmpdir/file-expand.txt" >/dev/null
+curl -fsS "http://127.0.0.1:$port/context/symbol?name=ctx_live_beta&detail=full" | grep '^CODEBASE:' >/dev/null
 wait_for "stats freshness" "curl -fsS http://127.0.0.1:$port/stats | grep '\"watch_count\"'"
 
 cat > "$tmpdir/live.c" <<'SRC'
