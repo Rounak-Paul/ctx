@@ -16,7 +16,7 @@ static const BenchCase k_cases[] = {
     { "where is the API status endpoint implemented",
       { "api.c", "handle_stats", NULL } },
     { "how are pending semantic edges resolved",
-      { "graph.c", "resolve_calls", NULL } },
+      { "graph.c", "ctx_graph_add_pending_edge", NULL } },
     { "how is context retrieved for a task query",
       { "retrieve.c", NULL } },
     { "how does the compact CTX_PACKET get generated and expanded",

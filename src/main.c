@@ -12,6 +12,7 @@
 #include "ui/app_window.h"
 #include "bench/bench.h"
 #include "mcp/mcp.h"
+#include "install/install.h"
 
 static volatile sig_atomic_t s_quit = 0;
 static void on_sigint(int sig) { CTX_UNUSED(sig); s_quit = 1; }
@@ -168,6 +169,9 @@ int main(int argc, char *argv[])
     pthread_sigmask(SIG_BLOCK, &sig_set, NULL);
 
     CtxAppConfig cfg = ctx_app_parse_args(argc, argv);
+
+    if (cfg.install)
+        return ctx_install_run(&cfg, argv[0]) ? 0 : 1;
 
     if (!ctx_event_system_init()) {
         CTX_LOG_FATAL("Failed to init event system");

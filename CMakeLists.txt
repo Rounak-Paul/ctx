@@ -28,6 +28,7 @@ endif()
 # Threads (required by job system and file watcher)
 # --------------------------------------------------------------------------
 find_package(Threads REQUIRED)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 # --------------------------------------------------------------------------
 # tree-sitter core (force static)
@@ -263,5 +264,13 @@ if(UNIX)
     add_test(
         NAME live_update_smoke
         COMMAND /bin/sh ${CMAKE_SOURCE_DIR}/tests/live_update_smoke.sh $<TARGET_FILE:ctx>
+    )
+    add_test(
+        NAME mcp_smoke
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mcp_smoke.py $<TARGET_FILE:ctx>
+    )
+    add_test(
+        NAME install_smoke
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/install_smoke.py $<TARGET_FILE:ctx>
     )
 endif()

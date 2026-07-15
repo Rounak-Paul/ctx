@@ -64,9 +64,13 @@ grep 'expand:entrypoints:' "$tmpdir/context.txt" >/dev/null
 handle=$(sed -n 's/.*\(expand:source:[0-9][0-9]*\).*/\1/p' "$tmpdir/context.txt" | head -1)
 test -n "$handle"
 curl -fsS "http://127.0.0.1:$port/context/expand?handle=$handle" | grep 'SOURCE .*live.c' >/dev/null
+id=${handle#expand:source:}
+curl -fsS "http://127.0.0.1:$port/context/expand?handle=expand:lines:$id:1-999" | grep '^SOURCE live.c:' >/dev/null
 curl -fsS "http://127.0.0.1:$port/context/expand?handle=expand:entrypoints:$tmpdir/live.c" > "$tmpdir/entrypoints.txt"
 grep '^DETAIL: entrypoints-only' "$tmpdir/entrypoints.txt" >/dev/null
 grep 'ctx_live_beta' "$tmpdir/entrypoints.txt" >/dev/null
+grep 'live.c:' "$tmpdir/entrypoints.txt" >/dev/null
+curl -fsS "http://127.0.0.1:$port/context/expand?handle=expand:entrypoints:live.c" | grep 'ctx_live_beta' >/dev/null
 curl -fsS "http://127.0.0.1:$port/context/expand?handle=expand:file:$tmpdir/live.c" > "$tmpdir/file-expand.txt"
 grep '^DETAIL: compact-file-map' "$tmpdir/file-expand.txt" >/dev/null
 grep '^ENTRYPOINTS' "$tmpdir/file-expand.txt" >/dev/null

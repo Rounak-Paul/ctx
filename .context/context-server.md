@@ -36,6 +36,9 @@ Default output is `CTX_PACKET`, a compact/adaptive packet. It is not governed by
 a hard token cap; the renderer downgrades low-marginal-value symbols to handles
 when they repeat files/modules/relations already represented. `detail=full`
 keeps the older complete grouped module/file/symbol output for explicit callers.
+Compact packets declare `CODEBASE` once and render paths relative to that root
+where possible. `expand:file:<path>` and `expand:entrypoints:<path>` accept both
+root-relative and absolute paths.
 
 **Pipeline:**
 1. Tokenize query: stopword-filtered, light stemming (-ing/-ed/-s). Symbol/file
@@ -64,16 +67,37 @@ keeps the older complete grouped module/file/symbol output for explicit callers.
 6. File sibling pull + include-chain pull for top-16 seeds (structural locality),
    then a bounded pass pulls public entrypoints from represented files.
 7. Sort by score, emit a packet with answer map, edit targets, relevant files,
-   symbol cards, omitted expandable handles, and accounting.
+   relevant-file public entrypoint hints, symbol cards, omitted expandable
+   handles, and accounting.
 
 **API:** `/context?task=&detail=compact|standard|full`,
 `/context/symbol?name=&detail=...`, `/context/file?path=&detail=...`, and
 `/context/expand?handle=expand:...`.
 
+**MCP:** `./bin/ctx --mcp --project <repo>` runs a stdio JSON-RPC server with
+`Content-Length` framing. Tools: `get_context`, `get_symbol`, `get_file`,
+`expand_context`, `get_status`, `get_stats`. Agent flow should prefer
+`get_context` → `expand:entrypoints` → `expand:lines`, and reserve
+`expand:source` for full-body needs.
+
+**Agent install:** `./bin/ctx --install --project <repo>` writes project-local
+setup for Claude Code, Codex, and OpenCode. It creates/updates `.mcp.json`,
+`.codex/config.toml`, `opencode.json`, `AGENTS.md`, `CLAUDE.md`, and
+`.ctx/ctx-agent-instructions.md`. The installer is idempotent and replaces only
+ctx-managed text blocks. `--clients codex,claude,opencode` limits which clients
+are written. Regression coverage lives in `tests/install_smoke.py`.
+
+**MCP metadata:** Tool descriptions repeat the low-credit policy directly:
+`get_status` first when freshness matters, `get_context` before broad file
+reads, selective handle expansion, and full source/detail only as fallbacks.
+
 ## Cache/versioning (`store/store.c`, `indexer/indexer.c`)
 - `CTX_STORE_SCHEMA_VERSION` → `migrate_schema` drops stale tables on mismatch.
 - `CTX_SEMANTIC_INDEX_VERSION` (currently "5") → forces re-extraction on change.
 - Bump SCHEMA when CtxSymbol columns change; SEMANTIC when extraction changes.
+- Full indexing in `ctx_indexer_index_all()` is synchronous over `ctx_extract_file()`.
+  Do not wait on the global job pool in that path; unrelated jobs can otherwise
+  stall CLI/MCP startup at 100% progress.
 
 ## API (`api/api.c`)
 - `GET /context?task=`, `/context/symbol?name=`, `/context/file?path=`.
@@ -83,6 +107,8 @@ keeps the older complete grouped module/file/symbol output for explicit callers.
 ## Benchmark (`bench/bench.c`, `--bench`)
 - 6 presence-based cases asserting expected file/symbol names appear in output.
 - Live smoke covers packet accounting, expansion handles, and `detail=full`.
+- MCP smoke covers framed stdio initialize, tool listing, `get_context`,
+  `expand_context`, and `get_status`.
 
 ## Retrieval engine (`retrieve/retrieve.c`) — packet format
 Default output is optimised for LLM credit reduction:
@@ -105,9 +131,16 @@ ACCOUNTING
 Key format rules:
 - Every packet is self-contained: query, intent, terms, represented files, symbol
   cards, and accounting are present in each response.
+- Paths are root-relative to `CODEBASE` where possible to avoid repeating the
+  absolute project prefix in every row.
 - Full source bodies are omitted by default. Use `expand:source:<id>` only when
   exact code is needed.
+- Use `expand:lines:<id>:<start>-<end>` for exact partial source from a large
+  symbol; ranges are clamped to the symbol body.
 - `expand:entrypoints:<path>` lists public/top-level file entrypoints.
+- `RELEVANT_FILES` rows include up to three public entrypoint hints when the file
+  has likely matching API functions, avoiding a separate expansion for common
+  architecture questions.
 - `expand:file:<path>` returns a compact file symbol map grouped into
   entrypoints, internal symbols, and omitted expandable handles; it does not dump
   whole source.

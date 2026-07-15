@@ -24,8 +24,8 @@
 static void send_response(cJSON *response) {
     char *text = cJSON_PrintUnformatted(response);
     if (text) {
+        fprintf(stdout, "Content-Length: %zu\r\n\r\n", strlen(text));
         fputs(text, stdout);
-        fputc('\n', stdout);
         fflush(stdout);
         free(text);
     }
@@ -58,6 +58,16 @@ static cJSON *build_tool_schema_string_prop(const char *desc) {
     return prop;
 }
 
+static cJSON *build_detail_prop(void) {
+    cJSON *prop = build_tool_schema_string_prop("Optional detail mode. Use compact by default; full is expensive.");
+    cJSON *values = cJSON_CreateArray();
+    cJSON_AddItemToArray(values, cJSON_CreateString("compact"));
+    cJSON_AddItemToArray(values, cJSON_CreateString("standard"));
+    cJSON_AddItemToArray(values, cJSON_CreateString("full"));
+    cJSON_AddItemToObject(prop, "enum", values);
+    return prop;
+}
+
 static CtxRetrieveDetail parse_detail_arg(cJSON *args) {
     cJSON *detail = args ? cJSON_GetObjectItemCaseSensitive(args, "detail") : NULL;
     if (!cJSON_IsString(detail) || !detail->valuestring)
@@ -75,15 +85,15 @@ static cJSON *build_tools_array(void) {
         cJSON *t = cJSON_CreateObject();
         cJSON_AddStringToObject(t, "name", "get_context");
         cJSON_AddStringToObject(t, "description",
-            "Retrieve structured codebase context for a task or question. "
-            "Returns a compact packet with symbol cards, relation summaries, and expansion handles by default.");
+            "First-step codebase retrieval for a task or question. "
+            "Returns a compact CTX_PACKET with answer map, edit targets, symbol cards, relation summaries, accounting, and expansion handles. "
+            "Use this before broad source reads; do not ask for full detail unless compact context is insufficient.");
         cJSON *schema = cJSON_CreateObject();
         cJSON_AddStringToObject(schema, "type", "object");
         cJSON *props = cJSON_CreateObject();
         cJSON_AddItemToObject(props, "task",
             build_tool_schema_string_prop("The task or question to get context for"));
-        cJSON_AddItemToObject(props, "detail",
-            build_tool_schema_string_prop("Optional detail mode: compact, standard, or full"));
+        cJSON_AddItemToObject(props, "detail", build_detail_prop());
         cJSON_AddItemToObject(schema, "properties", props);
         cJSON *req = cJSON_CreateArray();
         cJSON_AddItemToArray(req, cJSON_CreateString("task"));
@@ -97,15 +107,14 @@ static cJSON *build_tools_array(void) {
         cJSON *t = cJSON_CreateObject();
         cJSON_AddStringToObject(t, "name", "get_symbol");
         cJSON_AddStringToObject(t, "description",
-            "Retrieve context anchored to a specific symbol name — its definition, "
-            "callers, callees, related types, and expansion handles.");
+            "Retrieve compact context anchored to a symbol name: likely definition, callers, callees, related types, and expansion handles. "
+            "Prefer this over scanning files when you know the symbol name.");
         cJSON *schema = cJSON_CreateObject();
         cJSON_AddStringToObject(schema, "type", "object");
         cJSON *props = cJSON_CreateObject();
         cJSON_AddItemToObject(props, "name",
             build_tool_schema_string_prop("Symbol name to look up"));
-        cJSON_AddItemToObject(props, "detail",
-            build_tool_schema_string_prop("Optional detail mode: compact, standard, or full"));
+        cJSON_AddItemToObject(props, "detail", build_detail_prop());
         cJSON_AddItemToObject(schema, "properties", props);
         cJSON *req = cJSON_CreateArray();
         cJSON_AddItemToArray(req, cJSON_CreateString("name"));
@@ -119,14 +128,14 @@ static cJSON *build_tools_array(void) {
         cJSON *t = cJSON_CreateObject();
         cJSON_AddStringToObject(t, "name", "get_file");
         cJSON_AddStringToObject(t, "description",
-            "Retrieve symbols defined in a specific file and their relationship handles.");
+            "Retrieve compact context anchored to a file. Root-relative paths are accepted. "
+            "Use for file maps and relevant symbols; it is not a whole-file source dump.");
         cJSON *schema = cJSON_CreateObject();
         cJSON_AddStringToObject(schema, "type", "object");
         cJSON *props = cJSON_CreateObject();
         cJSON_AddItemToObject(props, "path",
-            build_tool_schema_string_prop("Absolute path to the file"));
-        cJSON_AddItemToObject(props, "detail",
-            build_tool_schema_string_prop("Optional detail mode: compact, standard, or full"));
+            build_tool_schema_string_prop("Root-relative or absolute path to the file"));
+        cJSON_AddItemToObject(props, "detail", build_detail_prop());
         cJSON_AddItemToObject(schema, "properties", props);
         cJSON *req = cJSON_CreateArray();
         cJSON_AddItemToArray(req, cJSON_CreateString("path"));
@@ -140,7 +149,8 @@ static cJSON *build_tools_array(void) {
         cJSON *t = cJSON_CreateObject();
         cJSON_AddStringToObject(t, "name", "expand_context");
         cJSON_AddStringToObject(t, "description",
-            "Expand a handle returned by get_context/get_symbol/get_file, such as expand:source:<id>, expand:entrypoints:<path>, or expand:file:<path>.");
+            "Expand one handle returned by ctx. For low credit usage, prefer expand:entrypoints:<path> for public API shape and expand:lines:<id>:<start>-<end> for exact edit ranges. "
+            "Use expand:source:<id> only when the full symbol body is required, and stop expanding once the packet answers the task.");
         cJSON *schema = cJSON_CreateObject();
         cJSON_AddStringToObject(schema, "type", "object");
         cJSON *props = cJSON_CreateObject();
@@ -159,7 +169,7 @@ static cJSON *build_tools_array(void) {
         cJSON *t = cJSON_CreateObject();
         cJSON_AddStringToObject(t, "name", "get_stats");
         cJSON_AddStringToObject(t, "description",
-            "Get indexing statistics, freshness state, and watcher readiness.");
+            "Get indexing statistics, freshness state, and watcher readiness. Use this when deciding whether ctx is current enough for retrieval.");
         cJSON *schema = cJSON_CreateObject();
         cJSON_AddStringToObject(schema, "type", "object");
         cJSON_AddItemToObject(schema, "properties", cJSON_CreateObject());
@@ -172,7 +182,7 @@ static cJSON *build_tools_array(void) {
         cJSON *t = cJSON_CreateObject();
         cJSON_AddStringToObject(t, "name", "get_status");
         cJSON_AddStringToObject(t, "description",
-            "Get readiness, indexing progress, graph generation, and file watcher status.");
+            "Get readiness, indexing progress, graph generation, and file watcher status. Call this first when freshness matters; rely on retrieval after ready is true.");
         cJSON *schema = cJSON_CreateObject();
         cJSON_AddStringToObject(schema, "type", "object");
         cJSON_AddItemToObject(schema, "properties", cJSON_CreateObject());
@@ -364,23 +374,75 @@ static void dispatch(cJSON *msg) {
 void ctx_mcp_run(void) {
     CTX_LOG_INFO("MCP server ready (stdio transport)");
 
-    char  *line = NULL;
-    size_t line_cap = 0;
-    ssize_t line_len;
+    for (;;) {
+        char *line = NULL;
+        size_t line_cap = 0;
+        ssize_t line_len = getline(&line, &line_cap, stdin);
+        if (line_len == -1) {
+            free(line);
+            break;
+        }
+        if (line_len == 0 || (line_len == 1 && line[0] == '\n')) {
+            free(line);
+            continue;
+        }
 
-    while ((line_len = getline(&line, &line_cap, stdin)) != -1) {
-        if (line_len == 0 || (line_len == 1 && line[0] == '\n')) continue;
+        char *payload = NULL;
+        size_t payload_len = 0;
+        if (line[0] == '{') {
+            payload = line;
+            payload_len = (size_t)line_len;
+            line = NULL;
+        } else {
+            size_t content_length = 0;
+            for (;;) {
+                if (!strncasecmp(line, "Content-Length:", 15)) {
+                    char *p = line + 15;
+                    while (*p == ' ' || *p == '\t') p++;
+                    content_length = (size_t)strtoull(p, NULL, 10);
+                }
 
-        cJSON *msg = cJSON_ParseWithLength(line, (size_t)line_len);
+                bool header_end = !strcmp(line, "\n") || !strcmp(line, "\r\n");
+                free(line);
+                line = NULL;
+                line_cap = 0;
+                if (header_end) break;
+
+                line_len = getline(&line, &line_cap, stdin);
+                if (line_len == -1) break;
+            }
+
+            if (content_length == 0) {
+                free(line);
+                send_error(NULL, JSONRPC_INVALID_REQUEST, "missing Content-Length");
+                continue;
+            }
+
+            payload = (char *)malloc(content_length + 1);
+            if (!payload) {
+                send_error(NULL, JSONRPC_INTERNAL_ERROR, "out of memory");
+                continue;
+            }
+
+            size_t got = fread(payload, 1, content_length, stdin);
+            payload[got] = '\0';
+            payload_len = got;
+            if (got != content_length) {
+                free(payload);
+                break;
+            }
+        }
+
+        cJSON *msg = cJSON_ParseWithLength(payload, payload_len);
         if (!msg) {
+            free(payload);
             send_error(NULL, JSONRPC_PARSE_ERROR, "parse error");
             continue;
         }
 
         dispatch(msg);
         cJSON_Delete(msg);
+        free(payload);
     }
-
-    free(line);
     CTX_LOG_INFO("MCP server stdin closed, shutting down");
 }

@@ -21,8 +21,10 @@ typedef struct {
     bool  no_api;           /* true → don't start HTTP API server */
     bool  bench;            /* true → run retrieval benchmark, then exit */
     bool  mcp_mode;         /* true → run MCP server on stdio, no API, no GUI */
+    bool  install;          /* true → write agent/MCP integration files, then exit */
     int   api_port;         /* default 8765 */
     char  project_path[4096]; /* path to index; "" → cwd */
+    char  install_clients[128]; /* comma-separated client list or "all" */
     int   argc;
     char **argv;
 } CtxAppConfig;

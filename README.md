@@ -18,13 +18,47 @@ cmake --build build --parallel
 # Index a project and serve the API (no GUI):
 ./bin/ctx --no-gui --project /path/to/repo            # API on :8765
 ./bin/ctx --no-gui --no-api --project /path/to/repo   # index only, then watch
+./bin/ctx --mcp --project /path/to/repo                # MCP stdio server for agents
+./bin/ctx --install --project /path/to/repo            # write agent MCP configs
 ./bin/ctx --bench  --project /path/to/repo            # run retrieval benchmark
 ```
 
 Flags: `--project <dir>`, `--api-port <n>` (default 8765), `--no-gui`,
-`--no-api`, `--bench`. The index is cached in `~/.ctx/<hash>/index.db`; repeated
-startups load from cache and only re-extract changed files. Vendored code is
-indexed by default.
+`--no-api`, `--mcp`, `--install`, `--clients <all|codex,claude,opencode>`,
+`--bench`. The index is cached in `~/.ctx/<hash>/index.db`; repeated startups
+load from cache and only re-extract changed files. Vendored code is indexed by
+default.
+
+## Agent install
+
+Run this once per project after building ctx:
+
+```sh
+./bin/ctx --install --project /path/to/repo
+```
+
+The installer is project-scoped and idempotent. It writes:
+
+| Client | File |
+|---|---|
+| Claude Code | `.mcp.json`, `.claude/CLAUDE.md`, `.claude/settings.json`, `.claude/skills/ctx/SKILL.md`, `.claude/rules/ctx.md` |
+| Codex | `.codex/config.toml`, `.codex/skills/ctx/SKILL.md`, `AGENTS.md` |
+| OpenCode | `opencode.json` |
+| Shared instructions | `.ctx/ctx-agent-instructions.md` |
+
+Use `--clients codex`, `--clients claude`, `--clients opencode`, or a comma list
+to install only selected clients. Repeat the command after moving or rebuilding
+the ctx binary so configs point at the current executable. The generated files
+launch ctx as a local stdio MCP server:
+
+```sh
+ctx --mcp --project /path/to/repo
+```
+
+The generated instructions are part of the credit-saving contract: agents should
+call `get_status`, then one task-specific `get_context`, and expand only the
+handles needed for the next edit. Broad source scans, `detail=full`, and
+`expand:source` should be deliberate fallbacks, not the default path.
 
 ## Context API
 
@@ -54,10 +88,34 @@ self-contained for the current request but avoids full source bodies unless the
 caller explicitly expands a handle such as `expand:source:<id>`.
 `expand:entrypoints:<path>` returns exported/top-level entrypoints for a file.
 `expand:file:<path>` returns a compact file symbol map with omitted symbols left
-as handles; it is not a whole-file source dump.
+as handles; it is not a whole-file source dump. Paths inside packets are
+root-relative to `CODEBASE` when possible, and file expansion handles accept both
+root-relative and absolute paths.
+For edits that only need part of a large function, `expand:lines:<id>:<start>-<end>`
+returns an exact source range clamped to that symbol instead of the full body.
 
 Use `detail=full` on the context endpoints for the older complete grouped
 module/file/symbol output.
+
+## MCP
+
+For agentic coding, prefer MCP over manually calling HTTP endpoints. Start ctx
+with:
+
+```sh
+./bin/ctx --mcp --project /path/to/repo
+```
+
+The MCP server uses stdio JSON-RPC with `Content-Length` framing and exposes:
+`get_context`, `get_symbol`, `get_file`, `expand_context`, `get_status`, and
+`get_stats`. The intended credit-saving flow is:
+
+1. Call `get_status` when freshness matters; rely on retrieval after `ready` is true.
+2. Call `get_context` first for the concrete task.
+3. Use `expand:entrypoints:<path>` for file-level API surface.
+4. Use `expand:lines:<id>:<start>-<end>` for exact edit context.
+5. Use `expand:source:<id>` only when the full symbol body is actually needed.
+6. Stop expanding when the packet answers the question.
 
 ## Retrieval model
 

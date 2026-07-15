@@ -48,6 +48,7 @@ char *ctx_retrieve(CtxGraph *g, const CtxRetrieveRequest *req);
  *   expand:file:<path>
  *   expand:entrypoints:<path>
  *   expand:source:<id>
+ *   expand:lines:<id>:<start>-<end>
  *   expand:callers:<id>
  *   expand:callees:<id>
  *   expand:refs:<id>

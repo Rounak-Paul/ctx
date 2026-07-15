@@ -3,7 +3,6 @@
 #include "../extractor/extractor.h"
 #include "../parser/parser.h"
 #include "../event/event.h"
-#include "../jobs/jobs.h"
 #include "../log/log.h"
 #include "../stats/stats.h"
 
@@ -257,8 +256,6 @@ void ctx_indexer_index_all(void) {
 
         status_set_progress(stale.count, i + 1, true);
     }
-
-    ctx_jobs_wait_all();
 
     uint32_t resolved = ctx_graph_resolve_calls(s_graph);
 
