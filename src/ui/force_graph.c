@@ -55,6 +55,13 @@ typedef struct {
     float color[4];
 } GraphVertex;
 
+/* Host-visible vertex storage owned by one Causality frame-in-flight slot. */
+typedef struct {
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    VkDeviceSize capacity;
+} GraphVertexSlot;
+
 struct CtxForceGraph {
     ForceNode *nodes;
     ForceEdge *edges;
@@ -64,9 +71,7 @@ struct CtxForceGraph {
 
     Ca_Viewport *viewport;
     VkDevice device;
-    VkBuffer vertex_buffer;
-    VkDeviceMemory vertex_memory;
-    VkDeviceSize vertex_capacity;
+    GraphVertexSlot vertex_slots[CA_FRAMES_IN_FLIGHT];
     VkPipelineLayout pipeline_layout;
     VkPipeline pipeline;
     VkPipeline halo_pipeline;  /* max-blend pipeline for module halos */
@@ -359,20 +364,39 @@ static void free_candidates(Candidate *candidates, Candidate **ordered)
     free(ordered);
 }
 
-static bool create_or_resize_vertex_buffer(CtxForceGraph *view, Ca_Instance *inst, VkDeviceSize required)
+/**
+ * Destroys a vertex slot's buffer and memory. The caller guarantees the GPU no
+ * longer references them.
+ *
+ * dev   Device that owns the slot's objects.
+ * slot  Slot to release; reset to an empty state.
+ */
+static void destroy_vertex_slot(VkDevice dev, GraphVertexSlot *slot)
 {
-    if (view->vertex_buffer != VK_NULL_HANDLE && view->vertex_capacity >= required)
+    if (slot->buffer != VK_NULL_HANDLE)
+        vkDestroyBuffer(dev, slot->buffer, NULL);
+    if (slot->memory != VK_NULL_HANDLE)
+        vkFreeMemory(dev, slot->memory, NULL);
+    *slot = (GraphVertexSlot){0};
+}
+
+/**
+ * Ensures a frame slot's vertex buffer holds at least `required` bytes.
+ * Only called from the viewport render callback, where Causality has already
+ * waited on this slot's fence, so replacing the slot's buffer is safe.
+ *
+ * slot      Frame-in-flight slot being recorded.
+ * inst      Causality instance providing the device and memory types.
+ * required  Minimum buffer size in bytes.
+ * Returns   true when the slot has a bound buffer of sufficient capacity.
+ */
+static bool create_or_resize_vertex_buffer(GraphVertexSlot *slot, Ca_Instance *inst, VkDeviceSize required)
+{
+    if (slot->buffer != VK_NULL_HANDLE && slot->capacity >= required)
         return true;
 
     VkDevice dev = ca_gpu_device(inst);
-    if (view->vertex_buffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(dev, view->vertex_buffer, NULL);
-        view->vertex_buffer = VK_NULL_HANDLE;
-    }
-    if (view->vertex_memory != VK_NULL_HANDLE) {
-        vkFreeMemory(dev, view->vertex_memory, NULL);
-        view->vertex_memory = VK_NULL_HANDLE;
-    }
+    destroy_vertex_slot(dev, slot);
 
     VkBufferCreateInfo bi = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -380,16 +404,17 @@ static bool create_or_resize_vertex_buffer(CtxForceGraph *view, Ca_Instance *ins
         .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
-    if (vkCreateBuffer(dev, &bi, NULL, &view->vertex_buffer) != VK_SUCCESS)
+    if (vkCreateBuffer(dev, &bi, NULL, &slot->buffer) != VK_SUCCESS) {
+        slot->buffer = VK_NULL_HANDLE;
         return false;
+    }
 
     VkMemoryRequirements req;
-    vkGetBufferMemoryRequirements(dev, view->vertex_buffer, &req);
+    vkGetBufferMemoryRequirements(dev, slot->buffer, &req);
     uint32_t type = ca_gpu_find_memory_type(inst, req.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (type == UINT32_MAX) {
-        vkDestroyBuffer(dev, view->vertex_buffer, NULL);
-        view->vertex_buffer = VK_NULL_HANDLE;
+        destroy_vertex_slot(dev, slot);
         return false;
     }
 
@@ -398,13 +423,16 @@ static bool create_or_resize_vertex_buffer(CtxForceGraph *view, Ca_Instance *ins
         .allocationSize = req.size,
         .memoryTypeIndex = type,
     };
-    if (vkAllocateMemory(dev, &ai, NULL, &view->vertex_memory) != VK_SUCCESS) {
-        vkDestroyBuffer(dev, view->vertex_buffer, NULL);
-        view->vertex_buffer = VK_NULL_HANDLE;
+    if (vkAllocateMemory(dev, &ai, NULL, &slot->memory) != VK_SUCCESS) {
+        slot->memory = VK_NULL_HANDLE;
+        destroy_vertex_slot(dev, slot);
         return false;
     }
-    vkBindBufferMemory(dev, view->vertex_buffer, view->vertex_memory, 0);
-    view->vertex_capacity = required;
+    if (vkBindBufferMemory(dev, slot->buffer, slot->memory, 0) != VK_SUCCESS) {
+        destroy_vertex_slot(dev, slot);
+        return false;
+    }
+    slot->capacity = required;
     return true;
 }
 
@@ -414,6 +442,9 @@ static bool create_pipeline(CtxForceGraph *view, Ca_Instance *inst, VkFormat for
         return true;
 
     VkDevice dev = ca_gpu_device(inst);
+    if (view->pipeline != VK_NULL_HANDLE || view->halo_pipeline != VK_NULL_HANDLE ||
+        view->pipeline_layout != VK_NULL_HANDLE)
+        vkDeviceWaitIdle(dev);
     if (view->pipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(dev, view->pipeline, NULL);
         view->pipeline = VK_NULL_HANDLE;
@@ -427,8 +458,8 @@ static bool create_pipeline(CtxForceGraph *view, Ca_Instance *inst, VkFormat for
         view->pipeline_layout = VK_NULL_HANDLE;
     }
 
-    VkShaderModule vs = ca_shader_compile(dev, GRAPH_VERT_GLSL, VK_SHADER_STAGE_VERTEX_BIT);
-    VkShaderModule fs = ca_shader_compile(dev, GRAPH_FRAG_GLSL, VK_SHADER_STAGE_FRAGMENT_BIT);
+    VkShaderModule vs = ca_shader_compile(inst, GRAPH_VERT_GLSL, VK_SHADER_STAGE_VERTEX_BIT);
+    VkShaderModule fs = ca_shader_compile(inst, GRAPH_FRAG_GLSL, VK_SHADER_STAGE_FRAGMENT_BIT);
     if (vs == VK_NULL_HANDLE || fs == VK_NULL_HANDLE) {
         if (vs) vkDestroyShaderModule(dev, vs, NULL);
         if (fs) vkDestroyShaderModule(dev, fs, NULL);
@@ -953,12 +984,14 @@ static void graph_render(Ca_Viewport *viewport, void *user_data)
         max_vertices = 3u;
 
     VkDeviceSize required = (VkDeviceSize)max_vertices * sizeof(GraphVertex);
+    uint32_t frame_slot = ca_viewport_frame_index(viewport);
+    GraphVertexSlot *slot = frame_slot < CA_FRAMES_IN_FLIGHT ? &view->vertex_slots[frame_slot] : NULL;
     uint32_t vertex_count = 0;
-    if (create_pipeline(view, inst, format) && create_or_resize_vertex_buffer(view, inst, required)) {
+    if (slot && create_pipeline(view, inst, format) && create_or_resize_vertex_buffer(slot, inst, required)) {
         GraphVertex *mapped = NULL;
-        if (vkMapMemory(dev, view->vertex_memory, 0, required, 0, (void **)&mapped) == VK_SUCCESS) {
+        if (vkMapMemory(dev, slot->memory, 0, required, 0, (void **)&mapped) == VK_SUCCESS) {
             vertex_count = build_vertices(view, mapped, max_vertices);
-            vkUnmapMemory(dev, view->vertex_memory);
+            vkUnmapMemory(dev, slot->memory);
             view->gpu_ready = true;
         } else {
             view->gpu_ready = false;
@@ -995,7 +1028,7 @@ static void graph_render(Ca_Viewport *viewport, void *user_data)
     vkCmdSetScissor(cmd, 0, 1, &sc);
     if (view->gpu_ready && vertex_count > 0) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, view->pipeline);
-        vkCmdBindVertexBuffers(cmd, 0, 1, &view->vertex_buffer, &off);
+        vkCmdBindVertexBuffers(cmd, 0, 1, &slot->buffer, &off);
         vkCmdPushConstants(cmd, view->pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
         vkCmdDraw(cmd, vertex_count, 1, 0, 0);
     } else {
@@ -1135,10 +1168,9 @@ void ctx_force_graph_destroy(CtxForceGraph *view)
 {
     if (!view) return;
     if (view->device != VK_NULL_HANDLE) {
-        if (view->vertex_buffer != VK_NULL_HANDLE)
-            vkDestroyBuffer(view->device, view->vertex_buffer, NULL);
-        if (view->vertex_memory != VK_NULL_HANDLE)
-            vkFreeMemory(view->device, view->vertex_memory, NULL);
+        vkDeviceWaitIdle(view->device);
+        for (uint32_t i = 0; i < CA_FRAMES_IN_FLIGHT; ++i)
+            destroy_vertex_slot(view->device, &view->vertex_slots[i]);
         if (view->pipeline != VK_NULL_HANDLE)
             vkDestroyPipeline(view->device, view->pipeline, NULL);
         if (view->halo_pipeline != VK_NULL_HANDLE)

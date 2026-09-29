@@ -15,7 +15,21 @@
 #include "install/install.h"
 
 static volatile sig_atomic_t s_quit = 0;
-static void on_sigint(int sig) { CTX_UNUSED(sig); s_quit = 1; }
+
+/**
+ * SIGINT/SIGTERM handler: flags shutdown for the CLI wait loop and asks the
+ * GUI loop, when running, to close.
+ *
+ * sig  Signal number (unused).
+ */
+static void on_sigint(int sig)
+{
+    CTX_UNUSED(sig);
+    s_quit = 1;
+#ifdef CTX_HAS_CAUSALITY
+    ctx_ui_request_close();
+#endif
+}
 
 typedef struct {
     CtxFileEventKind kind;

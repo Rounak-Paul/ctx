@@ -128,6 +128,7 @@ endforeach()
 if(Vulkan_FOUND AND CAUSALITY_VENDORS_READY)
     message(STATUS "Vulkan found — causality visualization will be built")
     add_compile_definitions(CTX_HAS_CAUSALITY)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
     add_subdirectory(vendors/causality EXCLUDE_FROM_ALL)
     target_compile_definitions(causality PRIVATE NDEBUG)
     set(CTX_CAUSALITY_LIB causality)
@@ -240,8 +241,15 @@ if(Vulkan_FOUND AND CAUSALITY_VENDORS_READY)
         )
     else()
         # macOS / Windows — no circular dep issues
-        target_link_libraries(ctx PRIVATE ${CTX_CAUSALITY_LIB})
+        target_link_libraries(ctx PRIVATE ${CTX_CAUSALITY_LIB} Vulkan::Vulkan)
     endif()
+
+    # <ca_gpu.h> exposes Vulkan and VMA types; Causality links both privately,
+    # so consumers of the native GPU surface provide them. VMA is added as a
+    # system include to keep its header diagnostics out of ctx warnings.
+    target_include_directories(ctx SYSTEM PRIVATE
+        $<TARGET_PROPERTY:VulkanMemoryAllocator,INTERFACE_INCLUDE_DIRECTORIES>
+    )
 endif()
 
 # Platform-specific link libs for file watcher

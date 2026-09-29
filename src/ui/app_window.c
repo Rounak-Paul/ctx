@@ -12,6 +12,7 @@
 #include "force_graph.h"
 
 #include <ctype.h>
+#include <signal.h>
 
 /* ca_input_key_pressed() takes a raw GLFW key code; GLFW's headers are not on
  * this target's include path, so mirror the one constant we need. */
@@ -142,6 +143,7 @@ typedef struct {
 } AppState;
 
 static AppState s;
+static volatile sig_atomic_t s_close_requested = 0;
 
 #if defined(CTX_PLATFORM_WINDOWS)
 static CRITICAL_SECTION s_ui_lock;
@@ -1615,6 +1617,11 @@ static void build_content(Ca_Div *div, void *ud)
 /* ============================================================
    Entry point
    ============================================================ */
+void ctx_ui_request_close(void)
+{
+    s_close_requested = 1;
+}
+
 bool ctx_ui_run(void)
 {
 #if defined(CTX_PLATFORM_WINDOWS)
@@ -1714,6 +1721,7 @@ bool ctx_ui_run(void)
     ca_ui_end();
 
     while (ca_instance_tick(s.inst)) {
+        if (s_close_requested) s.closing = true;
         if (s.closing) ca_window_close(s.win);
     }
 
