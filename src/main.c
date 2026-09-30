@@ -13,6 +13,8 @@
 #include "bench/bench.h"
 #include "mcp/mcp.h"
 #include "install/install.h"
+#include "model/model.h"
+#include "search/search.h"
 
 static volatile sig_atomic_t s_quit = 0;
 
@@ -35,7 +37,19 @@ typedef struct {
     CtxFileEventKind kind;
     char path[CTX_WATCHER_PATH_MAX];
     char old_path[CTX_WATCHER_PATH_MAX];
+    bool is_dir;
 } FileChangeJob;
+
+/* Paths with a file-change job queued but not yet started. Further events for
+   the same path are dropped until the job starts, collapsing event bursts
+   into one incremental update. */
+typedef struct {
+    char path[CTX_WATCHER_PATH_MAX];
+    UT_hash_handle hh;
+} PendingPath;
+
+static pthread_mutex_t s_pending_lock = PTHREAD_MUTEX_INITIALIZER;
+static PendingPath *s_pending_paths = NULL;
 
 static pthread_mutex_t s_reindex_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool s_reindex_pending = false;
@@ -82,12 +96,71 @@ static void request_full_reindex(void)
     }
 }
 
+/**
+ * Removes path from the pending set so changes arriving from here on queue a
+ * new job, since this job may read the file before they land.
+ *
+ * path  Path whose queued job is starting.
+ */
+static void pending_path_release(const char *path)
+{
+    pthread_mutex_lock(&s_pending_lock);
+    PendingPath *entry = NULL;
+    HASH_FIND_STR(s_pending_paths, path, entry);
+    if (entry) {
+        HASH_DEL(s_pending_paths, entry);
+        free(entry);
+    }
+    pthread_mutex_unlock(&s_pending_lock);
+}
+
+/**
+ * Adds path to the pending set.
+ *
+ * path     Path about to have a job queued.
+ * Returns  false when a job for path is already queued or on allocation
+ *          failure; the caller must not queue another job.
+ */
+static bool pending_path_claim(const char *path)
+{
+    pthread_mutex_lock(&s_pending_lock);
+    PendingPath *entry = NULL;
+    HASH_FIND_STR(s_pending_paths, path, entry);
+    if (entry) {
+        pthread_mutex_unlock(&s_pending_lock);
+        return false;
+    }
+    entry = calloc(1, sizeof(*entry));
+    if (!entry) {
+        pthread_mutex_unlock(&s_pending_lock);
+        return false;
+    }
+    snprintf(entry->path, sizeof(entry->path), "%s", path);
+    HASH_ADD_STR(s_pending_paths, path, entry);
+    pthread_mutex_unlock(&s_pending_lock);
+    return true;
+}
+
+/** Frees every pending-path entry. Called after the job system has stopped. */
+static void pending_paths_clear(void)
+{
+    pthread_mutex_lock(&s_pending_lock);
+    PendingPath *entry, *tmp;
+    HASH_ITER(hh, s_pending_paths, entry, tmp) {
+        HASH_DEL(s_pending_paths, entry);
+        free(entry);
+    }
+    pthread_mutex_unlock(&s_pending_lock);
+}
+
 static void file_change_job_fn(void *user_data)
 {
     FileChangeJob *job = user_data;
     if (!job) return;
+    if (!job->old_path[0])
+        pending_path_release(job->path);
 
-    if (is_dir_path(job->path)) {
+    if (job->is_dir || is_dir_path(job->path)) {
         request_full_reindex();
         free(job);
         return;
@@ -106,13 +179,23 @@ static void on_file_change(const CtxEvent *ev, void *user_data)
     if (!fe) return;
     if (fe->kind == CTX_FILE_EVENT_CREATED  || fe->kind == CTX_FILE_EVENT_MODIFIED ||
         fe->kind == CTX_FILE_EVENT_DELETED  || fe->kind == CTX_FILE_EVENT_RENAMED) {
+        /* Renames carry an old path that must be processed, so only
+           single-path events are coalesced. */
+        bool coalesce = fe->old_path[0] == '\0';
+        if (coalesce && !pending_path_claim(fe->path)) return;
         FileChangeJob *job = calloc(1, sizeof(*job));
-        if (!job) return;
+        if (!job) {
+            if (coalesce) pending_path_release(fe->path);
+            return;
+        }
         job->kind = fe->kind;
+        job->is_dir = fe->is_dir;
         snprintf(job->path, sizeof(job->path), "%s", fe->path);
         snprintf(job->old_path, sizeof(job->old_path), "%s", fe->old_path);
-        if (!ctx_job_submit(file_change_job_fn, job, CTX_JOB_PRIORITY_HIGH))
+        if (!ctx_job_submit(file_change_job_fn, job, CTX_JOB_PRIORITY_HIGH)) {
+            if (coalesce) pending_path_release(fe->path);
             free(job);
+        }
     }
 }
 
@@ -166,6 +249,7 @@ int main(int argc, char *argv[])
     bool indexer_ready = false;
     bool api_ready = false;
     bool idx_started = false;
+    bool search_ready = false;
 
 #ifdef NDEBUG
     ctx_log_init(CTX_LOG_INFO);
@@ -226,7 +310,11 @@ int main(int argc, char *argv[])
     ctx_event_subscribe(CTX_EVENT_FILE_DELETED,  on_file_change, NULL);
     ctx_event_subscribe(CTX_EVENT_FILE_RENAMED,  on_file_change, NULL);
 
-    if (watcher_ready) ctx_watcher_add(cfg.project_path, true);
+    if (watcher_ready) {
+        ctx_watcher_set_dir_filter(ctx_indexer_skips_dir_name);
+        if (ctx_watcher_add(cfg.project_path, true) == CTX_WATCH_HANDLE_INVALID)
+            CTX_LOG_WARN("Unable to watch %s; live updates disabled", cfg.project_path);
+    }
 
     if (pthread_create(&s_idx_thread, NULL, index_thread, NULL) != 0) {
         CTX_LOG_FATAL("Failed to start index thread: %s", strerror(errno));
@@ -235,6 +323,12 @@ int main(int argc, char *argv[])
     }
     idx_started = true;
 
+    if (!cfg.bench) {
+        ctx_models_start(!cfg.no_models);
+        ctx_search_start(ctx_indexer_get_graph());
+        search_ready = true;
+    }
+
     if (cfg.bench) {
         cli_progress_loop();
         exit_code = ctx_bench_run(ctx_indexer_get_graph());
@@ -242,7 +336,6 @@ int main(int argc, char *argv[])
     }
 
     if (cfg.mcp_mode) {
-        cli_progress_loop();
         ctx_mcp_run();
         goto shutdown;
     }
@@ -287,6 +380,9 @@ shutdown:
         s_idx_joined = true;
     }
     if (jobs_ready) ctx_jobs_shutdown();
+    if (search_ready) ctx_search_stop();
+    ctx_models_stop();
+    pending_paths_clear();
     if (indexer_ready) ctx_indexer_shutdown();
     if (parser_ready) ctx_parser_shutdown();
 

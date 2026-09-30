@@ -23,6 +23,8 @@ CtxAppConfig ctx_app_parse_args(int argc, char **argv)
             cfg.gui_mode = false;
         } else if (!strcmp(argv[i], "--no-api")) {
             cfg.no_api = true;
+        } else if (!strcmp(argv[i], "--no-models")) {
+            cfg.no_models = true;
         } else if (!strcmp(argv[i], "--bench")) {
             cfg.bench    = true;
             cfg.gui_mode = false;
@@ -45,6 +47,16 @@ CtxAppConfig ctx_app_parse_args(int argc, char **argv)
         }
     }
 
+    /* One canonical root form for the indexer, store and watchers: stored and
+       watched paths are built as root + "/" + relative, so a trailing slash
+       would produce "root//x" keys that never match watcher events. */
+    size_t root_len = strlen(cfg.project_path);
+    while (root_len > 1 && cfg.project_path[root_len - 1] == '/')
+        cfg.project_path[--root_len] = '\0';
+    if (root_len == 0 &&
+        !getcwd(cfg.project_path, sizeof(cfg.project_path)))
+        snprintf(cfg.project_path, sizeof(cfg.project_path), ".");
+
 #ifndef CTX_HAS_CAUSALITY
     CTX_UNUSED(argc);
     CTX_UNUSED(argv);
@@ -55,5 +67,6 @@ CtxAppConfig ctx_app_parse_args(int argc, char **argv)
     CTX_LOG_INFO("MCP mode     : %s", cfg.mcp_mode  ? "yes" : "no");
     CTX_LOG_INFO("Install mode : %s", cfg.install   ? "yes" : "no");
     CTX_LOG_INFO("API enabled  : %s (port %d)", cfg.no_api ? "no" : "yes", cfg.api_port);
+    CTX_LOG_INFO("Models       : %s", cfg.no_models ? "disabled" : "enabled");
     return cfg;
 }

@@ -5,6 +5,7 @@
 #include "../stats/stats.h"
 #include "../log/log.h"
 #include "../jobs/jobs.h"
+#include "../tools/tools.h"
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -70,10 +71,10 @@ static CtxRetrieveDetail parse_detail_param(const char *detail) {
 }
 
 /* ---- parse first line of HTTP request ---- */
-typedef struct { char method[8]; char path[512]; char query[512]; } HttpReq;
+typedef struct { char method[8]; char path[512]; char query[8192]; } HttpReq;
 
 static bool parse_request(int fd, HttpReq *req) {
-    char buf[2048]; int n = 0, cap = (int)sizeof(buf) - 1;
+    char buf[16384]; int n = 0, cap = (int)sizeof(buf) - 1;
     /* Read until we have at least the first line */
     while (n < cap) {
         int r = (int)recv(fd, buf + n, (size_t)(cap - n), 0);
@@ -102,36 +103,58 @@ static bool parse_request(int fd, HttpReq *req) {
     return true;
 }
 
-static char *get_param(const char *query, const char *key) {
-    /* Returns heap-allocated value for key= in query string, or NULL */
-    size_t klen = strlen(key);
-    const char *p = query;
-    while (*p) {
-        if (!strncmp(p, key, klen) && p[klen] == '=') {
-            p += klen + 1;
-            const char *end = strchr(p, '&');
-            size_t vlen = end ? (size_t)(end - p) : strlen(p);
-            char *val = (char *)malloc(vlen + 1);
-            if (!val) return NULL;
-            /* URL-decode: '+' → space, %XX → byte */
-            size_t w = 0;
-            for (size_t i = 0; i < vlen; i++) {
-                if (p[i] == '+') { val[w++] = ' '; }
-                else if (p[i] == '%' && i + 2 < vlen &&
-                         isxdigit((unsigned char)p[i+1]) && isxdigit((unsigned char)p[i+2])) {
-                    char hex[3] = { p[i+1], p[i+2], 0 };
-                    val[w++] = (char)strtol(hex, NULL, 16);
-                    i += 2;
-                } else { val[w++] = p[i]; }
-            }
-            val[w] = '\0';
-            return val;
+/* Heap copy of p[0..len) with '+' → space and %XX decoded, or NULL. */
+static char *url_decode(const char *p, size_t len) {
+    char *val = (char *)malloc(len + 1);
+    if (!val) return NULL;
+    size_t w = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] == '+') {
+            val[w++] = ' ';
+        } else if (p[i] == '%' && i + 2 < len &&
+                   isxdigit((unsigned char)p[i + 1]) && isxdigit((unsigned char)p[i + 2])) {
+            char hex[3] = { p[i + 1], p[i + 2], 0 };
+            val[w++] = (char)strtol(hex, NULL, 16);
+            i += 2;
+        } else {
+            val[w++] = p[i];
         }
-        p = strchr(p, '&');
-        if (!p) break;
-        p++;
+    }
+    val[w] = '\0';
+    return val;
+}
+
+/* Returns the heap-allocated, URL-decoded value for key= in query, or NULL. */
+static char *get_param(const char *query, const char *key) {
+    size_t klen = strlen(key);
+    for (const char *p = query; p && *p; ) {
+        const char *end = strchr(p, '&');
+        size_t plen = end ? (size_t)(end - p) : strlen(p);
+        if (plen > klen && !strncmp(p, key, klen) && p[klen] == '=')
+            return url_decode(p + klen + 1, plen - klen - 1);
+        p = end ? end + 1 : NULL;
     }
     return NULL;
+}
+
+/* Converts a query string into a JSON object of decoded string values. */
+static cJSON *query_to_json(const char *query) {
+    cJSON *obj = cJSON_CreateObject();
+    for (const char *p = query; p && *p; ) {
+        const char *end = strchr(p, '&');
+        size_t plen = end ? (size_t)(end - p) : strlen(p);
+        const char *eq = memchr(p, '=', plen);
+        if (eq && eq > p) {
+            char *k = url_decode(p, (size_t)(eq - p));
+            char *v = url_decode(eq + 1, plen - (size_t)(eq - p) - 1);
+            if (k && v && !cJSON_GetObjectItemCaseSensitive(obj, k))
+                cJSON_AddStringToObject(obj, k, v);
+            free(k);
+            free(v);
+        }
+        p = end ? end + 1 : NULL;
+    }
+    return obj;
 }
 
 /* ---- route handlers ---- */
@@ -258,12 +281,44 @@ static void handle_context_expand(int fd, const char *query) {
     free(handle);
 }
 
+static void handle_tools_list(int fd) {
+    cJSON *arr = cJSON_CreateArray();
+    for (uint32_t i = 0; i < ctx_tools_count(); i++) {
+        const CtxToolSpec *spec = ctx_tools_at(i);
+        cJSON *t = cJSON_CreateObject();
+        cJSON_AddStringToObject(t, "name", spec->name);
+        cJSON_AddStringToObject(t, "description", spec->description);
+        cJSON_AddItemToObject(t, "inputSchema", ctx_tools_input_schema(spec));
+        cJSON_AddItemToArray(arr, t);
+    }
+    char *json = cJSON_PrintUnformatted(arr);
+    cJSON_Delete(arr);
+    send_json(fd, 200, json ? json : "[]");
+    free(json);
+}
+
+static void handle_tool(int fd, const char *name, const char *query) {
+    if (!ctx_tools_find(name)) {
+        send_json(fd, 404, "{\"error\":\"unknown tool\"}");
+        return;
+    }
+    cJSON *args = query_to_json(query);
+    bool is_error = false;
+    char *text = ctx_tools_call(name, args, &is_error);
+    cJSON_Delete(args);
+    send_response(fd, is_error ? 400 : 200, "text/plain", text);
+    free(text);
+    ctx_stats_record_query(name, 0);
+}
+
 static void handle_request(int fd) {
     HttpReq req = {0};
     if (!parse_request(fd, &req)) { close(fd); return; }
     CTX_LOG_DEBUG("API %s %s", req.method, req.path);
 
     if (!strcmp(req.path, "/health"))              handle_health(fd);
+    else if (!strcmp(req.path, "/tools"))          handle_tools_list(fd);
+    else if (!strncmp(req.path, "/tool/", 6))      handle_tool(fd, req.path + 6, req.query);
     else if (!strcmp(req.path, "/context"))        handle_context(fd, req.query, NULL);
     else if (!strcmp(req.path, "/context/symbol")) handle_context(fd, req.query, "symbol");
     else if (!strcmp(req.path, "/context/file"))   handle_context(fd, req.query, "file");

@@ -59,7 +59,7 @@ def main():
         require(f'"{ctx_bin}"' in codex, "codex config missing ctx binary")
         require(f'"{resolved_project}"' in codex, "codex config missing project path")
         codex_skill = (project / ".codex" / "skills" / "ctx" / "SKILL.md").read_text()
-        require("get_context" in codex_skill, "codex skill missing retrieval policy")
+        require("`search`" in codex_skill, "codex skill missing tool policy")
 
         claude = json.loads((project / ".mcp.json").read_text())
         require(claude["mcpServers"]["ctx"]["command"] == str(ctx_bin), "claude command mismatch")
@@ -84,10 +84,10 @@ def main():
         require(agents.count("BEGIN ctx managed") == 1, "AGENTS block duplicated")
         require(claude_md.count("BEGIN ctx managed") == 1, "CLAUDE block duplicated")
         require(claude_settings["$schema"] == "https://json.schemastore.org/claude-code-settings.json", "claude settings schema missing")
-        require("get_context" in claude_skill, "claude skill missing retrieval policy")
-        require("get_status" in claude_rule, "claude rule missing retrieval policy")
+        require("`search`" in claude_skill, "claude skill missing tool policy")
+        require("`impact`" in claude_rule, "claude rule missing tool policy")
         require(not (project / "CLAUDE.md").exists(), "installer wrote root CLAUDE.md instead of .claude/CLAUDE.md")
-        require("expand:lines" in shared, "shared instructions missing selective expansion policy")
+        require("`outline`" in shared and "`source`" in shared, "shared instructions missing tool policy")
 
     return 0
 

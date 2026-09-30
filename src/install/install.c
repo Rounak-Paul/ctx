@@ -354,6 +354,20 @@ static char *toml_escape(const char *text)
     return out;
 }
 
+/* Tool-usage policy shared by every generated instruction file. */
+#define CTX_AGENT_POLICY \
+    "Use the `ctx` MCP tools instead of grep/glob exploration and whole-file reads for code in this " \
+    "repository. Each tool re-indexes changed files before answering, so its output is current.\n\n" \
+    "- Task names an exact identifier: call `source`, `callers`, or `impact` on it directly.\n" \
+    "- Unknown location: `search` with a question or identifiers; the top result includes code.\n" \
+    "- Known symbol: `source` for its exact code and doc comment; `outline` for a file's structure; " \
+    "`source` with `file` + `lines` for a specific range.\n" \
+    "- Before changing a function or type: `impact` (call sites with code, indirect callers, affected " \
+    "files and tests); `callers` / `callees` for narrower questions.\n" \
+    "- Fetch narrowly: `outline` first for large files, then `source` with a `lines` range.\n" \
+    "- Treat ctx output as current; do not re-read the same code with other tools.\n" \
+    "- Use grep only for text ctx does not index (strings, configs, docs, build files).\n"
+
 /*
  * Writes the shared agent instructions used by all supported clients.
  *
@@ -367,15 +381,7 @@ static bool install_shared_instructions(const CtxInstallPlan *plan)
 
     const char *text =
         "# ctx Agent Instructions\n\n"
-        "Use ctx as the first codebase-retrieval step for agentic coding tasks in this project.\n\n"
-        "- Call `get_status` first when freshness matters; wait for `ready: true` before relying on retrieval.\n"
-        "- Call `get_context` once with a concrete task before scanning files directly.\n"
-        "- Treat `CTX_PACKET` as the working map: use `ANSWER_MAP`, `EDIT_TARGETS`, `RELEVANT_FILES`, and `SYMBOL_CARDS` before expanding.\n"
-        "- Prefer `expand:entrypoints:<path>` for file-level API shape.\n"
-        "- Prefer `expand:lines:<id>:<start>-<end>` for exact edit context.\n"
-        "- Use `expand:source:<id>` only when the full symbol body is required.\n"
-        "- Avoid `detail=full` unless compact context is insufficient and the extra source text is justified.\n"
-        "- Stop expanding when the packet answers the question; ctx saves credits only when handles are expanded selectively.\n";
+        CTX_AGENT_POLICY;
 
     return write_text_file(path, text);
 }
@@ -394,21 +400,12 @@ static bool install_codex_skill(const CtxInstallPlan *plan)
     const char *text =
         "---\n"
         "name: \"ctx\"\n"
-        "description: \"Use for coding tasks in this repository. Retrieves compact, fresh codebase context from the project-local ctx MCP server before broad file reads.\"\n"
+        "description: \"Use for coding tasks in this repository. Finds and reads exact, current code through the project-local ctx MCP server instead of grep and whole-file reads.\"\n"
         "---\n"
         "\n"
         "# ctx\n"
         "\n"
-        "Use the `ctx` MCP server as the first codebase-retrieval step for agentic coding tasks in this repository.\n"
-        "\n"
-        "1. Call `get_status` first when freshness matters; wait for `ready: true` before relying on retrieval.\n"
-        "2. Call `get_context` once with a concrete task before scanning files directly.\n"
-        "3. Treat `CTX_PACKET` as the working map: use `ANSWER_MAP`, `EDIT_TARGETS`, `RELEVANT_FILES`, and `SYMBOL_CARDS` before expanding.\n"
-        "4. Prefer `expand:entrypoints:<path>` for file-level API shape.\n"
-        "5. Prefer `expand:lines:<id>:<start>-<end>` for exact edit context.\n"
-        "6. Use `expand:source:<id>` only when the full symbol body is required.\n"
-        "7. Avoid `detail=full` unless compact context is insufficient and the extra source text is justified.\n"
-        "8. Stop expanding when the packet answers the question.\n";
+        CTX_AGENT_POLICY;
 
     return write_text_file(path, text);
 }
@@ -475,7 +472,7 @@ static bool install_codex(const CtxInstallPlan *plan)
     const char *agents_block =
         CTX_INSTALL_MARK_BEGIN "\n"
         "## ctx MCP\n"
-        "Use the `ctx` MCP server for codebase retrieval before broad file reads. Start with `get_status`, then `get_context` for the current task. Expand only the handles needed for the next edit, preferring `expand:entrypoints` and `expand:lines`; avoid `detail=full` and `expand:source` unless the full body is required.\n"
+        "Use the `ctx` MCP tools (`search`, `source`, `outline`, `impact`, `callers`, `callees`) instead of grep/glob exploration and whole-file reads. Their output is current; do not re-read the same code with other tools.\n"
         "\n"
         "See `.ctx/ctx-agent-instructions.md` for the full ctx usage policy.\n"
         CTX_INSTALL_MARK_END "\n";
@@ -593,18 +590,12 @@ static bool install_claude_skill_and_rules(const CtxInstallPlan *plan)
     const char *skill_text =
         "---\n"
         "name: ctx\n"
-        "description: Use for coding tasks in this repository. Retrieves compact, fresh codebase context from the project-local ctx MCP server before broad file reads.\n"
+        "description: Use for coding tasks in this repository. Finds and reads exact, current code through the project-local ctx MCP server instead of grep and whole-file reads.\n"
         "---\n"
         "\n"
         "# ctx\n"
         "\n"
-        "Use the `ctx` MCP server as the first retrieval step for coding tasks in this repository.\n"
-        "\n"
-        "1. Call `get_status` first when freshness matters; wait for `ready: true` before relying on retrieval.\n"
-        "2. Call `get_context` once with a concrete task before scanning files directly.\n"
-        "3. Use `CTX_PACKET` as the working map before expanding files.\n"
-        "4. Prefer `expand:entrypoints:<path>` and `expand:lines:<id>:<start>-<end>`.\n"
-        "5. Avoid `detail=full` and `expand:source` unless the full body is required.\n";
+        CTX_AGENT_POLICY;
 
     if (!write_text_file(skill_path, skill_text))
         return false;
@@ -615,7 +606,7 @@ static bool install_claude_skill_and_rules(const CtxInstallPlan *plan)
 
     const char *rule_text =
         "# ctx retrieval\n\n"
-        "Use the project-local `ctx` MCP server before broad file reads on coding tasks. Start with `get_status`, then `get_context`; expand only the handles needed for the next edit.\n";
+        CTX_AGENT_POLICY;
 
     return write_text_file(rule_path, rule_text);
 }
@@ -666,7 +657,7 @@ static bool install_claude(const CtxInstallPlan *plan)
     const char *claude_block =
         CTX_INSTALL_MARK_BEGIN "\n"
         "## ctx MCP\n"
-        "Use the `ctx` MCP server before broad codebase reads. Start with `get_status`, then `get_context`; expand only needed handles, preferring `expand:entrypoints` and `expand:lines`. Avoid `detail=full` and full-source expansion unless necessary.\n"
+        "Use the `ctx` MCP tools (`search`, `source`, `outline`, `impact`, `callers`, `callees`) instead of grep/glob exploration and whole-file reads. Their output is current; do not re-read the same code with other tools.\n"
         "\n"
         "See `.ctx/ctx-agent-instructions.md` for the full ctx usage policy.\n"
         CTX_INSTALL_MARK_END "\n";

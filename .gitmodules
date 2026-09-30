@@ -34,3 +34,6 @@
 [submodule "vendors/tree-sitter-rust"]
 	path = vendors/tree-sitter-rust
 	url = https://github.com/Rounak-Paul/tree-sitter-rust.git
+[submodule "vendors/llama.cpp"]
+	path = vendors/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp.git

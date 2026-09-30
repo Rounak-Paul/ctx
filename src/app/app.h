@@ -22,6 +22,7 @@ typedef struct {
     bool  bench;            /* true → run retrieval benchmark, then exit */
     bool  mcp_mode;         /* true → run MCP server on stdio, no API, no GUI */
     bool  install;          /* true → write agent/MCP integration files, then exit */
+    bool  no_models;        /* true → skip local search models (reranker, embedder) */
     int   api_port;         /* default 8765 */
     char  project_path[4096]; /* path to index; "" → cwd */
     char  install_clients[128]; /* comma-separated client list or "all" */

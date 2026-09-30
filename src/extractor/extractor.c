@@ -1,11 +1,8 @@
 #include "extractor.h"
 #include "../parser/parser.h"
 #include "../log/log.h"
-#include "../jobs/jobs.h"
 
 #include <ctype.h>
-#include <dirent.h>
-#include <sys/stat.h>
 
 /* ---- text extraction helper ---- */
 static char *node_text(const char *src, TSNode node, char *buf, size_t buf_sz) {
@@ -132,61 +129,44 @@ static bool is_inheritance_container(const char *type) {
                     type_contains(type, "heritage"));
 }
 
-static bool is_declaration_name(TSNode node) {
-    TSNode parent = ts_node_parent(node);
-    if (ts_node_is_null(parent)) return false;
-
-    const char *ptype = ts_node_type(parent);
-    if (type_contains(ptype, "declarator") ||
-        type_contains(ptype, "declaration") ||
-        type_contains(ptype, "definition") ||
-        type_contains(ptype, "specifier") ||
-        type_contains(ptype, "alias")) {
-        return true;
-    }
-
-    TSNode grand = ts_node_parent(parent);
-    if (!ts_node_is_null(grand)) {
-        const char *gtype = ts_node_type(grand);
-        if (type_contains(gtype, "declarator") ||
-            type_contains(gtype, "declaration") ||
-            type_contains(gtype, "definition") ||
-            type_contains(gtype, "specifier") ||
-            type_contains(gtype, "alias")) {
-            return true;
-        }
-    }
-    return false;
+static bool is_declaration_context(const char *type) {
+    return type && (type_contains(type, "declarator") ||
+                    type_contains(type, "declaration") ||
+                    type_contains(type, "definition") ||
+                    type_contains(type, "specifier") ||
+                    type_contains(type, "alias"));
 }
 
-static bool is_call_target(TSNode node) {
-    TSNode parent = ts_node_parent(node);
-    if (ts_node_is_null(parent)) return false;
-    const char *ptype = ts_node_type(parent);
-    if (!strcmp(ptype, "call_expression") || !strcmp(ptype, "call"))
-        return true;
+/* True when an identifier with the given parent/grandparent types names the
+ * thing being declared rather than referencing another symbol. */
+static bool is_declaration_name(const char *parent_type, const char *grand_type) {
+    return is_declaration_context(parent_type) || is_declaration_context(grand_type);
+}
 
-    TSNode grand = ts_node_parent(parent);
-    if (ts_node_is_null(grand)) return false;
-    const char *gtype = ts_node_type(grand);
-    return (!strcmp(gtype, "call_expression") || !strcmp(gtype, "call"));
+static bool is_call_node(const char *type) {
+    return type && (!strcmp(type, "call_expression") || !strcmp(type, "call"));
+}
+
+/* True when an identifier with the given parent/grandparent types is the
+ * callee of a call (already recorded as a call site). */
+static bool is_call_target(const char *parent_type, const char *grand_type) {
+    return is_call_node(parent_type) || is_call_node(grand_type);
 }
 
 /*
  * Emits inheritance edges from a class-like symbol to base symbols found in
  * language-specific inheritance clauses.
  *
- * graph      Graph receiving unresolved edges.
+ * ex         Extraction buffer receiving inheritance reference sites.
  * source     Source text backing the tree-sitter nodes.
- * filepath   File owning the source symbol.
  * class_name Emitted class/struct symbol name.
  * class_line Emitted class/struct symbol line.
  * node       Class/struct node to inspect.
  */
-static void emit_inheritance_edges(CtxGraph *graph, const char *source,
-                                   const char *filepath, const char *class_name,
+static void emit_inheritance_edges(CtxFileExtract *ex, const char *source,
+                                   const char *class_name,
                                    uint32_t class_line, TSNode node) {
-    if (!graph || !source || !class_name || !class_name[0]) return;
+    if (!ex || !source || !class_name || !class_name[0]) return;
 
     TSNode containers[16];
     uint32_t container_count = 0;
@@ -208,8 +188,8 @@ static void emit_inheritance_edges(CtxGraph *graph, const char *source,
                 char base_name[256] = {0};
                 node_text(source, cur, base_name, sizeof(base_name));
                 if (base_name[0] && strcmp(base_name, class_name) != 0) {
-                    ctx_graph_add_pending_edge(graph, filepath, class_name, class_line,
-                                               base_name, CTX_EDGE_INHERITS);
+                    ctx_file_extract_add_site(ex, class_name, class_line,
+                                              base_name, CTX_EDGE_INHERITS);
                 }
             }
             uint32_t n = ts_node_child_count(cur);
@@ -253,6 +233,28 @@ static bool is_variable_decl(const char *ntype) {
                      !strcmp(ntype, "variable_declaration"));
 }
 
+/*
+ * Splits a C++ qualified name in place: "ns::Foo::bar" leaves "bar" in name
+ * and writes "Foo" to qualifier. Template arguments in the qualifier are
+ * dropped. Unqualified names leave qualifier empty.
+ */
+static void split_qualified_name(char *name, char *qualifier, size_t qualifier_size) {
+    qualifier[0] = '\0';
+    char *last = NULL;
+    for (char *p = strstr(name, "::"); p; p = strstr(p + 2, "::")) last = p;
+    if (!last) return;
+    char *prev = NULL;
+    for (char *p = strstr(name, "::"); p && p < last; p = strstr(p + 2, "::")) prev = p;
+    const char *qstart = prev ? prev + 2 : name;
+    size_t qlen = (size_t)(last - qstart);
+    const char *angle = memchr(qstart, '<', qlen);
+    if (angle) qlen = (size_t)(angle - qstart);
+    if (qlen >= qualifier_size) qlen = qualifier_size - 1;
+    memcpy(qualifier, qstart, qlen);
+    qualifier[qlen] = '\0';
+    memmove(name, last + 2, strlen(last + 2) + 1);
+}
+
 /* ---- symbol kind from node type string ---- */
 static CtxSymbolKind sym_kind_for(const char *ntype) {
     /* C / C++ / Python / JS / TS */
@@ -293,78 +295,64 @@ static CtxSymbolKind sym_kind_for(const char *ntype) {
     return CTX_SYM_UNKNOWN;
 }
 
-static bool should_emit_generic_node(TSNode node, const char *ntype) {
-    if (!ntype || !ts_node_is_named(node) || ts_node_is_extra(node)) return false;
-    if (!strcmp(ntype, "comment") || !strcmp(ntype, "string") ||
-        !strcmp(ntype, "string_literal") || !strcmp(ntype, "ERROR")) {
+/* True for C/C++ struct/union/class/enum specifiers without a body, which
+ * reference a type declared elsewhere instead of defining one. */
+static bool is_type_reference(TSNode node, const char *ntype) {
+    if (strcmp(ntype, "struct_specifier") && strcmp(ntype, "union_specifier") &&
+        strcmp(ntype, "class_specifier") && strcmp(ntype, "enum_specifier"))
         return false;
-    }
-    return type_contains(ntype, "declaration") ||
-           type_contains(ntype, "definition") ||
-           type_contains(ntype, "specifier") ||
-           type_contains(ntype, "import") ||
-           type_contains(ntype, "include") ||
-           type_contains(ntype, "namespace") ||
-           type_contains(ntype, "class") ||
-           type_contains(ntype, "struct") ||
-           type_contains(ntype, "enum") ||
-           type_contains(ntype, "typedef") ||
-           type_contains(ntype, "type_alias") ||
-           type_contains(ntype, "function") ||
-           type_contains(ntype, "method");
-}
-
-static void generic_node_name(const char *src, TSNode node, const char *ntype,
-                              char *name, size_t name_sz,
-                              char *signature, size_t signature_sz) {
-    if (!name || name_sz == 0 || !signature || signature_sz == 0) return;
-
-    char text[256];
-    node_text(src, node, text, sizeof(text));
-    for (size_t i = 0; text[i]; ++i) {
-        if ((unsigned char)text[i] < 32) text[i] = ' ';
-    }
-
-    uint32_t line = ts_node_start_point(node).row + 1;
-    uint32_t col = ts_node_start_point(node).column + 1;
-    snprintf(name, name_sz, "%s@%u:%u", ntype ? ntype : "node", line, col);
-    snprintf(signature, signature_sz, "%s", text);
+    return ts_node_is_null(find_child(node, "field_declaration_list")) &&
+           ts_node_is_null(find_child(node, "enumerator_list"));
 }
 
 /* ---- recursive AST walk ---- */
 typedef struct {
-    CtxGraph   *graph;
+    CtxFileExtract *ex;
     const char *source;
     const char *filepath;
     uint8_t     lang;
+    const char *parent_type;  /* type of the current node's parent, NULL at root */
+    const char *grand_type;   /* type of the grandparent, NULL near the root */
     char        enclosing_fn[256]; /* name of the innermost function being walked */
     char        enclosing_scope[256]; /* nearest class/struct/namespace for scope tagging */
 } WalkCtx;
 
+/* Enclosing function/scope saved when the walk enters a node that opens one;
+ * restored once the walk leaves that node's subtree. */
 typedef struct {
-    TSNode   node;
     uint32_t depth;
-    bool     exit_scope;
-    char     restore_fn[256];
-    char     restore_scope[256];
-} WalkEntry;
+    char     fn[256];
+    char     scope[256];
+} ScopeSave;
 
 typedef struct {
-    WalkEntry *items;
+    ScopeSave *items;
     size_t     count;
     size_t     cap;
-} WalkStack;
+} ScopeStack;
 
-static bool walk_stack_push(WalkStack *stack, WalkEntry entry) {
+static bool scope_stack_push(ScopeStack *stack, uint32_t depth, const WalkCtx *ctx) {
     if (stack->count >= stack->cap) {
-        size_t next_cap = stack->cap ? stack->cap * 2 : 256;
-        WalkEntry *next = (WalkEntry *)realloc(stack->items, next_cap * sizeof(WalkEntry));
+        size_t next_cap = stack->cap ? stack->cap * 2 : 32;
+        ScopeSave *next = (ScopeSave *)realloc(stack->items, next_cap * sizeof(ScopeSave));
         if (!next) return false;
         stack->items = next;
         stack->cap = next_cap;
     }
-    stack->items[stack->count++] = entry;
+    ScopeSave *save = &stack->items[stack->count++];
+    save->depth = depth;
+    memcpy(save->fn, ctx->enclosing_fn, sizeof(save->fn));
+    memcpy(save->scope, ctx->enclosing_scope, sizeof(save->scope));
     return true;
+}
+
+/* Restores every scope opened at a depth >= depth (their subtrees are done). */
+static void scope_stack_unwind(ScopeStack *stack, uint32_t depth, WalkCtx *ctx) {
+    while (stack->count > 0 && stack->items[stack->count - 1].depth >= depth) {
+        ScopeSave *save = &stack->items[--stack->count];
+        memcpy(ctx->enclosing_fn, save->fn, sizeof(ctx->enclosing_fn));
+        memcpy(ctx->enclosing_scope, save->scope, sizeof(ctx->enclosing_scope));
+    }
 }
 
 static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
@@ -374,6 +362,7 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
     pushed_name[0] = '\0';
     const char *ntype = ts_node_type(node);
     char namebuf[256] = {0};
+    char qualifier[256] = {0};
     char sigbuf[512]  = {0};
 
     /* Skip error nodes but log once */
@@ -389,11 +378,17 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
     if (kind == CTX_SYM_FUNCTION || kind == CTX_SYM_METHOD) {
         /* C/C++: function_definition has a declarator child */
         TSNode decl = find_descendant(node, "function_declarator", 64);
+        TSNode name_node = {0};
+        /* The declarator field names the function itself (identifier,
+         * field_identifier, Scope::name, ~Dtor, operator); a descendant
+         * search would find parameter names first. */
+        if (!ts_node_is_null(decl)) name_node = ts_node_child_by_field_name(decl, "declarator", 10);
         if (ts_node_is_null(decl)) decl = find_child(node, "declarator");
-        TSNode name_node = find_descendant(decl, "identifier", 64);
+        if (ts_node_is_null(name_node)) name_node = find_descendant(decl, "identifier", 64);
         if (ts_node_is_null(name_node)) name_node = find_child(node, "identifier");
         if (!ts_node_is_null(name_node)) {
             node_text(ctx->source, name_node, namebuf, sizeof(namebuf));
+            split_qualified_name(namebuf, qualifier, sizeof(qualifier));
             /* signature = trim source of function node up to body */
             TSNode body = find_child(node, "compound_statement");
             if (ts_node_is_null(body)) body = find_child(node, "block");
@@ -443,6 +438,9 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
                 emit_sym = (namebuf[0] != '\0');
             }
         }
+    } else if ((kind == CTX_SYM_CLASS || kind == CTX_SYM_STRUCT || kind == CTX_SYM_ENUM) &&
+               is_type_reference(node, ntype)) {
+        /* `struct stat st;` names an existing type; it is not a definition. */
     } else if (kind == CTX_SYM_CLASS || kind == CTX_SYM_STRUCT || kind == CTX_SYM_ENUM) {
         TSNode name_node = find_child(node, "type_identifier");
         if (ts_node_is_null(name_node)) name_node = find_child(node, "identifier");
@@ -517,8 +515,7 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
         strncpy(namebuf, pathbuf, sizeof(namebuf) - 1);
         emit_sym = (namebuf[0] != '\0');
     } else if (!strcmp(ntype, "call_expression") || !strcmp(ntype, "call")) {
-        /* Record a pending call — callee may not be in the graph yet during parallel extraction.
-         * ctx_graph_resolve_calls() is called post-index to wire edges. */
+        /* Record a call site; the graph resolves it by name once every file is known. */
         TSNode fn_node = find_child(node, "identifier");
         if (ts_node_is_null(fn_node)) fn_node = find_child(node, "field_expression");
         if (!ts_node_is_null(fn_node)) {
@@ -526,8 +523,8 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
             symbol_name_from_node(ctx->source, fn_node, callee_name, sizeof(callee_name));
             if (callee_name[0]) {
                 uint32_t call_line = ts_node_start_point(node).row + 1;
-                ctx_graph_add_pending_call(ctx->graph, ctx->filepath,
-                                           ctx->enclosing_fn, call_line, callee_name);
+                ctx_file_extract_add_site(ctx->ex, ctx->enclosing_fn, call_line,
+                                          callee_name, CTX_EDGE_CALLS);
             }
         }
     } else if (!ctx->enclosing_fn[0] && is_variable_decl(ntype)) {
@@ -542,20 +539,13 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
         }
     }
 
-    if (!emit_sym && should_emit_generic_node(node, ntype)) {
-        generic_node_name(ctx->source, node, ntype, namebuf, sizeof(namebuf),
-                          sigbuf, sizeof(sigbuf));
-        emit_sym = (namebuf[0] != '\0');
-        kind = CTX_SYM_UNKNOWN;
-    }
-
     if (emit_sym && namebuf[0]) {
-        CtxSymbol sym = {0};
+        CtxSymbolDraft sym = {0};
         sym.id   = ctx_symbol_id(ctx->filepath, namebuf, ts_node_start_point(node).row + 1);
         strncpy(sym.name,      namebuf,         sizeof(sym.name)      - 1);
-        strncpy(sym.file,      ctx->filepath,   sizeof(sym.file)      - 1);
         strncpy(sym.signature, sigbuf[0] ? sigbuf : namebuf, sizeof(sym.signature) - 1);
-        strncpy(sym.scope,     ctx->enclosing_scope, sizeof(sym.scope) - 1);
+        strncpy(sym.scope, ctx->enclosing_scope[0] ? ctx->enclosing_scope : qualifier,
+                sizeof(sym.scope) - 1);
         sym.line         = ts_node_start_point(node).row + 1;
         sym.col          = ts_node_start_point(node).column + 1;
         sym.end_line     = ts_node_end_point(node).row + 1;
@@ -575,21 +565,20 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
                              !strcmp(ntype, "enum_item")            ||
                              !strcmp(ntype, "trait_item")           ||
                              !strcmp(ntype, "impl_item"));
-        ctx_graph_add_symbol(ctx->graph, &sym);
+        ctx_file_extract_add_symbol(ctx->ex, &sym);
         if (kind == CTX_SYM_CLASS || kind == CTX_SYM_STRUCT) {
-            emit_inheritance_edges(ctx->graph, ctx->source, ctx->filepath,
-                                   namebuf, sym.line, node);
+            emit_inheritance_edges(ctx->ex, ctx->source, namebuf, sym.line, node);
         }
     } else if (ctx->enclosing_fn[0] && is_identifier_type(ntype) &&
-               !is_call_target(node) && !is_declaration_name(node)) {
+               !is_call_target(ctx->parent_type, ctx->grand_type) &&
+               !is_declaration_name(ctx->parent_type, ctx->grand_type)) {
         char ref_name[256] = {0};
         symbol_name_from_node(ctx->source, node, ref_name, sizeof(ref_name));
         if (ref_name[0] && !is_noise_identifier(ref_name) &&
             strcmp(ref_name, ctx->enclosing_fn) != 0) {
             uint32_t ref_line = ts_node_start_point(node).row + 1;
-            ctx_graph_add_pending_edge(ctx->graph, ctx->filepath,
-                                       ctx->enclosing_fn, ref_line,
-                                       ref_name, CTX_EDGE_REFERENCES);
+            ctx_file_extract_add_site(ctx->ex, ctx->enclosing_fn, ref_line,
+                                      ref_name, CTX_EDGE_REFERENCES);
         }
     }
 
@@ -611,130 +600,77 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
     return true;
 }
 
+#define CTX_WALK_MAX_DEPTH 512u
+
+/*
+ * Pre-order walk with a tree cursor: O(nodes) regardless of fan-out and no
+ * recursion. Subtrees deeper than CTX_WALK_MAX_DEPTH are skipped.
+ */
 static void walk_tree(WalkCtx *ctx, TSNode root) {
     if (ts_node_is_null(root)) return;
 
-    WalkStack stack = {0};
-    if (!walk_stack_push(&stack, (WalkEntry){ .node = root })) {
-        CTX_LOG_WARN("Cannot allocate AST walk stack for %s", ctx->filepath);
-        return;
-    }
+    ScopeStack scopes = {0};
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    const char *types[CTX_WALK_MAX_DEPTH + 2];
+    uint32_t depth = 0;
+    for (;;) {
+        scope_stack_unwind(&scopes, depth, ctx);
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (depth <= CTX_WALK_MAX_DEPTH) types[depth] = ts_node_type(node);
+        ctx->parent_type = depth >= 1 && depth - 1 <= CTX_WALK_MAX_DEPTH ? types[depth - 1] : NULL;
+        ctx->grand_type = depth >= 2 && depth - 2 <= CTX_WALK_MAX_DEPTH ? types[depth - 2] : NULL;
 
-    while (stack.count > 0) {
-        WalkEntry entry = stack.items[--stack.count];
-        if (entry.exit_scope) {
-            memcpy(ctx->enclosing_fn, entry.restore_fn, sizeof(ctx->enclosing_fn));
-            memcpy(ctx->enclosing_scope, entry.restore_scope, sizeof(ctx->enclosing_scope));
-            continue;
-        }
-
-        if (ts_node_is_null(entry.node)) continue;
-        if (entry.depth > 512) continue;
-
+        bool descend = false;
         bool pushed_fn = false, pushed_scope = false;
         char pushed_name[256];
-        if (!process_node(ctx, entry.node, &pushed_fn, &pushed_scope, pushed_name)) continue;
-
-        if (pushed_fn || pushed_scope) {
-            WalkEntry exit_entry = { .exit_scope = true };
-            memcpy(exit_entry.restore_fn, ctx->enclosing_fn, sizeof(exit_entry.restore_fn));
-            memcpy(exit_entry.restore_scope, ctx->enclosing_scope, sizeof(exit_entry.restore_scope));
-            if (!walk_stack_push(&stack, exit_entry)) break;
-            if (pushed_fn) {
-                strncpy(ctx->enclosing_fn, pushed_name, sizeof(ctx->enclosing_fn) - 1);
-                ctx->enclosing_fn[sizeof(ctx->enclosing_fn) - 1] = '\0';
-            }
-            if (pushed_scope) {
-                strncpy(ctx->enclosing_scope, pushed_name, sizeof(ctx->enclosing_scope) - 1);
-                ctx->enclosing_scope[sizeof(ctx->enclosing_scope) - 1] = '\0';
-            }
-        }
-
-        uint32_t n = ts_node_child_count(entry.node);
-        for (uint32_t i = n; i > 0; --i) {
-            TSNode child = ts_node_child(entry.node, i - 1);
-            if (!walk_stack_push(&stack, (WalkEntry){
-                    .node = child,
-                    .depth = entry.depth + 1,
-                })) {
-                CTX_LOG_WARN("AST walk stack exhausted while indexing %s", ctx->filepath);
-                stack.count = 0;
-                break;
+        if (depth <= CTX_WALK_MAX_DEPTH &&
+            process_node(ctx, node, &pushed_fn, &pushed_scope, pushed_name)) {
+            descend = true;
+            if (pushed_fn || pushed_scope) {
+                if (!scope_stack_push(&scopes, depth, ctx)) {
+                    CTX_LOG_WARN("Cannot allocate scope stack while indexing %s", ctx->filepath);
+                    break;
+                }
+                if (pushed_fn) {
+                    strncpy(ctx->enclosing_fn, pushed_name, sizeof(ctx->enclosing_fn) - 1);
+                    ctx->enclosing_fn[sizeof(ctx->enclosing_fn) - 1] = '\0';
+                }
+                if (pushed_scope) {
+                    strncpy(ctx->enclosing_scope, pushed_name, sizeof(ctx->enclosing_scope) - 1);
+                    ctx->enclosing_scope[sizeof(ctx->enclosing_scope) - 1] = '\0';
+                }
             }
         }
+
+        if (descend && ts_tree_cursor_goto_first_child(&cursor)) {
+            depth++;
+            continue;
+        }
+        bool advanced = false;
+        for (;;) {
+            if (ts_tree_cursor_goto_next_sibling(&cursor)) { advanced = true; break; }
+            if (!ts_tree_cursor_goto_parent(&cursor)) break;
+            depth--;
+        }
+        if (!advanced) break;
     }
-
-    free(stack.items);
+    scope_stack_unwind(&scopes, 0, ctx);
+    ts_tree_cursor_delete(&cursor);
+    free(scopes.items);
 }
 
-bool ctx_extract_file(CtxGraph *g, const char *path) {
-    if (!g || !path) return false;
+bool ctx_extract_file(const char *path, CtxFileExtract *out) {
+    if (!path || !out) return false;
+    memset(out, 0, sizeof(*out));
 
     CtxParseResult pr;
     if (!ctx_parser_parse_file(path, &pr)) return false;
 
     TSNode root = ts_tree_root_node(pr.tree);
-    WalkCtx wctx = { .graph = g, .source = pr.source, .filepath = path,
+    WalkCtx wctx = { .ex = out, .source = pr.source, .filepath = path,
                      .lang = (uint8_t)pr.lang };
     walk_tree(&wctx, root);
 
     ctx_parser_free_result(&pr);
     return true;
-}
-
-/* ---- skip-list for directory traversal ---- */
-static bool should_skip_dir(const char *name) {
-    static const char *skip[] = {
-        "node_modules", ".git", "build", "bin", "__pycache__",
-        ".cache", "dist", "target", ".svn", ".hg", NULL
-    };
-    if (name[0] == '.') return true; /* hidden */
-    for (int i = 0; skip[i]; i++)
-        if (!strcmp(name, skip[i])) return true;
-    return false;
-}
-
-static bool is_source_file(const char *name) {
-    return ctx_lang_from_path(name) != CTX_LANG_UNKNOWN;
-}
-
-typedef struct { CtxGraph *g; char path[4096]; } ExtractJobData;
-
-static void extract_job_fn(void *ud) {
-    ExtractJobData *d = (ExtractJobData *)ud;
-    ctx_extract_file(d->g, d->path);
-    free(d);
-}
-
-void ctx_extract_directory(CtxGraph *g, const char *dir, bool recursive) {
-    if (!g || !dir) return;
-
-    DIR *d = opendir(dir);
-    if (!d) { CTX_LOG_WARN("Cannot open dir %s: %s", dir, strerror(errno)); return; }
-
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-
-        char full[4096];
-        int n = snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
-        if (n <= 0 || (size_t)n >= sizeof(full)) continue;
-
-        struct stat st;
-        if (stat(full, &st) != 0) continue;
-
-        if (S_ISDIR(st.st_mode)) {
-            if (recursive && !should_skip_dir(de->d_name))
-                ctx_extract_directory(g, full, true);
-        } else if (S_ISREG(st.st_mode) && is_source_file(de->d_name)) {
-            ExtractJobData *jd = (ExtractJobData *)malloc(sizeof(ExtractJobData));
-            if (jd) {
-                jd->g = g;
-                strncpy(jd->path, full, sizeof(jd->path) - 1);
-                jd->path[sizeof(jd->path)-1] = '\0';
-                ctx_job_submit_normal(extract_job_fn, jd);
-            }
-        }
-    }
-    closedir(d);
 }

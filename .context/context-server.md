@@ -1,5 +1,11 @@
 # ctx Context Server — Architecture & Decisions
 
+> Superseded for agents by the precise tools (see `precise-tools.md`): MCP now
+> exposes search/outline/source/callers/callees/impact/status. The packet
+> retrieval below (`retrieve/`) remains only for `/context*` HTTP and the GUI
+> Context tab. Graph/extraction/store sections below are outdated where they
+> conflict with `precise-tools.md`.
+
 Goal: a token-efficient LLM context server. Given a task/question, return a
 compact, self-contained context packet with the files, symbols, relation paths,
 risks, and expansion handles an agent needs to decide the next action. ctx should
@@ -74,22 +80,8 @@ root-relative and absolute paths.
 `/context/symbol?name=&detail=...`, `/context/file?path=&detail=...`, and
 `/context/expand?handle=expand:...`.
 
-**MCP:** `./bin/ctx --mcp --project <repo>` runs a stdio JSON-RPC server with
-`Content-Length` framing. Tools: `get_context`, `get_symbol`, `get_file`,
-`expand_context`, `get_status`, `get_stats`. Agent flow should prefer
-`get_context` → `expand:entrypoints` → `expand:lines`, and reserve
-`expand:source` for full-body needs.
-
-**Agent install:** `./bin/ctx --install --project <repo>` writes project-local
-setup for Claude Code, Codex, and OpenCode. It creates/updates `.mcp.json`,
-`.codex/config.toml`, `opencode.json`, `AGENTS.md`, `CLAUDE.md`, and
-`.ctx/ctx-agent-instructions.md`. The installer is idempotent and replaces only
-ctx-managed text blocks. `--clients codex,claude,opencode` limits which clients
-are written. Regression coverage lives in `tests/install_smoke.py`.
-
-**MCP metadata:** Tool descriptions repeat the low-credit policy directly:
-`get_status` first when freshness matters, `get_context` before broad file
-reads, selective handle expansion, and full source/detail only as fallbacks.
+**MCP / install:** see `precise-tools.md` (tool registry, framing, installer
+policy text `CTX_AGENT_POLICY` in `install/install.c`).
 
 ## Cache/versioning (`store/store.c`, `indexer/indexer.c`)
 - `CTX_STORE_SCHEMA_VERSION` → `migrate_schema` drops stale tables on mismatch.

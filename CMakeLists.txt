@@ -108,6 +108,31 @@ add_library(uthash INTERFACE)
 target_include_directories(uthash INTERFACE vendors/uthash/src)
 
 # --------------------------------------------------------------------------
+# llama.cpp (optional local models — search reranker and code embeddings)
+# --------------------------------------------------------------------------
+option(CTX_WITH_MODELS "Build llama.cpp-backed search reranker and embedder" ON)
+if(CTX_WITH_MODELS AND NOT EXISTS ${CMAKE_SOURCE_DIR}/vendors/llama.cpp/CMakeLists.txt)
+    message(STATUS "vendors/llama.cpp not initialized — building without local models (run: git submodule update --init vendors/llama.cpp)")
+    set(CTX_WITH_MODELS OFF)
+endif()
+if(CTX_WITH_MODELS)
+    enable_language(CXX)
+    set(LLAMA_BUILD_COMMON   OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_APP      OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_UI       OFF CACHE BOOL "" FORCE)
+    set(LLAMA_OPENSSL        OFF CACHE BOOL "" FORCE)
+    set(LLAMA_SUBPROCESS     OFF CACHE BOOL "" FORCE)
+    set(LLAMA_ALL_WARNINGS   OFF CACHE BOOL "" FORCE)
+    set(GGML_OPENMP          OFF CACHE BOOL "" FORCE)
+    add_subdirectory(vendors/llama.cpp EXCLUDE_FROM_ALL)
+    message(STATUS "llama.cpp found — local search models enabled")
+endif()
+
+# --------------------------------------------------------------------------
 # causality (optional UI — requires Vulkan and initialized nested submodules)
 # --------------------------------------------------------------------------
 find_package(Vulkan QUIET)
@@ -180,6 +205,11 @@ target_link_libraries(ctx PRIVATE
     uthash
     Threads::Threads
 )
+
+if(CTX_WITH_MODELS)
+    target_link_libraries(ctx PRIVATE llama)
+    target_compile_definitions(ctx PRIVATE CTX_HAS_MODELS)
+endif()
 
 # --------------------------------------------------------------------------
 # causality on Linux: all causality-related archives have circular deps
@@ -272,6 +302,10 @@ if(UNIX)
     add_test(
         NAME live_update_smoke
         COMMAND /bin/sh ${CMAKE_SOURCE_DIR}/tests/live_update_smoke.sh $<TARGET_FILE:ctx>
+    )
+    add_test(
+        NAME watcher_smoke
+        COMMAND /bin/sh ${CMAKE_SOURCE_DIR}/tests/watcher_smoke.sh $<TARGET_FILE:ctx>
     )
     add_test(
         NAME mcp_smoke

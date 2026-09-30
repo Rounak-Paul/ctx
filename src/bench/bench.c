@@ -1,11 +1,11 @@
 #include "bench.h"
-#include "../retrieve/retrieve.h"
+#include "../search/search.h"
 #include "../log/log.h"
 
 /*
- * Each case asserts that every must_have token appears somewhere in the
- * retrieval output. Assertions are presence-based to stay robust as ranking
- * evolves. Accounting and expansion-handle behavior are covered by live smoke.
+ * Each case asserts that every must_have token appears in the top search
+ * results (lexical ranking only: bench mode runs without models, so this is
+ * the quality floor). Presence-based to stay robust as ranking evolves.
  */
 typedef struct {
     const char *task;
@@ -14,17 +14,17 @@ typedef struct {
 
 static const BenchCase k_cases[] = {
     { "where is the API status endpoint implemented",
-      { "api.c", "handle_stats", NULL } },
-    { "how are pending semantic edges resolved",
-      { "graph.c", "ctx_graph_add_pending_edge", NULL } },
-    { "how is context retrieved for a task query",
-      { "retrieve.c", NULL } },
-    { "how does the compact CTX_PACKET get generated and expanded",
-      { "ctx_retrieve", "ctx_expand_context", "expand:entrypoints", NULL } },
-    { "where are symbols persisted to the database",
+      { "api.c", "build_status_json", NULL } },
+    { "how are reference sites resolved to target symbols",
+      { "graph.c", "resolve_site", NULL } },
+    { "where are symbols persisted to sqlite",
       { "store.c", NULL } },
+    { "how does a file change trigger an incremental reindex",
+      { "on_file_change", "file_change_job_fn", NULL } },
     { "how does the extractor walk the AST",
-      { "extractor.c", NULL } },
+      { "extractor.c", "walk_tree", NULL } },
+    { "which callers call a symbol",
+      { "ctx_nav_callers", NULL } },
     { "how does the force graph render nodes",
       { "force_graph.c", NULL } },
 };
@@ -37,12 +37,12 @@ int ctx_bench_run(CtxGraph *g) {
     uint32_t total = (uint32_t)(sizeof(k_cases) / sizeof(k_cases[0]));
     uint32_t failed = 0;
 
-    fprintf(stdout, "\n=== ctx retrieval benchmark (%u cases) ===\n", total);
+    fprintf(stdout, "\n=== ctx search benchmark (%u cases) ===\n", total);
 
     for (uint32_t i = 0; i < total; i++) {
         const BenchCase *c = &k_cases[i];
-        CtxRetrieveRequest req = { .kind = CTX_QUERY_TASK, .text = c->task };
-        char *out = ctx_retrieve(g, &req);
+        CtxSearchRequest req = { .query = c->task, .k = 8, .bodies = 0 };
+        char *out = ctx_search(g, &req);
 
         bool ok = true;
         const char *missing = NULL;

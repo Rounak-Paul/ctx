@@ -1,13 +1,18 @@
-# ctx — LLM Context Server
+# ctx — code navigation server for coding agents
 
-`ctx` indexes a codebase with tree-sitter, builds a semantic symbol graph
-(calls, references, inheritance, includes), and serves **compact, explainable
-context packets** over HTTP. It exists to keep coding agents from burning tokens
-scanning large repositories: ask for a task and get back the relevant files,
-symbols, relationships, accounting, and expansion handles with stable
-`file:line` citations.
+`ctx` indexes a codebase with tree-sitter into a symbol graph (calls,
+references, inheritance) and gives coding agents **exact, current answers**
+through a small set of tools: ranked search, file outlines, exact symbol
+source, callers/callees, and change-impact reports. Every answer is re-checked
+against disk before it is returned, so agents can act on it without
+re-reading files with grep or whole-file reads — that substitution is where
+token savings come from.
 
-The graph visualizer (GUI) is a debugging aid. The product is the context API.
+Search combines BM25 over symbol names, paths, signatures, and doc comments
+with local code embeddings, and re-ranks with a local cross-encoder
+(llama.cpp; models are downloaded once, pinned and sha256-verified).
+
+The graph visualizer (GUI) is a debugging aid. The product is the tool API.
 
 ## Build & run
 
@@ -20,12 +25,16 @@ cmake --build build --parallel
 ./bin/ctx --no-gui --no-api --project /path/to/repo   # index only, then watch
 ./bin/ctx --mcp --project /path/to/repo                # MCP stdio server for agents
 ./bin/ctx --install --project /path/to/repo            # write agent MCP configs
-./bin/ctx --bench  --project /path/to/repo            # run retrieval benchmark
+./bin/ctx --bench  --project /path/to/repo            # run search benchmark (lexical floor)
 ```
 
+Add `--no-models` (or set `CTX_MODELS=0`) to run without the local reranker
+and embedder; search then uses BM25 only. Build with `-DCTX_WITH_MODELS=OFF`
+to drop the llama.cpp dependency entirely.
+
 Flags: `--project <dir>`, `--api-port <n>` (default 8765), `--no-gui`,
-`--no-api`, `--mcp`, `--install`, `--clients <all|codex,claude,opencode>`,
-`--bench`. The index is cached in `~/.ctx/<hash>/index.db`; repeated startups
+`--no-api`, `--no-models`, `--mcp`, `--install`,
+`--clients <all|codex,claude,opencode>`, `--bench`. The index is cached in `~/.ctx/<hash>/index.db`; repeated startups
 load from cache and only re-extract changed files. Vendored code is indexed by
 default.
 
@@ -55,94 +64,92 @@ launch ctx as a local stdio MCP server:
 ctx --mcp --project /path/to/repo
 ```
 
-The generated instructions are part of the credit-saving contract: agents should
-call `get_status`, then one task-specific `get_context`, and expand only the
-handles needed for the next edit. Broad source scans, `detail=full`, and
-`expand:source` should be deliberate fallbacks, not the default path.
+The generated instructions tell agents to use the ctx tools instead of
+grep/glob exploration and whole-file reads, and to treat ctx output as current.
 
-## Context API
+## Tools
 
-Retrieval endpoints accept `detail=compact|standard|full`. Compact/adaptive is
-the default. Output is deterministic and avoids whole-file/source dumps unless
-the caller explicitly expands a handle or asks for `detail=full`.
+The same tools are served over MCP and HTTP (one registry, identical
+arguments). Paths may be absolute, root-relative, or a unique suffix; symbols
+may be `name`, `Scope::name`, `Scope.name`, or `path:line`.
+
+| Tool | Arguments | Returns |
+|---|---|---|
+| `search` | `query`, `k`=5, `bodies`=1, `include_vendor`=false | Ranked symbols (`path:line-range`, signature, doc summary), code for the top `bodies` |
+| `outline` | `path`, `from_line`, `limit`=300 | A file's symbols: line range, kind, signature (nested) |
+| `source` | `symbol` \| `file`+`lines`, `max_lines`=120 | Exact code with line numbers and leading doc comment; other matches listed |
+| `callers` | `symbol`, `file`, `depth`=1..3 | Call sites with the calling line's text; indirect callers for depth > 1 |
+| `callees` | `symbol`, `file` | Called functions with resolved locations; unresolved/external names |
+| `impact` | `symbol`, `file` | Definitions/declarations, call sites, indirect callers, references, subtypes, affected files and tests |
+| `status` | — | Index readiness/counts, model states, embedding coverage |
+
+Freshness: before answering, every tool stats the files it answers from and
+synchronously re-indexes any that changed (mtime ns + size), independent of
+the file watcher. Tools wait for the initial index to finish.
+
+## HTTP API
 
 | Method | Endpoint | Description |
 |---|---|---|
-| GET | `/context?task=<text>&detail=<mode>` | Compact context packet for a natural-language task |
-| GET | `/context/symbol?name=<sym>&detail=<mode>` | Context packet anchored on a symbol |
-| GET | `/context/file?path=<path>&detail=<mode>` | Context packet anchored on a file |
-| GET | `/context/expand?handle=<handle>` | Expand a handle returned by a context packet |
-| GET | `/stats` | Index counters (files, symbols, edges) |
-| GET | `/health` | Liveness probe |
+| GET | `/tools` | Tool list with JSON input schemas |
+| GET | `/tool/<name>?arg=value&…` | Run a tool (text response; HTTP 400 on tool errors) |
+| GET | `/context?task=…`, `/context/symbol`, `/context/file`, `/context/expand` | Legacy context packets (used by the GUI Context tab) |
+| GET | `/stats`, `/health` | Index counters / liveness |
 | POST | `/reindex` | Trigger a re-index |
 
-### Example
-
 ```sh
-curl 'http://127.0.0.1:8765/context?task=where+is+the+API+status+endpoint'
+curl -G http://127.0.0.1:8765/tool/search --data-urlencode 'query=where are symbols persisted'
+curl 'http://127.0.0.1:8765/tool/callers?symbol=ctx_graph_replace_file&depth=2'
 ```
 
-The default response is a `CTX_PACKET`: answer map, likely edit targets,
-relevant files, symbol cards, omitted expandable handles, and accounting. It is
-self-contained for the current request but avoids full source bodies unless the
-caller explicitly expands a handle such as `expand:source:<id>`.
-`expand:entrypoints:<path>` returns exported/top-level entrypoints for a file.
-`expand:file:<path>` returns a compact file symbol map with omitted symbols left
-as handles; it is not a whole-file source dump. Paths inside packets are
-root-relative to `CODEBASE` when possible, and file expansion handles accept both
-root-relative and absolute paths.
-For edits that only need part of a large function, `expand:lines:<id>:<start>-<end>`
-returns an exact source range clamped to that symbol instead of the full body.
-
-Use `detail=full` on the context endpoints for the older complete grouped
-module/file/symbol output.
-
 ## MCP
-
-For agentic coding, prefer MCP over manually calling HTTP endpoints. Start ctx
-with:
 
 ```sh
 ./bin/ctx --mcp --project /path/to/repo
 ```
 
-The MCP server uses stdio JSON-RPC with `Content-Length` framing and exposes:
-`get_context`, `get_symbol`, `get_file`, `expand_context`, `get_status`, and
-`get_stats`. The intended credit-saving flow is:
+stdio JSON-RPC; replies use the client's framing (newline-delimited JSON per
+the MCP spec, or `Content-Length` headers). `initialize` and `tools/list`
+answer immediately; tool calls wait for the initial index.
 
-1. Call `get_status` when freshness matters; rely on retrieval after `ready` is true.
-2. Call `get_context` first for the concrete task.
-3. Use `expand:entrypoints:<path>` for file-level API surface.
-4. Use `expand:lines:<id>:<start>-<end>` for exact edit context.
-5. Use `expand:source:<id>` only when the full symbol body is actually needed.
-6. Stop expanding when the packet answers the question.
+## Search model
 
-## Retrieval model
+1. **Candidates**: BM25 over each symbol's name parts (weighted), scope, file
+   stem and directory, signature identifiers, and leading doc comment, with
+   light stemming and prefix matching (`defrag` ↔ `defragment`); scores are
+   scaled by query-term coverage. In parallel, cosine similarity against
+   project-symbol embeddings (jina-embeddings-v2-base-code).
+2. **Fusion**: reciprocal-rank fusion of both lists; prototypes merge into
+   their definitions.
+3. **Rerank**: the top 30 are scored by a cross-encoder
+   (jina-reranker-v1-turbo-en) over path + signature + doc comment + body
+   head, blended with the fused rank.
 
-Symbols are scored by a blend of: text match over name/signature/file/scope,
-query-term coverage, symbol-kind importance, definition preference, graph hub
-score, and a vendor penalty. The top-ranked seeds are expanded with their
-call/reference/inheritance neighborhoods. Rendering is compact/adaptive by
-default: repeated or low-marginal-value items become expansion handles instead
-of source dumps. There is no hard context-length cap in the default policy.
+Embeddings are computed in the background (event-driven on graph updates and
+model readiness) and cached in SQLite by content hash, so unchanged symbols
+are never re-embedded. Models live in `~/.ctx/models` (`CTX_MODEL_DIR`);
+`CTX_RERANK_MODEL` / `CTX_EMBED_MODEL` point at local GGUF files instead.
 
 ## Architecture
 
-- `parser/` — tree-sitter parsing (C, C++, Python, JS, TS); ambiguous `.h`
-  parsed as both C and C++, fewer-error tree kept.
-- `extractor/` — language-aware AST walk emitting first-class symbols (functions,
-  methods, classes, structs, enums, typedefs, namespaces, macros, includes,
-  module-level variables) plus pending call/reference/inheritance edges, with
-  enclosing scope tracking. Iterative heap stack — no deep recursion.
-- `graph/` — in-memory symbol/edge store (uthash) with rwlock; ranked
-  post-index name resolution preferring same-file/module, definitions, and
-  symbol kind.
-- `store/` — SQLite cache with schema/semantic versioning; stale caches rebuild
-  automatically on version change (no manual delete).
-- `retrieve/` — graph retrieval, compact context-packet rendering, and expansion handles.
-- `api/` — minimal HTTP server exposing the endpoints above.
-- `indexer/`, `watcher/`, `jobs/`, `event/` — indexing pipeline and live updates.
-- `bench/` — built-in retrieval benchmark (`--bench`).
-- `ui/` — optional Causality GUI: a **Context** tab that runs the retrieval
-  engine on a typed task (type a query, press Enter, see the ranked bundle), plus
-  the force-directed dependency graph and Symbols/Calls/Files inspectors.
+- `parser/` — tree-sitter parsing (C, C++, Python, JS, TS, Go, Rust).
+- `extractor/` — cursor-based AST walk (no recursion) producing a per-file
+  extraction: symbols plus reference sites (calls, references, inheritance)
+  with their enclosing symbol and line.
+- `graph/` — in-memory symbol graph (uthash, rwlock). Files are replaced
+  atomically; reference sites persist and edges are derived, ref-counted, and
+  re-resolved when a changed file adds or removes candidate targets. Resolution
+  is kind-aware (calls bind to callables) and respects C translation-unit scope.
+- `store/` — SQLite cache (files, symbols, sites, embeddings) written per file;
+  schema/semantic versions rebuild stale caches automatically.
+- `indexer/` — full and incremental indexing, `ensure_fresh` for query-time
+  freshness.
+- `nav/` — outline, source, callers, callees, impact.
+- `search/` — BM25 + embedding candidates, fusion, rerank; background
+  embedding worker.
+- `model/` — llama.cpp reranker/embedder, pinned model fetch with sha256.
+- `tools/` — tool registry shared by `mcp/` and `api/`.
+- `retrieve/` — legacy context packets (GUI Context tab, `/context`).
+- `watcher/`, `jobs/`, `event/` — live updates and background work.
+- `bench/` — built-in search benchmark (`--bench`).
+- `ui/` — optional Causality GUI.

@@ -11,13 +11,24 @@ extern const TSLanguage *tree_sitter_rust(void);
 
 static TSParser *s_parsers[CTX_LANG_UNKNOWN];
 
-static uint32_t count_error_nodes(TSNode node) {
-    if (ts_node_is_null(node)) return 0;
+/* Counts ERROR and MISSING nodes with a cursor walk (no recursion, so deeply
+ * nested generated sources cannot overflow the thread stack). */
+static uint32_t count_error_nodes(TSNode root) {
+    if (ts_node_is_null(root)) return 0;
     uint32_t count = 0;
-    if (ts_node_is_error(node) || ts_node_is_missing(node)) count++;
-    uint32_t n = ts_node_child_count(node);
-    for (uint32_t i = 0; i < n; i++)
-        count += count_error_nodes(ts_node_child(node, i));
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (ts_node_is_error(node) || ts_node_is_missing(node)) count++;
+        if (ts_node_has_error(node) && ts_tree_cursor_goto_first_child(&cursor)) continue;
+        bool advanced = false;
+        while (!advanced) {
+            if (ts_tree_cursor_goto_next_sibling(&cursor)) { advanced = true; break; }
+            if (!ts_tree_cursor_goto_parent(&cursor)) break;
+        }
+        if (!advanced) break;
+    }
+    ts_tree_cursor_delete(&cursor);
     return count;
 }
 

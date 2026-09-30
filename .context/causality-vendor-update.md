@@ -41,13 +41,36 @@
   fence is already waited when `on_render` runs, so resizing that slot's buffer
   is safe. Pipeline recreation and `ctx_force_graph_destroy()` call
   `vkDeviceWaitIdle` first.
-- Local Causality fix (uncommitted in submodule): `ca_viewport_gpu_destroy()`
-  waited only on the viewport's render fences, but `render_done` and
-  `desc_set` are also used by the swapchain composite submit. Viewport resize
-  destroyed in-use objects -> GPU address fault -> device lost -> SIGSEGV in
-  `vkQueuePresentKHR`. Now idles `gfx_queue` (same pattern as
-  `ca_image_destroy_impl`).
+- Causality fix (interim queue-wait version committed as `e132838`; deferred
+  destruction below supersedes it): viewport GPU objects were
+  destroyed on resize/node removal while the window's composite submit still
+  waited on `render_done` / sampled `desc_set` -> GPU address fault -> device
+  lost -> SIGSEGV in `vkQueuePresentKHR`. Now deferred destruction:
+  - `ca_viewport_gpu_retire(inst, win, vp)` moves a viewport generation into
+    `Ca_Swapchain.retired_viewport_storage` (`Ca_ViewportRetired`), tagged with
+    `Ca_Swapchain.submit_serial` (monotonic composite submit count;
+    `Ca_Frame.submit_serial` records each slot's latest submit).
+  - `ca_viewport_collect_retired(inst, win, device_idle)` frees entries once
+    every composite slot is past the tag or fence-signaled and the retired
+    render fences are signaled. Non-blocking; runs per window in
+    `ca_renderer_frame` and with `device_idle=true` in `ca_swapchain_destroy`.
+  - Immediate release only for partial `ca_viewport_gpu_create` failures or
+    when the window has no swapchain; synchronous `vkQueueWaitIdle` fallback
+    only if the retired list cannot grow.
+  - `ca_viewport_gpu_destroy` no longer exists; callers use retire.
 - GUI mode now honors SIGINT/SIGTERM via async-signal-safe
   `ctx_ui_request_close()` polled by the `ctx_ui_run()` tick loop.
 - Verified: clean build (no ctx warnings), ctest 3/3, GUI run with live graph
   updates shows no Vulkan validation errors and exits 0 on SIGINT.
+
+## Causality Abandoned-Frame Recovery
+
+- `ca_swapchain_frame` failure paths after `vkResetFences(in_flight)`
+  (begin/end command buffer, wait-storage allocation, queue submit) call
+  `swapchain_abandon_frame`: allocation-free command-free submits consume the
+  acquire semaphore and viewport `render_done` semaphores, the last signals
+  `in_flight`, then the swapchain is recreated to release the acquired,
+  unpresented image. Previously: fence never signaled (next-frame hang) and
+  acquired images leaked until `vkAcquireNextImageKHR` blocked.
+- Verified by temporary fault injection (5 forced `vkEndCommandBuffer`
+  failures): each recovered via swapchain recreation, no validation errors.
