@@ -20,8 +20,9 @@ Legacy `get_context`/`expand_context` removed from MCP; `/context*` HTTP and
 - `ctx_graph_replace_file(g, path, ex|NULL, resolve)`: one write lock; with
   resolve, re-resolves other files' sites whose target name was defined in the
   old or new content (fixes lost incoming callers after edits).
-- `pick_target`: kind-aware (`kind_accepts`: calls→fn/method/macro/class) and
-  C translation-unit scope (static fns/macros in .c only bind same-file).
+- `pick_target`: kind-aware (`kind_accepts`: calls→fn/method/macro/class),
+  scope-aware (see `name-resolution.md`) and C translation-unit scope (static
+  fns/macros/anonymous-namespace members in .c/.cpp only bind same-file).
 - Site source = same-named symbol in file whose range contains the line
   (deterministic tie-breaks `symbol_tighter`/`symbol_preferred`).
 
@@ -30,7 +31,7 @@ Legacy `get_context`/`expand_context` removed from MCP; `/context*` HTTP and
   types tracked in the walk (no `ts_node_parent`). Generic `*@L:C` nodes and
   body-less `struct X` references are no longer emitted (was 84% of symbols).
 
-## Store (schema v3, semantic v7)
+## Store (schema v6, semantic v12 — see name-resolution.md)
 files(mtime_ns,size), symbols, sites, embeddings(key=fnv(model|text)).
 `ctx_store_commit_files` = per-file DELETE+INSERT in one txn (fixed ghost
 symbols); load streams ORDER BY file per file then `resolve_all`.

@@ -12,6 +12,10 @@ typedef enum {
     CTX_EDGE_REFERENCES, CTX_EDGE_INHERITS
 } CtxEdgeKind;
 
+/* Scope component recorded for C++ anonymous namespaces; members are private
+ * to their translation unit and transparent to qualified lookup. */
+#define CTX_ANONYMOUS_SCOPE "(anonymous namespace)"
+
 /*
  * Indexed symbol. Strings are never NULL and live in the same allocation as
  * the symbol; file is interned in the owning CtxGraphFile. All of them stay
@@ -22,7 +26,7 @@ typedef struct {
     const char    *name;
     const char    *file;
     const char    *signature;
-    const char    *scope;        /* enclosing class/struct/namespace, "" at file scope */
+    const char    *scope;        /* "::"-joined enclosing namespaces/classes, "" at file scope */
     uint32_t       line;
     uint32_t       col;
     uint32_t       end_line;     /* last source line of the symbol body (>= line) */
@@ -57,23 +61,92 @@ typedef struct CtxEdgeEntry {
 } CtxEdgeEntry;
 
 /*
+ * Type expressions describe how the static type of an object is obtained;
+ * they are evaluated at resolution time, once every file is known.
+ *
+ *   head  T<path>  declared type          S  this / self
+ *         B        super()                V<name>  member of the caller's class
+ *         C<path>  result of calling path (constructor or function return)
+ *   step  |f<name> field of the current type
+ *         |m<name> result of calling method name on the current type
+ *
+ * Paths are "::"-joined. Example: "Sengine_|mcache" is this->engine_.cache().
+ */
+#define CTX_TYPE_STEP_SEP '|'
+
+/*
  * Unresolved-by-name reference recorded at extraction time. Sites persist so
  * edges can be re-resolved whenever the set of candidate targets changes.
+ * Every string is owned by the site.
  *
- * from_name  Enclosing symbol name, NULL at file scope (owned).
- * to_name    Referenced name (owned).
+ * from_name  Enclosing symbol name, NULL at file scope.
+ * to_name    Referenced name without qualifier.
+ * to_scope   Explicit "::" qualifier written at the site (ns::Foo in
+ *            ns::Foo::bar()), NULL when unqualified.
+ * recv       Type expression of the receiver of a member site, NULL if unknown.
+ * arg_types  ';'-separated type expressions of call arguments, used for
+ *            argument-dependent lookup; NULL when none are known.
  * from_line  Source line of the reference.
+ * member     Target is reached through an object (obj.f(), ptr->f()).
  * res_from   Resolved source symbol id, 0 when unresolved.
  * res_to     Resolved target symbol id, 0 when unresolved.
  */
 typedef struct {
     char        *from_name;
     char        *to_name;
+    char        *to_scope;
+    char        *recv;
+    char        *arg_types;
     uint32_t     from_line;
     CtxEdgeKind  kind;
+    bool         member;
     uint64_t     res_from;
     uint64_t     res_to;
 } CtxRefSite;
+
+/* Borrowed-string input for ctx_file_extract_add_site; NULL/"" means absent. */
+typedef struct {
+    const char  *from_name;
+    const char  *to_name;
+    const char  *to_scope;
+    const char  *recv;
+    const char  *arg_types;
+    uint32_t     from_line;
+    CtxEdgeKind  kind;
+    bool         member;
+} CtxSiteDraft;
+
+/* Name-lookup declarations that change how C++ names resolve. */
+typedef enum {
+    CTX_DECL_USING_NAMESPACE = 0, /* using namespace target;                  */
+    CTX_DECL_USING,               /* using target;   (name = last component)  */
+    CTX_DECL_NAMESPACE_ALIAS,     /* namespace name = target;                 */
+    CTX_DECL_TYPE_ALIAS,          /* using name = target; / typedef target name; */
+    CTX_DECL_FIELD,               /* data member name; target = type expression */
+    CTX_DECL_RETURN               /* function name returns target (type expression) */
+} CtxDeclKind;
+
+/*
+ * One lookup declaration of a file. Strings are owned.
+ *
+ * scope     "::"-joined scope the declaration appears in ("" global; the
+ *           owning class path for fields, the function's scope for returns).
+ *           Never NULL.
+ * name      Introduced name; NULL for using-directives.
+ * target    "::" path the declaration refers to. Never NULL.
+ * line      First line the declaration is visible on.
+ * end_line  Last line of the enclosing block.
+ * local     Declared inside a function body (visible only in that range).
+ */
+typedef struct {
+    char        *scope;
+    char        *name;
+    char        *target;
+    uint32_t     line;
+    uint32_t     end_line;
+    CtxDeclKind  kind;
+    bool         local;
+} CtxLookupDecl;
 
 /* Output buffer of one file extraction: symbol drafts plus reference sites. */
 typedef struct {
@@ -83,6 +156,9 @@ typedef struct {
     CtxRefSite *sites;
     uint32_t    site_count;
     uint32_t    site_cap;
+    CtxLookupDecl *decls;
+    uint32_t    decl_count;
+    uint32_t    decl_cap;
 } CtxFileExtract;
 
 /* Per-file graph entry. symbols are ordered by (line, col). version changes
@@ -94,6 +170,11 @@ typedef struct CtxGraphFile {
     uint32_t        symbol_count;
     CtxRefSite     *sites;
     uint32_t        site_count;
+    CtxLookupDecl  *decls;
+    uint32_t        decl_count;
+    struct CtxGraphFile **includes;   /* resolved direct #includes (cache) */
+    uint32_t        include_count;
+    uint64_t        include_epoch;    /* g->include_epoch the cache was built for, 0 = stale */
     UT_hash_handle  hh;
 } CtxGraphFile;
 
@@ -106,12 +187,44 @@ typedef struct CtxNameEntry {
     UT_hash_handle  hh;
 } CtxNameEntry;
 
+/* Non-local lookup declarations sharing one name. */
+typedef struct CtxDeclEntry {
+    char                 *name;
+    const CtxLookupDecl **decls;
+    const CtxGraphFile  **files;
+    uint32_t              count;
+    uint32_t              cap;
+    UT_hash_handle        hh;
+} CtxDeclEntry;
+
+/* Resolved base classes of one class (from inheritance edges). */
+typedef struct CtxBaseEntry {
+    uint64_t        class_id;
+    uint64_t       *base_ids;
+    uint32_t        count;
+    uint32_t        cap;
+    UT_hash_handle  hh;
+} CtxBaseEntry;
+
+/* Files sharing one basename, used to map #include strings to files. */
+typedef struct CtxBasenameEntry {
+    char                 *basename;
+    CtxGraphFile        **files;
+    uint32_t              count;
+    uint32_t              cap;
+    UT_hash_handle        hh;
+} CtxBasenameEntry;
+
 typedef struct {
     CtxSymbol    *symbols;   /* by id */
     CtxEdgeEntry *edges;     /* by composite key */
     CtxGraphFile *files;     /* by path */
     CtxNameEntry *names;     /* by name */
+    CtxDeclEntry *decls;     /* non-local lookup declarations by name */
+    CtxBaseEntry *bases;     /* class id -> base class ids */
+    CtxBasenameEntry *basenames; /* file basename -> files */
     uint64_t      version_seq;
+    uint64_t      include_epoch;  /* bumped whenever the file set changes */
 #if defined(CTX_PLATFORM_WINDOWS)
     SRWLOCK          lock;
 #else
@@ -126,19 +239,35 @@ uint64_t  ctx_symbol_id(const char *file, const char *name, uint32_t line);
 bool ctx_file_extract_add_symbol(CtxFileExtract *ex, const CtxSymbolDraft *sym);
 
 /*
- * Appends a reference site to an extraction buffer.
- *
- * from_name  Enclosing symbol name; NULL or "" for file scope.
- * from_line  Source line of the reference.
- * to_name    Referenced name; ignored when NULL or empty.
- * kind       Edge kind produced once resolved.
+ * Appends a reference site to an extraction buffer, copying its strings.
+ * Sites without to_name are ignored. Returns false on allocation failure.
  */
-bool ctx_file_extract_add_site(CtxFileExtract *ex, const char *from_name,
-                               uint32_t from_line, const char *to_name,
-                               CtxEdgeKind kind);
+bool ctx_file_extract_add_site(CtxFileExtract *ex, const CtxSiteDraft *site);
+
+/*
+ * Appends a lookup declaration to an extraction buffer, copying its strings.
+ *
+ * kind      Declaration kind.
+ * scope     Enclosing scope (NULL treated as "").
+ * name      Introduced name; NULL/"" for using-directives.
+ * target    Referenced path; declarations without one are ignored.
+ * line      First visible line.
+ * end_line  Last line of the enclosing block.
+ * local     Declared inside a function body.
+ */
+bool ctx_file_extract_add_decl(CtxFileExtract *ex, CtxDeclKind kind, const char *scope,
+                               const char *name, const char *target,
+                               uint32_t line, uint32_t end_line, bool local);
 
 /* Releases everything owned by an extraction buffer and zeroes it. */
 void ctx_file_extract_free(CtxFileExtract *ex);
+
+/*
+ * True when a symbol lives under qualifier ("::" or "." separated): its scope
+ * ends with it, or for Python its module path plus scope does
+ * ("pkg.mod.Class" matches method Class.run in pkg/mod.py).
+ */
+bool ctx_symbol_in_scope(const CtxSymbol *s, const char *qualifier);
 
 CtxGraph *ctx_graph_create(void);
 void      ctx_graph_destroy(CtxGraph *g);

@@ -356,7 +356,7 @@ static void resolve_locked(CtxGraph *g, const char *root, const char *symbol,
             CtxSymbol *s = n->symbols[i];
             if (!is_navigable(s)) continue;
             if (file_abs[0] && strcmp(s->file, file_abs) != 0) continue;
-            if (use_scope && strcmp(s->scope, scope) != 0) continue;
+            if (use_scope && !ctx_symbol_in_scope(s, scope)) continue;
             if (m->count < NAV_MAX_MATCHES) m->items[m->count++] = s;
             else m->truncated = true;
         }
@@ -698,15 +698,18 @@ static void collect_sites_locked(CtxGraph *g, const IdSet *targets, bool calls, 
     if (out->count > 1) qsort(out->items, out->count, sizeof(SiteRef), site_order);
 }
 
-/* Target ids: every match plus same-named declarations/definitions of the
- * best match, since resolution may bind a call to a prototype or a body. */
+/* Target ids: every match plus same-named, same-scope declarations/definitions
+ * of the best match, since resolution may bind a call to a prototype or a body. */
 static void build_targets(const Matches *m, CtxGraph *g, IdSet *out) {
     for (uint32_t i = 0; i < m->count; i++) id_set_add(out, m->items[i]->id);
     if (m->count) {
-        const CtxNameEntry *n = ctx_graph_find_name_locked(g, m->items[0]->name);
-        for (uint32_t i = 0; n && i < n->count; i++)
-            if (n->symbols[i]->kind == m->items[0]->kind || is_callable(n->symbols[i]))
-                id_set_add(out, n->symbols[i]->id);
+        const CtxSymbol *best = m->items[0];
+        const CtxNameEntry *n = ctx_graph_find_name_locked(g, best->name);
+        for (uint32_t i = 0; n && i < n->count; i++) {
+            const CtxSymbol *s = n->symbols[i];
+            if (strcmp(s->scope, best->scope) != 0) continue;
+            if (s->kind == best->kind || is_callable(s)) id_set_add(out, s->id);
+        }
     }
     id_set_seal(out);
 }
@@ -872,7 +875,9 @@ char *ctx_nav_callees(CtxGraph *g, const char *symbol, const char *file) {
         const CtxSymbol *target = site->res_to ? ctx_graph_find_by_id_locked(g, site->res_to) : NULL;
         if (!target) {
             if (unresolved_count < 40 && !strstr(unresolved.data ? unresolved.data : "", site->to_name))
-                ctx_buf_printf(&unresolved, "%s%s", unresolved_count ? ", " : "", site->to_name);
+                ctx_buf_printf(&unresolved, "%s%s%s%s", unresolved_count ? ", " : "",
+                               site->to_scope ? site->to_scope : "", site->to_scope ? "::" : "",
+                               site->to_name);
             unresolved_count++;
             continue;
         }

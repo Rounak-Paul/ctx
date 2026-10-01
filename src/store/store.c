@@ -25,7 +25,7 @@ static bool exec_sql(const char *sql) {
 
 /* Bumped whenever the table layout changes. A mismatch drops the cached
  * tables so they are rebuilt with the current columns — no manual delete. */
-#define CTX_STORE_SCHEMA_VERSION 3
+#define CTX_STORE_SCHEMA_VERSION 6
 
 static void migrate_schema(void) {
     exec_sql("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);");
@@ -44,6 +44,7 @@ static void migrate_schema(void) {
     CTX_LOG_INFO("Store schema %d → %d; rebuilding cached tables", stored, CTX_STORE_SCHEMA_VERSION);
     exec_sql("DROP TABLE IF EXISTS symbols; DROP TABLE IF EXISTS edges;"
              "DROP TABLE IF EXISTS sites; DROP TABLE IF EXISTS files;"
+             "DROP TABLE IF EXISTS decls;"
              "DROP TABLE IF EXISTS embeddings;"
              "DELETE FROM meta WHERE key='semantic_index_version';");
     char vbuf[16];
@@ -70,13 +71,18 @@ static bool create_schema(void) {
         "  signature TEXT, scope TEXT, lang INTEGER, is_definition INTEGER);"
         "CREATE TABLE IF NOT EXISTS sites("
         "  file TEXT NOT NULL, from_name TEXT, from_line INTEGER,"
-        "  to_name TEXT NOT NULL, kind INTEGER);"
+        "  to_name TEXT NOT NULL, to_scope TEXT, kind INTEGER, member INTEGER,"
+        "  recv TEXT, arg_types TEXT);"
+        "CREATE TABLE IF NOT EXISTS decls("
+        "  file TEXT NOT NULL, kind INTEGER, scope TEXT, name TEXT, target TEXT NOT NULL,"
+        "  line INTEGER, end_line INTEGER, local INTEGER);"
         "CREATE TABLE IF NOT EXISTS embeddings("
         "  key INTEGER PRIMARY KEY, dim INTEGER, vec BLOB);"
         "CREATE TABLE IF NOT EXISTS stats("
         "  key TEXT PRIMARY KEY, value INTEGER);"
         "CREATE INDEX IF NOT EXISTS idx_sym_file ON symbols(file);"
         "CREATE INDEX IF NOT EXISTS idx_site_file ON sites(file);"
+        "CREATE INDEX IF NOT EXISTS idx_decl_file ON decls(file);"
     );
 }
 
@@ -228,22 +234,29 @@ bool ctx_store_load_graph(CtxGraph *g) {
     pthread_mutex_lock(&s_lock);
     if (!s_db) { pthread_mutex_unlock(&s_lock); return false; }
 
-    sqlite3_stmt *syms = NULL, *sites = NULL;
+    sqlite3_stmt *syms = NULL, *sites = NULL, *decls = NULL;
     bool ok = sqlite3_prepare_v2(s_db,
                   "SELECT file,id,name,line,col,end_line,kind,signature,scope,lang,is_definition"
                   " FROM symbols ORDER BY file;", -1, &syms, NULL) == SQLITE_OK &&
               sqlite3_prepare_v2(s_db,
-                  "SELECT file,from_name,from_line,to_name,kind FROM sites ORDER BY file;",
-                  -1, &sites, NULL) == SQLITE_OK;
+                  "SELECT file,from_name,from_line,to_name,to_scope,kind,member,recv,arg_types"
+                  " FROM sites ORDER BY file;",
+                  -1, &sites, NULL) == SQLITE_OK &&
+              sqlite3_prepare_v2(s_db,
+                  "SELECT file,kind,scope,name,target,line,end_line,local FROM decls ORDER BY file;",
+                  -1, &decls, NULL) == SQLITE_OK;
     bool syms_live = ok && sqlite3_step(syms) == SQLITE_ROW;
     bool sites_live = ok && sqlite3_step(sites) == SQLITE_ROW;
+    bool decls_live = ok && sqlite3_step(decls) == SQLITE_ROW;
 
     char path[4096];
     CtxSymbolDraft draft;
-    while (syms_live || sites_live) {
-        const char *sf = cursor_file(syms, syms_live);
-        const char *tf = cursor_file(sites, sites_live);
-        const char *next = !sf ? tf : !tf ? sf : (strcmp(sf, tf) <= 0 ? sf : tf);
+    while (syms_live || sites_live || decls_live) {
+        const char *next = NULL;
+        const char *heads[3] = { cursor_file(syms, syms_live), cursor_file(sites, sites_live),
+                                 cursor_file(decls, decls_live) };
+        for (int h = 0; h < 3; h++)
+            if (heads[h] && (!next || strcmp(heads[h], next) < 0)) next = heads[h];
         if (!next) break;
         snprintf(path, sizeof(path), "%s", next);
 
@@ -254,17 +267,35 @@ bool ctx_store_load_graph(CtxGraph *g) {
             syms_live = sqlite3_step(syms) == SQLITE_ROW;
         }
         while (sites_live && !strcmp(cursor_file(sites, true), path)) {
-            ctx_file_extract_add_site(&ex,
-                (const char *)sqlite3_column_text(sites, 1),
-                (uint32_t)sqlite3_column_int(sites, 2),
-                (const char *)sqlite3_column_text(sites, 3),
-                (CtxEdgeKind)sqlite3_column_int(sites, 4));
+            CtxSiteDraft site = {
+                .from_name = (const char *)sqlite3_column_text(sites, 1),
+                .from_line = (uint32_t)sqlite3_column_int(sites, 2),
+                .to_name   = (const char *)sqlite3_column_text(sites, 3),
+                .to_scope  = (const char *)sqlite3_column_text(sites, 4),
+                .kind      = (CtxEdgeKind)sqlite3_column_int(sites, 5),
+                .member    = sqlite3_column_int(sites, 6) != 0,
+                .recv      = (const char *)sqlite3_column_text(sites, 7),
+                .arg_types = (const char *)sqlite3_column_text(sites, 8),
+            };
+            ctx_file_extract_add_site(&ex, &site);
             sites_live = sqlite3_step(sites) == SQLITE_ROW;
+        }
+        while (decls_live && !strcmp(cursor_file(decls, true), path)) {
+            ctx_file_extract_add_decl(&ex,
+                (CtxDeclKind)sqlite3_column_int(decls, 1),
+                (const char *)sqlite3_column_text(decls, 2),
+                (const char *)sqlite3_column_text(decls, 3),
+                (const char *)sqlite3_column_text(decls, 4),
+                (uint32_t)sqlite3_column_int(decls, 5),
+                (uint32_t)sqlite3_column_int(decls, 6),
+                sqlite3_column_int(decls, 7) != 0);
+            decls_live = sqlite3_step(decls) == SQLITE_ROW;
         }
         ctx_graph_replace_file(g, path, &ex, false);
     }
     sqlite3_finalize(syms);
     sqlite3_finalize(sites);
+    sqlite3_finalize(decls);
     pthread_mutex_unlock(&s_lock);
 
     uint32_t edges = ctx_graph_resolve_all(g);
@@ -273,7 +304,14 @@ bool ctx_store_load_graph(CtxGraph *g) {
     return ok;
 }
 
-enum { ST_UPSERT_FILE, ST_DEL_SYMS, ST_DEL_SITES, ST_INS_SYM, ST_INS_SITE, ST_COMMIT_COUNT };
+enum { ST_UPSERT_FILE, ST_DEL_SYMS, ST_DEL_SITES, ST_DEL_DECLS, ST_INS_SYM, ST_INS_SITE,
+       ST_INS_DECL, ST_COMMIT_COUNT };
+
+/* Binds an optional string: NULL becomes SQL NULL. */
+static void bind_optional_text(sqlite3_stmt *stmt, int col, const char *text) {
+    if (text) sqlite3_bind_text(stmt, col, text, -1, SQLITE_STATIC);
+    else      sqlite3_bind_null(stmt, col);
+}
 
 static bool write_file_content(sqlite3_stmt **st, const CtxGraphFile *f) {
     bool ok = true;
@@ -297,11 +335,27 @@ static bool write_file_content(sqlite3_stmt **st, const CtxGraphFile *f) {
         const CtxRefSite *site = &f->sites[i];
         sqlite3_stmt *ins = st[ST_INS_SITE];
         sqlite3_bind_text(ins, 1, f->path, -1, SQLITE_STATIC);
-        if (site->from_name) sqlite3_bind_text(ins, 2, site->from_name, -1, SQLITE_STATIC);
-        else                 sqlite3_bind_null(ins, 2);
+        bind_optional_text(ins, 2, site->from_name);
         sqlite3_bind_int (ins, 3, (int)site->from_line);
         sqlite3_bind_text(ins, 4, site->to_name, -1, SQLITE_STATIC);
-        sqlite3_bind_int (ins, 5, (int)site->kind);
+        bind_optional_text(ins, 5, site->to_scope);
+        sqlite3_bind_int (ins, 6, (int)site->kind);
+        sqlite3_bind_int (ins, 7, site->member ? 1 : 0);
+        bind_optional_text(ins, 8, site->recv);
+        bind_optional_text(ins, 9, site->arg_types);
+        ok = step_done(ins);
+    }
+    for (uint32_t i = 0; ok && i < f->decl_count; i++) {
+        const CtxLookupDecl *d = &f->decls[i];
+        sqlite3_stmt *ins = st[ST_INS_DECL];
+        sqlite3_bind_text(ins, 1, f->path, -1, SQLITE_STATIC);
+        sqlite3_bind_int (ins, 2, (int)d->kind);
+        sqlite3_bind_text(ins, 3, d->scope, -1, SQLITE_STATIC);
+        bind_optional_text(ins, 4, d->name);
+        sqlite3_bind_text(ins, 5, d->target, -1, SQLITE_STATIC);
+        sqlite3_bind_int (ins, 6, (int)d->line);
+        sqlite3_bind_int (ins, 7, (int)d->end_line);
+        sqlite3_bind_int (ins, 8, d->local ? 1 : 0);
         ok = step_done(ins);
     }
     return ok;
@@ -314,9 +368,12 @@ bool ctx_store_commit_files(CtxGraph *g, const CtxStoreFileState *files, uint32_
         "INSERT OR REPLACE INTO files(path,mtime_ns,size,lang,error_count) VALUES(?,?,?,?,?);",
         "DELETE FROM symbols WHERE file=?;",
         "DELETE FROM sites WHERE file=?;",
+        "DELETE FROM decls WHERE file=?;",
         ("INSERT OR REPLACE INTO symbols(id,file,name,line,col,end_line,kind,signature,scope,lang,is_definition)"
          " VALUES(?,?,?,?,?,?,?,?,?,?,?);"),
-        "INSERT INTO sites(file,from_name,from_line,to_name,kind) VALUES(?,?,?,?,?);",
+        ("INSERT INTO sites(file,from_name,from_line,to_name,to_scope,kind,member,recv,arg_types)"
+         " VALUES(?,?,?,?,?,?,?,?,?);"),
+        "INSERT INTO decls(file,kind,scope,name,target,line,end_line,local) VALUES(?,?,?,?,?,?,?,?);",
     };
 
     pthread_mutex_lock(&s_lock);
@@ -340,7 +397,7 @@ bool ctx_store_commit_files(CtxGraph *g, const CtxStoreFileState *files, uint32_
         sqlite3_bind_int  (up, 4, fs->lang);
         sqlite3_bind_int  (up, 5, fs->error_count);
         ok = step_done(up);
-        for (int d = ST_DEL_SYMS; ok && d <= ST_DEL_SITES; d++) {
+        for (int d = ST_DEL_SYMS; ok && d <= ST_DEL_DECLS; d++) {
             sqlite3_bind_text(st[d], 1, fs->path, -1, SQLITE_STATIC);
             ok = step_done(st[d]);
         }
@@ -358,28 +415,30 @@ bool ctx_store_commit_files(CtxGraph *g, const CtxStoreFileState *files, uint32_
 bool ctx_store_remove_files(const char *const *paths, uint32_t count) {
     if (!paths && count) return false;
     if (count == 0) return true;
-    static const char *const sql[3] = {
+    enum { REMOVE_COUNT = 4 };
+    static const char *const sql[REMOVE_COUNT] = {
         "DELETE FROM files WHERE path=?;",
         "DELETE FROM symbols WHERE file=?;",
         "DELETE FROM sites WHERE file=?;",
+        "DELETE FROM decls WHERE file=?;",
     };
     pthread_mutex_lock(&s_lock);
     if (!s_db) { pthread_mutex_unlock(&s_lock); return false; }
-    sqlite3_stmt *st[3] = {0};
-    if (!prepare_all(sql, st, 3) || !exec_sql("BEGIN;")) {
-        finalize_all(st, 3);
+    sqlite3_stmt *st[REMOVE_COUNT] = {0};
+    if (!prepare_all(sql, st, REMOVE_COUNT) || !exec_sql("BEGIN;")) {
+        finalize_all(st, REMOVE_COUNT);
         pthread_mutex_unlock(&s_lock);
         return false;
     }
     bool ok = true;
     for (uint32_t i = 0; ok && i < count; i++) {
         if (!paths[i]) continue;
-        for (int d = 0; ok && d < 3; d++) {
+        for (int d = 0; ok && d < REMOVE_COUNT; d++) {
             sqlite3_bind_text(st[d], 1, paths[i], -1, SQLITE_STATIC);
             ok = step_done(st[d]);
         }
     }
-    finalize_all(st, 3);
+    finalize_all(st, REMOVE_COUNT);
     ok = commit_or_rollback(ok);
     pthread_mutex_unlock(&s_lock);
     return ok;

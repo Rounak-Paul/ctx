@@ -29,3 +29,4 @@ Thumbs.db
 
 # clangd index
 .cache/
+__pycache__/

@@ -312,6 +312,18 @@ if(UNIX)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mcp_smoke.py $<TARGET_FILE:ctx>
     )
     add_test(
+        NAME cpp_scope_smoke
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/cpp_scope_smoke.py $<TARGET_FILE:ctx>
+    )
+    add_test(
+        NAME c_resolution_smoke
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/c_resolution_smoke.py $<TARGET_FILE:ctx>
+    )
+    add_test(
+        NAME python_resolution_smoke
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/python_resolution_smoke.py $<TARGET_FILE:ctx>
+    )
+    add_test(
         NAME install_smoke
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/install_smoke.py $<TARGET_FILE:ctx>
     )

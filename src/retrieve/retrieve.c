@@ -244,8 +244,7 @@ static bool has_static_storage_marker(const char *signature) {
 static bool symbol_is_public_entrypoint(const CtxSymbol *s) {
     if (!s) return false;
     if (is_vendor_path(s->file)) return false;
-    if (s->scope[0]) return false;
-    if (s->kind == CTX_SYM_FUNCTION || s->kind == CTX_SYM_METHOD) {
+    if (s->kind == CTX_SYM_FUNCTION) {
         if (s->end_line <= s->line) return false;
     } else if (s->kind == CTX_SYM_CLASS || s->kind == CTX_SYM_STRUCT ||
                s->kind == CTX_SYM_ENUM || s->kind == CTX_SYM_TYPEDEF) {

@@ -19,53 +19,168 @@ static char *node_text(const char *src, TSNode node, char *buf, size_t buf_sz) {
 }
 
 static bool is_identifier_type(const char *type);
+static bool is_name_node(const char *type);
+static void dotted_path(const char *src, TSNode node, char *out, size_t out_size);
 
-static void rightmost_symbol_name(char *text) {
-    if (!text || !text[0]) return;
-
-    char *last = text;
-    for (char *p = text; *p; ++p) {
-        if (*p == '.' || *p == ':' || *p == '>' || *p == '/') {
-            char *next = p + 1;
-            while (*next == ':' || *next == '>' || *next == '.' || *next == '/') next++;
-            if (*next) last = next;
-        }
-    }
-    if (last != text)
-        memmove(text, last, strlen(last) + 1);
-
-    size_t len = strlen(text);
-    while (len > 0 && !isalnum((unsigned char)text[len - 1]) && text[len - 1] != '_')
-        text[--len] = '\0';
+static bool is_ident_char(char c) {
+    return isalnum((unsigned char)c) || c == '_' || c == '$';
 }
 
-static bool symbol_name_from_node(const char *src, TSNode node, char *buf, size_t buf_sz) {
+/*
+ * Splits a source-level name into its unqualified name and "::" qualifier.
+ * Template arguments, parenthesised parts (decltype) and whitespace are
+ * dropped, a leading global "::" is ignored, and member access (a.b, a->b)
+ * keeps only the member. Operator names are kept verbatim.
+ *   "ns::Foo<int>::bar" -> name "bar", qualifier "ns::Foo"
+ *   "obj->field.method" -> name "method", qualifier ""
+ *
+ * text            Name text taken from the source.
+ * name            Receives the unqualified name ("" when none).
+ * name_size       Capacity of name.
+ * qualifier       Receives the "::"-joined qualifier; may be NULL.
+ * qualifier_size  Capacity of qualifier.
+ */
+static void parse_qualified_name(const char *text, char *name, size_t name_size,
+                                 char *qualifier, size_t qualifier_size) {
+    size_t name_len = 0, qual_len = 0;
+    name[0] = '\0';
+    if (qualifier && qualifier_size) qualifier[0] = '\0';
+    if (!text) return;
+
+    uint32_t depth = 0;
+    for (const char *p = text; *p;) {
+        char c = *p;
+        if (depth > 0) {
+            if (c == '<' || c == '(') depth++;
+            else if (c == '>' || c == ')') depth--;
+            p++;
+            continue;
+        }
+        if (name_len == 0 && !strncmp(p, "operator", 8) && !is_ident_char(p[8])) {
+            bool space = false;
+            for (; *p && name_len + 1 < name_size; p++) {
+                if (isspace((unsigned char)*p)) { space = true; continue; }
+                if (space && is_ident_char(*p) && is_ident_char(name[name_len - 1]))
+                    name[name_len++] = ' ';
+                if (name_len + 1 < name_size) name[name_len++] = *p;
+                space = false;
+            }
+            break;
+        }
+        if (c == ':' && p[1] == ':') {
+            if (name_len && qualifier && qual_len + name_len + 3 < qualifier_size) {
+                if (qual_len) { qualifier[qual_len++] = ':'; qualifier[qual_len++] = ':'; }
+                memcpy(qualifier + qual_len, name, name_len);
+                qual_len += name_len;
+                qualifier[qual_len] = '\0';
+            }
+            name_len = 0;
+            p += 2;
+            continue;
+        }
+        if (c == '.' || (c == '-' && p[1] == '>')) {
+            name_len = 0;
+            qual_len = 0;
+            if (qualifier && qualifier_size) qualifier[0] = '\0';
+            p += c == '.' ? 1 : 2;
+            continue;
+        }
+        if (c == '<' || c == '(') depth++;
+        else if ((is_ident_char(c) || (c == '~' && name_len == 0)) && name_len + 1 < name_size)
+            name[name_len++] = c;
+        p++;
+    }
+    name[name_len] = '\0';
+}
+
+/*
+ * Extracts the symbol name (and qualifier) a node denotes: the node itself
+ * when it is a name node, else its first name descendant in source order.
+ *
+ * src             Source text backing the node.
+ * node            Node to inspect.
+ * buf             Receives the unqualified name.
+ * buf_sz          Capacity of buf.
+ * qualifier       Receives the "::" qualifier; may be NULL.
+ * qualifier_size  Capacity of qualifier.
+ * Returns true when a non-empty name was found.
+ */
+static bool symbol_name_from_node(const char *src, TSNode node, char *buf, size_t buf_sz,
+                                  char *qualifier, size_t qualifier_size) {
     if (!buf || buf_sz == 0) return false;
     buf[0] = '\0';
+    if (qualifier && qualifier_size) qualifier[0] = '\0';
     if (ts_node_is_null(node)) return false;
-
-    const char *type = ts_node_type(node);
-    if (is_identifier_type(type)) {
-        node_text(src, node, buf, buf_sz);
-        rightmost_symbol_name(buf);
-        return buf[0] != '\0';
-    }
 
     TSNode stack[128];
     uint32_t count = 0;
     stack[count++] = node;
     while (count > 0) {
         TSNode cur = stack[--count];
-        if (is_identifier_type(ts_node_type(cur))) {
-            node_text(src, cur, buf, buf_sz);
-            rightmost_symbol_name(buf);
+        if (is_name_node(ts_node_type(cur))) {
+            char text[512];
+            node_text(src, cur, text, sizeof(text));
+            parse_qualified_name(text, buf, buf_sz, qualifier, qualifier_size);
             return buf[0] != '\0';
         }
         uint32_t n = ts_node_child_count(cur);
-        for (uint32_t i = 0; i < n && count < 128; ++i)
-            stack[count++] = ts_node_child(cur, i);
+        for (uint32_t i = n; i > 0 && count < 128; --i)
+            stack[count++] = ts_node_child(cur, i - 1);
     }
     return false;
+}
+
+/*
+ * Resolves the target named by a call's function expression or a base-class
+ * entry. Member access keeps only the member and reports the object
+ * expression. C/C++/Rust field access (obj.f, ptr->f) and this/self access
+ * in other languages are flagged as member targets.
+ *
+ * src             Source text backing the node.
+ * node            Function/base expression node.
+ * name            Receives the unqualified target name.
+ * name_size       Capacity of name.
+ * qualifier       Receives the explicit "::" qualifier.
+ * qualifier_size  Capacity of qualifier.
+ * member          Set when the target is reached through an object.
+ * object          Receives the object expression of a member access (null
+ *                 node otherwise); may be NULL.
+ * Returns true when a target name was found.
+ */
+static bool target_from_node(const char *src, TSNode node, char *name, size_t name_size,
+                             char *qualifier, size_t qualifier_size, bool *member, TSNode *object) {
+    TSNode null = {0};
+    TSNode obj = null;
+    *member = false;
+    if (object) *object = null;
+    if (ts_node_is_null(node)) return false;
+    const char *type = ts_node_type(node);
+    TSNode field = null;
+    if (!strcmp(type, "field_expression")) {
+        field = ts_node_child_by_field_name(node, "field", 5);
+        obj = ts_node_child_by_field_name(node, "argument", 8);
+        *member = !ts_node_is_null(field);
+    } else if (!strcmp(type, "member_expression") || !strcmp(type, "attribute")) {
+        field = ts_node_child_by_field_name(node, type[0] == 'm' ? "property" : "attribute",
+                                            type[0] == 'm' ? 8 : 9);
+        obj = ts_node_child_by_field_name(node, "object", 6);
+        if (!ts_node_is_null(obj) && !ts_node_is_null(field)) {
+            char text[8];
+            node_text(src, obj, text, sizeof(text));
+            *member = !strcmp(text, "this") || !strcmp(text, "self");
+        }
+    } else if (!strcmp(type, "selector_expression")) {
+        field = ts_node_child_by_field_name(node, "field", 5);
+    }
+    if (!ts_node_is_null(field)) node = field;
+    if (object && *member) *object = obj;
+    return symbol_name_from_node(src, node, name, name_size, qualifier, qualifier_size);
+}
+
+/* Writes outer::inner (either may be empty) into out. */
+static void join_scope(char *out, size_t out_size, const char *outer, const char *inner) {
+    if (outer[0] && inner[0]) snprintf(out, out_size, "%s::%s", outer, inner);
+    else                      snprintf(out, out_size, "%s", outer[0] ? outer : inner);
 }
 
 /* ---- find first child of given type ---- */
@@ -121,6 +236,29 @@ static bool is_identifier_type(const char *type) {
                     !strcmp(type, "package_identifier")); /* Go package-qualified names */
 }
 
+/* Nodes whose text spells a (possibly qualified or templated) symbol name. */
+static bool is_name_node(const char *type) {
+    return is_identifier_type(type) || (type && (
+               !strcmp(type, "qualified_type_identifier") ||
+               !strcmp(type, "qualified_field_identifier") ||
+               !strcmp(type, "scoped_type_identifier") ||
+               !strcmp(type, "template_function") ||
+               !strcmp(type, "template_method") ||
+               !strcmp(type, "template_type") ||
+               !strcmp(type, "generic_type") ||
+               !strcmp(type, "destructor_name") ||
+               !strcmp(type, "operator_name")));
+}
+
+/* Nodes spelling a "::" path; their own children are parts of that path. */
+static bool is_qualified_node(const char *type) {
+    return type && (!strcmp(type, "qualified_identifier") ||
+                    !strcmp(type, "qualified_type_identifier") ||
+                    !strcmp(type, "qualified_field_identifier") ||
+                    !strcmp(type, "scoped_identifier") ||
+                    !strcmp(type, "scoped_type_identifier"));
+}
+
 static bool is_inheritance_container(const char *type) {
     return type && (type_contains(type, "superclass") ||
                     type_contains(type, "base_class") ||
@@ -154,8 +292,9 @@ static bool is_call_target(const char *parent_type, const char *grand_type) {
 }
 
 /*
- * Emits inheritance edges from a class-like symbol to base symbols found in
- * language-specific inheritance clauses.
+ * Emits inheritance sites from a class-like symbol to the bases named in its
+ * language-specific inheritance clauses. Each base expression (ns::Base<T>,
+ * mod.Base) yields one site carrying its explicit qualifier.
  *
  * ex         Extraction buffer receiving inheritance reference sites.
  * source     Source text backing the tree-sitter nodes.
@@ -170,6 +309,8 @@ static void emit_inheritance_edges(CtxFileExtract *ex, const char *source,
 
     TSNode containers[16];
     uint32_t container_count = 0;
+    TSNode superclasses = ts_node_child_by_field_name(node, "superclasses", 12);
+    if (!ts_node_is_null(superclasses)) containers[container_count++] = superclasses;
     uint32_t child_count = ts_node_child_count(node);
     for (uint32_t i = 0; i < child_count && container_count < 16; ++i) {
         TSNode child = ts_node_child(node, i);
@@ -184,13 +325,29 @@ static void emit_inheritance_edges(CtxFileExtract *ex, const char *source,
         while (count > 0) {
             TSNode cur = stack[--count];
             const char *ctype = ts_node_type(cur);
-            if (is_identifier_type(ctype)) {
-                char base_name[256] = {0};
-                node_text(source, cur, base_name, sizeof(base_name));
-                if (base_name[0] && strcmp(base_name, class_name) != 0) {
-                    ctx_file_extract_add_site(ex, class_name, class_line,
-                                              base_name, CTX_EDGE_INHERITS);
+            if (!strcmp(ctype, "keyword_argument")) continue;
+            if (is_name_node(ctype) || is_qualified_node(ctype) ||
+                !strcmp(ctype, "attribute") || !strcmp(ctype, "member_expression")) {
+                char base_name[256], base_scope[256];
+                bool member = false;
+                bool found;
+                if (!strcmp(ctype, "attribute")) {
+                    char path[256];
+                    dotted_path(source, cur, path, sizeof(path));
+                    parse_qualified_name(path, base_name, sizeof(base_name), base_scope, sizeof(base_scope));
+                    found = base_name[0] != '\0';
+                } else {
+                    found = target_from_node(source, cur, base_name, sizeof(base_name),
+                                             base_scope, sizeof(base_scope), &member, NULL);
                 }
+                if (found && strcmp(base_name, class_name) != 0) {
+                    CtxSiteDraft site = {
+                        .from_name = class_name, .from_line = class_line, .to_name = base_name,
+                        .to_scope = base_scope, .kind = CTX_EDGE_INHERITS,
+                    };
+                    ctx_file_extract_add_site(ex, &site);
+                }
+                continue;
             }
             uint32_t n = ts_node_child_count(cur);
             for (uint32_t j = n; j > 0 && count < 128; --j)
@@ -233,28 +390,6 @@ static bool is_variable_decl(const char *ntype) {
                      !strcmp(ntype, "variable_declaration"));
 }
 
-/*
- * Splits a C++ qualified name in place: "ns::Foo::bar" leaves "bar" in name
- * and writes "Foo" to qualifier. Template arguments in the qualifier are
- * dropped. Unqualified names leave qualifier empty.
- */
-static void split_qualified_name(char *name, char *qualifier, size_t qualifier_size) {
-    qualifier[0] = '\0';
-    char *last = NULL;
-    for (char *p = strstr(name, "::"); p; p = strstr(p + 2, "::")) last = p;
-    if (!last) return;
-    char *prev = NULL;
-    for (char *p = strstr(name, "::"); p && p < last; p = strstr(p + 2, "::")) prev = p;
-    const char *qstart = prev ? prev + 2 : name;
-    size_t qlen = (size_t)(last - qstart);
-    const char *angle = memchr(qstart, '<', qlen);
-    if (angle) qlen = (size_t)(angle - qstart);
-    if (qlen >= qualifier_size) qlen = qualifier_size - 1;
-    memcpy(qualifier, qstart, qlen);
-    qualifier[qlen] = '\0';
-    memmove(name, last + 2, strlen(last + 2) + 1);
-}
-
 /* ---- symbol kind from node type string ---- */
 static CtxSymbolKind sym_kind_for(const char *ntype) {
     /* C / C++ / Python / JS / TS */
@@ -267,7 +402,8 @@ static CtxSymbolKind sym_kind_for(const char *ntype) {
         return CTX_SYM_CLASS;
     if (!strcmp(ntype, "struct_specifier")) return CTX_SYM_STRUCT;
     if (!strcmp(ntype, "enum_specifier"))   return CTX_SYM_ENUM;
-    if (!strcmp(ntype, "typedef_declaration") || !strcmp(ntype, "type_alias_declaration"))
+    if (!strcmp(ntype, "typedef_declaration") || !strcmp(ntype, "type_alias_declaration") ||
+        !strcmp(ntype, "type_definition") || !strcmp(ntype, "alias_declaration"))
         return CTX_SYM_TYPEDEF;
     if (!strcmp(ntype, "preproc_def") || !strcmp(ntype, "preproc_function_def"))
         return CTX_SYM_MACRO;
@@ -305,7 +441,14 @@ static bool is_type_reference(TSNode node, const char *ntype) {
            ts_node_is_null(find_child(node, "enumerator_list"));
 }
 
-/* ---- recursive AST walk ---- */
+/* ---- AST walk ---- */
+
+/* Declared type of a local variable or parameter, in declaration order. */
+typedef struct {
+    char name[64];
+    char type[256];  /* type expression, "" when untyped */
+} LocalVar;
+
 typedef struct {
     CtxFileExtract *ex;
     const char *source;
@@ -313,15 +456,40 @@ typedef struct {
     uint8_t     lang;
     const char *parent_type;  /* type of the current node's parent, NULL at root */
     const char *grand_type;   /* type of the grandparent, NULL near the root */
+    TSNode      parent;       /* parent of the current node, null at the root */
     char        enclosing_fn[256]; /* name of the innermost function being walked */
-    char        enclosing_scope[256]; /* nearest class/struct/namespace for scope tagging */
+    char        enclosing_scope[256]; /* "::"-joined enclosing namespaces/classes */
+    bool        scope_is_type; /* innermost scope is a class/struct/trait/impl body */
+    bool        in_method;    /* enclosing function is a member of a class */
+    bool        fn_return_known; /* enclosing function's return type is recorded */
+    char        fn_scope[256]; /* full scope of the enclosing function (class path for methods) */
+    LocalVar   *vars;         /* typed locals/parameters of the enclosing functions */
+    uint32_t    var_count;
+    uint32_t    var_cap;
 } WalkCtx;
+
+/* Function and scope a node opens for its subtree. */
+typedef struct {
+    bool opens_fn;
+    bool opens_scope;
+    bool scope_is_type;
+    bool fn_in_method;      /* function is a class member (in-class or Class::f) */
+    bool fn_return_known;   /* function's return type was recorded */
+    char fn[256];           /* function name */
+    char fn_scope[256];     /* function's full scope */
+    char scope[256];        /* scope path relative to the enclosing scope */
+} NodeScope;
 
 /* Enclosing function/scope saved when the walk enters a node that opens one;
  * restored once the walk leaves that node's subtree. */
 typedef struct {
     uint32_t depth;
+    uint32_t var_count;
+    bool     scope_is_type;
+    bool     in_method;
+    bool     fn_return_known;
     char     fn[256];
+    char     fn_scope[256];
     char     scope[256];
 } ScopeSave;
 
@@ -341,6 +509,11 @@ static bool scope_stack_push(ScopeStack *stack, uint32_t depth, const WalkCtx *c
     }
     ScopeSave *save = &stack->items[stack->count++];
     save->depth = depth;
+    save->var_count = ctx->var_count;
+    save->scope_is_type = ctx->scope_is_type;
+    save->in_method = ctx->in_method;
+    save->fn_return_known = ctx->fn_return_known;
+    memcpy(save->fn_scope, ctx->fn_scope, sizeof(save->fn_scope));
     memcpy(save->fn, ctx->enclosing_fn, sizeof(save->fn));
     memcpy(save->scope, ctx->enclosing_scope, sizeof(save->scope));
     return true;
@@ -350,26 +523,792 @@ static bool scope_stack_push(ScopeStack *stack, uint32_t depth, const WalkCtx *c
 static void scope_stack_unwind(ScopeStack *stack, uint32_t depth, WalkCtx *ctx) {
     while (stack->count > 0 && stack->items[stack->count - 1].depth >= depth) {
         ScopeSave *save = &stack->items[--stack->count];
+        ctx->scope_is_type = save->scope_is_type;
+        ctx->in_method = save->in_method;
+        ctx->fn_return_known = save->fn_return_known;
+        memcpy(ctx->fn_scope, save->fn_scope, sizeof(ctx->fn_scope));
+        ctx->var_count = save->var_count;
         memcpy(ctx->enclosing_fn, save->fn, sizeof(ctx->enclosing_fn));
         memcpy(ctx->enclosing_scope, save->scope, sizeof(ctx->enclosing_scope));
     }
 }
 
-static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
-                         bool *pushed_scope, char pushed_name[256]) {
-    *pushed_fn = false;
-    *pushed_scope = false;
-    pushed_name[0] = '\0';
+/*
+ * Writes the "::"-joined path of a C++ namespace name node (namespace_identifier
+ * or nested_namespace_specifier, possibly with inline segments) into out.
+ */
+static void namespace_path(const char *src, TSNode name_node, char *out, size_t out_size) {
+    out[0] = '\0';
+    size_t len = 0;
+    TSNode stack[64];
+    uint32_t count = 0;
+    stack[count++] = name_node;
+    while (count > 0) {
+        TSNode cur = stack[--count];
+        if (!strcmp(ts_node_type(cur), "namespace_identifier")) {
+            char part[256];
+            node_text(src, cur, part, sizeof(part));
+            int n = snprintf(out + len, out_size - len, "%s%s", len ? "::" : "", part);
+            if (n < 0 || (size_t)n >= out_size - len) return;
+            len += (size_t)n;
+            continue;
+        }
+        uint32_t n = ts_node_child_count(cur);
+        for (uint32_t i = n; i > 0 && count < 64; --i)
+            stack[count++] = ts_node_child(cur, i - 1);
+    }
+}
+
+/* Copies a node's source (up to body, when present) into a one-line signature. */
+static void signature_until(const char *src, TSNode node, TSNode body, char *out, size_t out_size) {
+    uint32_t sig_start = ts_node_start_byte(node);
+    uint32_t sig_end = ts_node_is_null(body) ? ts_node_end_byte(node) : ts_node_start_byte(body);
+    uint32_t sig_len = sig_end > sig_start ? sig_end - sig_start : 0;
+    if (sig_len >= out_size) sig_len = (uint32_t)(out_size - 1);
+    memcpy(out, src + sig_start, sig_len);
+    out[sig_len] = '\0';
+    for (size_t i = 0; out[i]; i++) if (out[i] == '\n' || out[i] == '\t') out[i] = ' ';
+}
+
+/* ---- type expressions and lookup-declaration tracking ---- */
+
+static bool is_cpp_family(uint8_t lang) {
+    return lang == CTX_LANG_C || lang == CTX_LANG_CPP;
+}
+
+/* Writes the "::" path a name node spells (template arguments dropped). */
+static void node_path(const char *src, TSNode node, char *out, size_t out_size) {
+    char name[256], qual[256];
+    out[0] = '\0';
+    if (symbol_name_from_node(src, node, name, sizeof(name), qual, sizeof(qual)))
+        join_scope(out, out_size, qual, name);
+}
+
+/*
+ * Writes the "::" path of a pure dotted name (a, a.b.c); "" when node is
+ * anything else (calls, subscripts, literals).
+ */
+static void dotted_path(const char *src, TSNode node, char *out, size_t out_size) {
+    out[0] = '\0';
+    const char *t = ts_node_type(node);
+    if (!strcmp(t, "identifier") || !strcmp(t, "dotted_name")) {
+        char text[256];
+        node_text(src, node, text, sizeof(text));
+        size_t len = 0;
+        for (const char *p = text; *p && len + 3 < out_size; p++) {
+            if (*p == '.') { out[len++] = ':'; out[len++] = ':'; }
+            else if (!isspace((unsigned char)*p)) out[len++] = *p;
+        }
+        out[len] = '\0';
+        return;
+    }
+    if (strcmp(t, "attribute") != 0) return;
+    char base[256], attr[128];
+    dotted_path(src, ts_node_child_by_field_name(node, "object", 6), base, sizeof(base));
+    TSNode name = ts_node_child_by_field_name(node, "attribute", 9);
+    if (!base[0] || ts_node_is_null(name)) return;
+    node_text(src, name, attr, sizeof(attr));
+    snprintf(out, out_size, "%s::%s", base, attr);
+}
+
+/* Template argument list of a (possibly qualified) templated name, or null. */
+static TSNode template_arguments(TSNode node) {
+    TSNode null = {0};
+    for (int depth = 0; depth < 8 && !ts_node_is_null(node); depth++) {
+        const char *t = ts_node_type(node);
+        if (!strcmp(t, "template_type") || !strcmp(t, "template_function") ||
+            !strcmp(t, "template_method"))
+            return ts_node_child_by_field_name(node, "arguments", 9);
+        if (!is_qualified_node(t)) break;
+        node = ts_node_child_by_field_name(node, "name", 4);
+    }
+    return null;
+}
+
+/* Wrappers whose -> / * / result yield their first template argument. */
+static bool is_pointer_wrapper(const char *path) {
+    const char *last = strrchr(path, ':');
+    const char *name = last ? last + 1 : path;
+    return !strcmp(name, "unique_ptr") || !strcmp(name, "shared_ptr") ||
+           !strcmp(name, "weak_ptr") || !strcmp(name, "optional") ||
+           !strcmp(name, "make_unique") || !strcmp(name, "make_shared");
+}
+
+static void declared_type_path(const char *src, TSNode type, char *out, size_t out_size, int depth);
+
+/* Type path of the first type argument of a template, "" when none. */
+static void first_template_type(const char *src, TSNode args, char *out, size_t out_size, int depth) {
+    out[0] = '\0';
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) == 0) return;
+    TSNode arg = ts_node_named_child(args, 0);
+    if (!strcmp(ts_node_type(arg), "type_descriptor"))
+        arg = ts_node_child_by_field_name(arg, "type", 4);
+    declared_type_path(src, arg, out, out_size, depth + 1);
+}
+
+/*
+ * Writes the class path a C/C++ declared type denotes: the named type, the
+ * pointee of a smart pointer/optional, or "" for primitive, auto and unnamed
+ * types.
+ *
+ * type   Type specifier node.
+ * depth  Recursion depth through wrapper template arguments.
+ */
+static void declared_type_path(const char *src, TSNode type, char *out, size_t out_size, int depth) {
+    out[0] = '\0';
+    if (ts_node_is_null(type) || depth > 3) return;
+    const char *t = ts_node_type(type);
+    if (!strcmp(t, "primitive_type") || !strcmp(t, "sized_type_specifier") ||
+        !strcmp(t, "placeholder_type_specifier") || !strcmp(t, "auto") ||
+        !strcmp(t, "decltype"))
+        return;
+    if (!strcmp(t, "struct_specifier") || !strcmp(t, "class_specifier") ||
+        !strcmp(t, "union_specifier") || !strcmp(t, "enum_specifier")) {
+        TSNode name = ts_node_child_by_field_name(type, "name", 4);
+        if (!ts_node_is_null(name)) node_path(src, name, out, out_size);
+        return;
+    }
+    if (!is_name_node(t) && !is_qualified_node(t)) return;
+    node_path(src, type, out, out_size);
+    if (is_pointer_wrapper(out)) first_template_type(src, template_arguments(type), out, out_size, depth);
+}
+
+/*
+ * Writes the class path a Python annotation denotes: Foo, pkg.Foo,
+ * Optional[Foo], Foo | None and "Foo" forward references; "" otherwise.
+ */
+static void python_type_path(const char *src, TSNode type, char *out, size_t out_size, int depth) {
+    out[0] = '\0';
+    if (ts_node_is_null(type) || depth > 4) return;
+    const char *t = ts_node_type(type);
+    if (!strcmp(t, "type") || !strcmp(t, "union_type") || !strcmp(t, "binary_operator")) {
+        if (ts_node_named_child_count(type))
+            python_type_path(src, ts_node_named_child(type, 0), out, out_size, depth + 1);
+    } else if (!strcmp(t, "identifier") || !strcmp(t, "attribute") || !strcmp(t, "member_type")) {
+        if (!strcmp(t, "member_type")) {
+            char text[256];
+            node_text(src, type, text, sizeof(text));
+            size_t len = 0;
+            for (const char *p = text; *p && len + 3 < out_size; p++) {
+                if (*p == '.') { out[len++] = ':'; out[len++] = ':'; }
+                else if (!isspace((unsigned char)*p)) out[len++] = *p;
+            }
+            out[len] = '\0';
+        } else {
+            dotted_path(src, type, out, out_size);
+        }
+        if (!strcmp(out, "None")) out[0] = '\0';
+    } else if (!strcmp(t, "generic_type") || !strcmp(t, "subscript")) {
+        TSNode base = !strcmp(t, "subscript") ? ts_node_child_by_field_name(type, "value", 5)
+                                              : ts_node_named_child(type, 0);
+        python_type_path(src, base, out, out_size, depth + 1);
+        if (!strcmp(out, "Optional") || !strcmp(out, "typing::Optional")) {
+            TSNode arg = !strcmp(t, "subscript") ? ts_node_child_by_field_name(type, "subscript", 9)
+                                                 : ts_node_named_child(type, 1);
+            if (!ts_node_is_null(arg) && !strcmp(ts_node_type(arg), "type_parameter") &&
+                ts_node_named_child_count(arg))
+                arg = ts_node_named_child(arg, 0);
+            python_type_path(src, arg, out, out_size, depth + 1);
+        }
+    } else if (!strcmp(t, "string")) {
+        char text[256];
+        node_text(src, type, text, sizeof(text));
+        size_t len = 0;
+        for (const char *p = text; *p && len + 3 < out_size; p++) {
+            if (*p == '"' || *p == '\'') continue;
+            if (*p == '.') { out[len++] = ':'; out[len++] = ':'; }
+            else out[len++] = *p;
+        }
+        out[len] = '\0';
+    }
+}
+
+/* Writes "T<path>" into out, or "" when path is empty. */
+static void type_expr_of_path(const char *path, char *out, size_t out_size) {
+    if (path[0]) snprintf(out, out_size, "T%s", path);
+    else out[0] = '\0';
+}
+
+/*
+ * Name declared by a (possibly nested pointer/reference/array/init)
+ * declarator; false for function declarators and unnamed declarators.
+ */
+static bool declarator_name(const char *src, TSNode decl, char *out, size_t out_size) {
+    out[0] = '\0';
+    for (int depth = 0; depth < 16 && !ts_node_is_null(decl); depth++) {
+        const char *t = ts_node_type(decl);
+        if (!strcmp(t, "identifier") || !strcmp(t, "field_identifier") || !strcmp(t, "type_identifier")) {
+            node_text(src, decl, out, out_size);
+            return out[0] != '\0';
+        }
+        if (!strcmp(t, "function_declarator") || !strcmp(t, "abstract_function_declarator")) return false;
+        TSNode inner = ts_node_child_by_field_name(decl, "declarator", 10);
+        if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0)
+            inner = ts_node_named_child(decl, 0);
+        decl = inner;
+    }
+    return false;
+}
+
+/* Function declarator wrapped by a declarator (Foo *f(int)), or null. */
+static TSNode function_declarator_of(TSNode decl) {
+    TSNode null = {0};
+    for (int depth = 0; depth < 8 && !ts_node_is_null(decl); depth++) {
+        if (!strcmp(ts_node_type(decl), "function_declarator")) return decl;
+        decl = ts_node_child_by_field_name(decl, "declarator", 10);
+    }
+    return null;
+}
+
+/* Remembers the type expression of a local/global variable or parameter. */
+static void local_var_add(WalkCtx *ctx, const char *name, const char *type) {
+    if (!name[0]) return;
+    if (ctx->var_count >= ctx->var_cap) {
+        uint32_t cap = ctx->var_cap ? ctx->var_cap * 2 : 32;
+        LocalVar *next = (LocalVar *)realloc(ctx->vars, cap * sizeof(LocalVar));
+        if (!next) return;
+        ctx->vars = next;
+        ctx->var_cap = cap;
+    }
+    LocalVar *v = &ctx->vars[ctx->var_count++];
+    snprintf(v->name, sizeof(v->name), "%s", name);
+    snprintf(v->type, sizeof(v->type), "%s", type);
+}
+
+/* Type expression of the latest visible variable named name ("" when untyped), or NULL. */
+static const char *local_var_type(const WalkCtx *ctx, const char *name) {
+    for (uint32_t i = ctx->var_count; i > 0; i--)
+        if (!strcmp(ctx->vars[i - 1].name, name)) return ctx->vars[i - 1].type;
+    return NULL;
+}
+
+/* Last line of the block enclosing the current node (where a declaration stays visible). */
+static uint32_t enclosing_block_end(const WalkCtx *ctx, TSNode node) {
+    TSNode block = ts_node_is_null(ctx->parent) ? node : ctx->parent;
+    return ts_node_end_point(block).row + 1;
+}
+
+/* True for the receiver names that denote the current object. */
+static bool is_self_name(const WalkCtx *ctx, const char *name) {
+    if (ctx->lang == CTX_LANG_PYTHON) return !strcmp(name, "self") || !strcmp(name, "cls");
+    return !strcmp(name, "this");
+}
+
+/* Root identifier of a Python attribute chain (a in a.b.c), or null. */
+static TSNode attribute_root(TSNode node) {
+    for (int depth = 0; depth < 32 && !ts_node_is_null(node); depth++) {
+        if (strcmp(ts_node_type(node), "attribute") != 0) return node;
+        node = ts_node_child_by_field_name(node, "object", 6);
+    }
+    TSNode null = {0};
+    return null;
+}
+
+/*
+ * True when a Python object expression denotes a value (self, a variable,
+ * a call result) rather than a module or class path, whose attributes are
+ * qualified names instead of members.
+ */
+static bool python_is_value(const WalkCtx *ctx, TSNode object) {
+    TSNode root = attribute_root(object);
+    if (ts_node_is_null(root) || strcmp(ts_node_type(root), "identifier") != 0) return true;
+    char name[64];
+    node_text(ctx->source, root, name, sizeof(name));
+    return is_self_name(ctx, name) || local_var_type(ctx, name) != NULL;
+}
+
+#define CTX_EXPR_DEPTH 6
+
+static void expr_type(const WalkCtx *ctx, TSNode node, char *out, size_t out_size, int depth);
+
+/* Appends a "|<tag><name>" step to base (a type expression) into out. */
+static void expr_step(const char *base, char tag, const char *name, char *out, size_t out_size) {
+    int n = snprintf(out, out_size, "%s%c%c%s", base, CTX_TYPE_STEP_SEP, tag, name);
+    if (n < 0 || (size_t)n >= out_size || !name[0]) out[0] = '\0';
+}
+
+/* Type expression of a call's result (constructor, function, method). */
+static void call_result_type(const WalkCtx *ctx, TSNode call, char *out, size_t out_size, int depth) {
+    out[0] = '\0';
+    TSNode fn = ts_node_child_by_field_name(call, "function", 8);
+    if (ts_node_is_null(fn)) return;
+    const char *t = ts_node_type(fn);
+    char base[256], name[128], path[256];
+    if (!strcmp(t, "field_expression") || !strcmp(t, "attribute")) {
+        bool python = t[0] == 'a';
+        TSNode obj = ts_node_child_by_field_name(fn, python ? "object" : "argument", python ? 6 : 8);
+        TSNode member = ts_node_child_by_field_name(fn, python ? "attribute" : "field", python ? 9 : 5);
+        if (ts_node_is_null(obj) || ts_node_is_null(member)) return;
+        symbol_name_from_node(ctx->source, member, name, sizeof(name), NULL, 0);
+        if (python && !python_is_value(ctx, obj)) {
+            dotted_path(ctx->source, fn, path, sizeof(path));
+            if (path[0]) snprintf(out, out_size, "C%s", path);
+            return;
+        }
+        expr_type(ctx, obj, base, sizeof(base), depth + 1);
+        if (base[0]) expr_step(base, 'm', name, out, out_size);
+        return;
+    }
+    if (ctx->lang == CTX_LANG_PYTHON && !strcmp(t, "identifier")) {
+        node_text(ctx->source, fn, name, sizeof(name));
+        if (!strcmp(name, "super")) { snprintf(out, out_size, "B"); return; }
+    }
+    if (!is_name_node(t) && !is_qualified_node(t)) return;
+    node_path(ctx->source, fn, path, sizeof(path));
+    if (is_pointer_wrapper(path)) {
+        first_template_type(ctx->source, template_arguments(fn), path, sizeof(path), 0);
+        type_expr_of_path(path, out, out_size);
+    } else if (path[0]) {
+        snprintf(out, out_size, "C%s", path);
+    }
+}
+
+/*
+ * Writes the type expression (see graph.h) of an expression node, or ""
+ * when it cannot be typed statically.
+ *
+ * depth  Recursion depth through member/call chains.
+ */
+static void expr_type(const WalkCtx *ctx, TSNode node, char *out, size_t out_size, int depth) {
+    out[0] = '\0';
+    if (ts_node_is_null(node) || depth > CTX_EXPR_DEPTH) return;
+    const char *t = ts_node_type(node);
+    char base[256], name[128];
+
+    if (!strcmp(t, "this")) {
+        snprintf(out, out_size, "S");
+    } else if (!strcmp(t, "identifier")) {
+        node_text(ctx->source, node, name, sizeof(name));
+        const char *local = is_self_name(ctx, name) ? NULL : local_var_type(ctx, name);
+        if (is_self_name(ctx, name)) snprintf(out, out_size, "S");
+        else if (local) snprintf(out, out_size, "%s", local);
+        else if (ctx->lang == CTX_LANG_CPP && ctx->fn_scope[0]) snprintf(out, out_size, "V%s", name);
+    } else if (!strcmp(t, "parenthesized_expression") || !strcmp(t, "await")) {
+        if (ts_node_named_child_count(node)) expr_type(ctx, ts_node_named_child(node, 0), out, out_size, depth + 1);
+    } else if (!strcmp(t, "pointer_expression")) {
+        expr_type(ctx, ts_node_child_by_field_name(node, "argument", 8), out, out_size, depth + 1);
+    } else if (!strcmp(t, "field_expression") || !strcmp(t, "attribute")) {
+        bool python = t[0] == 'a';
+        TSNode obj = ts_node_child_by_field_name(node, python ? "object" : "argument", python ? 6 : 8);
+        TSNode field = ts_node_child_by_field_name(node, python ? "attribute" : "field", python ? 9 : 5);
+        if (ts_node_is_null(field) || (python && !python_is_value(ctx, obj))) return;
+        expr_type(ctx, obj, base, sizeof(base), depth + 1);
+        node_text(ctx->source, field, name, sizeof(name));
+        if (base[0]) expr_step(base, 'f', name, out, out_size);
+    } else if (!strcmp(t, "new_expression")) {
+        char path[256];
+        declared_type_path(ctx->source, ts_node_child_by_field_name(node, "type", 4), path, sizeof(path), 0);
+        type_expr_of_path(path, out, out_size);
+    } else if (!strcmp(t, "compound_literal_expression")) {
+        TSNode type = ts_node_child_by_field_name(node, "type", 4);
+        if (!ts_node_is_null(type) && !strcmp(ts_node_type(type), "type_descriptor"))
+            type = ts_node_child_by_field_name(type, "type", 4);
+        char path[256];
+        declared_type_path(ctx->source, type, path, sizeof(path), 0);
+        type_expr_of_path(path, out, out_size);
+    } else if (is_call_node(t)) {
+        call_result_type(ctx, node, out, out_size, depth);
+    }
+}
+
+/* Adds a RETURN declaration for function name in scope. */
+static void record_return(WalkCtx *ctx, const char *scope, const char *name, const char *expr,
+                          uint32_t line) {
+    if (name[0] && expr[0])
+        ctx_file_extract_add_decl(ctx->ex, CTX_DECL_RETURN, scope, name, expr, line, line, false);
+}
+
+/*
+ * Records typed variables of a C/C++ declaration: locals, parameters and
+ * file-scope globals feed receiver/argument typing; data members of classes
+ * and structs become CTX_DECL_FIELD lookup declarations; function
+ * prototypes and in-class method declarations record their return types.
+ */
+static void record_declaration(WalkCtx *ctx, TSNode node, const char *ntype) {
+    bool in_fn = ctx->enclosing_fn[0] != '\0';
+    bool field = !strcmp(ntype, "field_declaration");
+    bool variable = !strcmp(ntype, "declaration") || !strcmp(ntype, "parameter_declaration") ||
+                    !strcmp(ntype, "optional_parameter_declaration") || !strcmp(ntype, "for_range_loop");
+    if (field ? in_fn || !ctx->scope_is_type : !variable) return;
+
+    char declared[256];
+    declared_type_path(ctx->source, ts_node_child_by_field_name(node, "type", 4),
+                       declared, sizeof(declared), 0);
+    uint32_t line = ts_node_start_point(node).row + 1;
+    uint32_t n = ts_node_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        const char *fname = ts_node_field_name_for_child(node, i);
+        if (!fname || strcmp(fname, "declarator") != 0) continue;
+        TSNode decl = ts_node_child(node, i);
+        char name[64], expr[256];
+
+        TSNode fn_decl = function_declarator_of(decl);
+        if (!ts_node_is_null(fn_decl)) {
+            char fn_name[256], qual[256], scope[256], ret[256];
+            node_path(ctx->source, ts_node_child_by_field_name(fn_decl, "declarator", 10),
+                      fn_name, sizeof(fn_name));
+            char bare[256];
+            parse_qualified_name(fn_name, bare, sizeof(bare), qual, sizeof(qual));
+            join_scope(scope, sizeof(scope), ctx->enclosing_scope, qual);
+            type_expr_of_path(declared, ret, sizeof(ret));
+            if (!in_fn) record_return(ctx, scope, bare, ret, line);
+            continue;
+        }
+        if (!declarator_name(ctx->source, decl, name, sizeof(name))) continue;
+        type_expr_of_path(declared, expr, sizeof(expr));
+        if (!expr[0] && !strcmp(ts_node_type(decl), "init_declarator"))
+            expr_type(ctx, ts_node_child_by_field_name(decl, "value", 5), expr, sizeof(expr), 0);
+        if (field) {
+            if (expr[0])
+                ctx_file_extract_add_decl(ctx->ex, CTX_DECL_FIELD, ctx->enclosing_scope, name, expr,
+                                          line, enclosing_block_end(ctx, node), false);
+        } else if (in_fn || !strcmp(ntype, "declaration")) {
+            local_var_add(ctx, name, expr);
+        }
+    }
+}
+
+/*
+ * Records C/C++ lookup declarations: using-directives, using-declarations,
+ * namespace aliases, alias-declarations and typedefs.
+ */
+static void record_lookup_decl(WalkCtx *ctx, TSNode node, const char *ntype) {
+    uint32_t line = ts_node_start_point(node).row + 1;
+    uint32_t end_line = enclosing_block_end(ctx, node);
+    bool local = ctx->enclosing_fn[0] != '\0';
+    char name[256] = {0}, target[256] = {0};
+
+    if (!strcmp(ntype, "using_declaration")) {
+        bool directive = false;
+        TSNode path = {0};
+        uint32_t n = ts_node_child_count(node);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode child = ts_node_child(node, i);
+            const char *t = ts_node_type(child);
+            if (!strcmp(t, "namespace")) directive = true;
+            else if (!strcmp(t, "enum")) return;
+            else if (!strcmp(t, "identifier") || !strcmp(t, "qualified_identifier")) path = child;
+        }
+        if (ts_node_is_null(path)) return;
+        char qual[256];
+        if (!symbol_name_from_node(ctx->source, path, name, sizeof(name), qual, sizeof(qual))) return;
+        join_scope(target, sizeof(target), qual, name);
+        if (directive) {
+            ctx_file_extract_add_decl(ctx->ex, CTX_DECL_USING_NAMESPACE, ctx->enclosing_scope,
+                                      NULL, target, line, end_line, local);
+        } else if (qual[0]) {
+            ctx_file_extract_add_decl(ctx->ex, CTX_DECL_USING, ctx->enclosing_scope,
+                                      name, target, line, end_line, local);
+        }
+    } else if (!strcmp(ntype, "namespace_alias_definition")) {
+        TSNode alias = ts_node_child_by_field_name(node, "name", 4);
+        if (ts_node_is_null(alias)) return;
+        node_text(ctx->source, alias, name, sizeof(name));
+        uint32_t n = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode child = ts_node_named_child(node, i);
+            if (ts_node_start_byte(child) <= ts_node_start_byte(alias)) continue;
+            namespace_path(ctx->source, child, target, sizeof(target));
+            break;
+        }
+        ctx_file_extract_add_decl(ctx->ex, CTX_DECL_NAMESPACE_ALIAS, ctx->enclosing_scope,
+                                  name, target, line, end_line, local);
+    } else if (!strcmp(ntype, "alias_declaration")) {
+        TSNode alias = ts_node_child_by_field_name(node, "name", 4);
+        TSNode type = ts_node_child_by_field_name(node, "type", 4);
+        if (ts_node_is_null(alias) || ts_node_is_null(type)) return;
+        node_text(ctx->source, alias, name, sizeof(name));
+        if (!strcmp(ts_node_type(type), "type_descriptor")) type = ts_node_child_by_field_name(type, "type", 4);
+        declared_type_path(ctx->source, type, target, sizeof(target), 0);
+        ctx_file_extract_add_decl(ctx->ex, CTX_DECL_TYPE_ALIAS, ctx->enclosing_scope,
+                                  name, target, line, end_line, local);
+    } else if (!strcmp(ntype, "type_definition")) {
+        declared_type_path(ctx->source, ts_node_child_by_field_name(node, "type", 4),
+                           target, sizeof(target), 0);
+        if (!target[0]) return;
+        uint32_t n = ts_node_child_count(node);
+        for (uint32_t i = 0; i < n; i++) {
+            const char *fname = ts_node_field_name_for_child(node, i);
+            if (!fname || strcmp(fname, "declarator") != 0) continue;
+            if (!declarator_name(ctx->source, ts_node_child(node, i), name, sizeof(name))) continue;
+            if (strcmp(name, target) != 0)
+                ctx_file_extract_add_decl(ctx->ex, CTX_DECL_TYPE_ALIAS, ctx->enclosing_scope,
+                                          name, target, line, end_line, local);
+        }
+    }
+}
+
+/* Converts a Python module reference (a.b, .a.b, ..) to a "::" path without leading dots. */
+static void python_module_path(const char *src, TSNode node, char *out, size_t out_size) {
+    char text[256];
+    node_text(src, node, text, sizeof(text));
+    const char *p = text;
+    while (*p == '.') p++;
+    size_t len = 0;
+    for (; *p && len + 3 < out_size; p++) {
+        if (*p == '.') { out[len++] = ':'; out[len++] = ':'; }
+        else if (!isspace((unsigned char)*p)) out[len++] = *p;
+    }
+    out[len] = '\0';
+}
+
+/*
+ * Records the names bound by a Python assignment/loop target (x, (a, b),
+ * [a, *rest]) as untyped values so their attributes are member accesses.
+ */
+static void record_python_targets(WalkCtx *ctx, TSNode target, int depth) {
+    if (ts_node_is_null(target) || depth > 8) return;
+    const char *t = ts_node_type(target);
+    if (!strcmp(t, "identifier")) {
+        char name[64];
+        node_text(ctx->source, target, name, sizeof(name));
+        local_var_add(ctx, name, "");
+    } else if (!strcmp(t, "pattern_list") || !strcmp(t, "tuple_pattern") || !strcmp(t, "list_pattern") ||
+               !strcmp(t, "tuple") || !strcmp(t, "list") || !strcmp(t, "expression_list") ||
+               !strcmp(t, "list_splat_pattern") || !strcmp(t, "as_pattern_target") ||
+               !strcmp(t, "parenthesized_expression")) {
+        uint32_t n = ts_node_named_child_count(target);
+        for (uint32_t i = 0; i < n; i++) record_python_targets(ctx, ts_node_named_child(target, i), depth + 1);
+    }
+}
+
+static bool is_python_comprehension(const char *t) {
+    return !strcmp(t, "list_comprehension") || !strcmp(t, "set_comprehension") ||
+           !strcmp(t, "dictionary_comprehension") || !strcmp(t, "generator_expression");
+}
+
+/*
+ * Records Python name bindings: imports (aliases visible in this module),
+ * typed locals/parameters/globals, class attributes and self.attr
+ * assignments (fields), and return types inferred from return statements.
+ */
+static void record_python(WalkCtx *ctx, TSNode node, const char *ntype) {
+    uint32_t line = ts_node_start_point(node).row + 1;
+    uint32_t end_line = enclosing_block_end(ctx, node);
+    bool local = ctx->enclosing_fn[0] != '\0';
+    char name[256], target[256], expr[256];
+
+    if (!strcmp(ntype, "import_statement")) {
+        uint32_t n = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode item = ts_node_named_child(node, i);
+            if (!strcmp(ts_node_type(item), "aliased_import")) {
+                python_module_path(ctx->source, ts_node_child_by_field_name(item, "name", 4),
+                                   target, sizeof(target));
+                node_text(ctx->source, ts_node_child_by_field_name(item, "alias", 5), name, sizeof(name));
+            } else {
+                python_module_path(ctx->source, item, target, sizeof(target));
+                size_t head = strcspn(target, ":");
+                snprintf(name, sizeof(name), "%.*s", (int)head, target);
+                target[head] = '\0';
+            }
+            ctx_file_extract_add_decl(ctx->ex, CTX_DECL_NAMESPACE_ALIAS, ctx->enclosing_scope,
+                                      name, target, line, end_line, local);
+        }
+    } else if (!strcmp(ntype, "import_from_statement")) {
+        char module[256];
+        python_module_path(ctx->source, ts_node_child_by_field_name(node, "module_name", 11),
+                           module, sizeof(module));
+        uint32_t n = ts_node_child_count(node);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode item = ts_node_child(node, i);
+            const char *fname = ts_node_field_name_for_child(node, i);
+            if (!strcmp(ts_node_type(item), "wildcard_import")) {
+                if (module[0])
+                    ctx_file_extract_add_decl(ctx->ex, CTX_DECL_USING_NAMESPACE, ctx->enclosing_scope,
+                                              NULL, module, line, end_line, local);
+                continue;
+            }
+            if (!fname || strcmp(fname, "name") != 0) continue;
+            char imported[256];
+            TSNode path = item;
+            name[0] = '\0';
+            if (!strcmp(ts_node_type(item), "aliased_import")) {
+                path = ts_node_child_by_field_name(item, "name", 4);
+                node_text(ctx->source, ts_node_child_by_field_name(item, "alias", 5), name, sizeof(name));
+            }
+            python_module_path(ctx->source, path, imported, sizeof(imported));
+            if (!name[0]) {
+                const char *last = strrchr(imported, ':');
+                snprintf(name, sizeof(name), "%s", last ? last + 1 : imported);
+            }
+            join_scope(target, sizeof(target), module, imported);
+            ctx_file_extract_add_decl(ctx->ex, CTX_DECL_USING, ctx->enclosing_scope,
+                                      name, target, line, end_line, local);
+        }
+    } else if (!strcmp(ntype, "assignment")) {
+        TSNode left = ts_node_child_by_field_name(node, "left", 4);
+        TSNode type = ts_node_child_by_field_name(node, "type", 4);
+        if (ts_node_is_null(left)) return;
+        char path[256];
+        python_type_path(ctx->source, type, path, sizeof(path), 0);
+        type_expr_of_path(path, expr, sizeof(expr));
+        if (!expr[0]) expr_type(ctx, ts_node_child_by_field_name(node, "right", 5), expr, sizeof(expr), 0);
+        const char *lt = ts_node_type(left);
+        if (strcmp(lt, "identifier") != 0 && strcmp(lt, "attribute") != 0) {
+            record_python_targets(ctx, left, 0);
+        } else if (!strcmp(lt, "identifier")) {
+            node_text(ctx->source, left, name, sizeof(name));
+            if (!local && ctx->scope_is_type) {
+                if (expr[0])
+                    ctx_file_extract_add_decl(ctx->ex, CTX_DECL_FIELD, ctx->enclosing_scope, name, expr,
+                                              line, end_line, false);
+            } else {
+                local_var_add(ctx, name, expr);
+            }
+        } else if (!strcmp(lt, "attribute") && ctx->in_method && expr[0]) {
+            TSNode obj = ts_node_child_by_field_name(left, "object", 6);
+            char owner[16];
+            node_text(ctx->source, obj, owner, sizeof(owner));
+            if (strcmp(ts_node_type(obj), "identifier") != 0 || strcmp(owner, "self") != 0) return;
+            node_text(ctx->source, ts_node_child_by_field_name(left, "attribute", 9), name, sizeof(name));
+            ctx_file_extract_add_decl(ctx->ex, CTX_DECL_FIELD, ctx->enclosing_scope, name, expr,
+                                      line, end_line, false);
+        }
+    } else if (!strcmp(ntype, "typed_parameter") || !strcmp(ntype, "typed_default_parameter") ||
+               !strcmp(ntype, "default_parameter")) {
+        TSNode id = ts_node_child_by_field_name(node, "name", 4);
+        if (ts_node_is_null(id) && ts_node_named_child_count(node)) id = ts_node_named_child(node, 0);
+        if (ts_node_is_null(id) || strcmp(ts_node_type(id), "identifier") != 0) return;
+        node_text(ctx->source, id, name, sizeof(name));
+        char path[256];
+        python_type_path(ctx->source, ts_node_child_by_field_name(node, "type", 4), path, sizeof(path), 0);
+        type_expr_of_path(path, expr, sizeof(expr));
+        local_var_add(ctx, name, expr);
+    } else if (!strcmp(ntype, "identifier") && ctx->parent_type &&
+               (!strcmp(ctx->parent_type, "parameters") || !strcmp(ctx->parent_type, "lambda_parameters"))) {
+        node_text(ctx->source, node, name, sizeof(name));
+        local_var_add(ctx, name, "");
+    } else if (!strcmp(ntype, "for_statement")) {
+        record_python_targets(ctx, ts_node_child_by_field_name(node, "left", 4), 0);
+    } else if (is_python_comprehension(ntype)) {
+        /* The body precedes its for-clauses in the tree; bind their targets first. */
+        uint32_t n = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode clause = ts_node_named_child(node, i);
+            if (!strcmp(ts_node_type(clause), "for_in_clause"))
+                record_python_targets(ctx, ts_node_child_by_field_name(clause, "left", 4), 0);
+        }
+    } else if (!strcmp(ntype, "as_pattern")) {
+        record_python_targets(ctx, ts_node_child_by_field_name(node, "alias", 5), 0);
+    } else if (!strcmp(ntype, "named_expression")) {
+        record_python_targets(ctx, ts_node_child_by_field_name(node, "name", 4), 0);
+    } else if (!strcmp(ntype, "return_statement") && local && !ctx->fn_return_known) {
+        if (!ts_node_named_child_count(node)) return;
+        expr_type(ctx, ts_node_named_child(node, 0), expr, sizeof(expr), 0);
+        if (!expr[0]) return;
+        record_return(ctx, ctx->enclosing_scope, ctx->enclosing_fn, expr, line);
+        ctx->fn_return_known = true;
+    }
+}
+
+#define CTX_ADL_MAX_ARGS 4
+
+/*
+ * Collects ';'-separated type expressions of a call's arguments for
+ * argument-dependent lookup: typed variables, constructed temporaries,
+ * call results and qualified names (whose qualifier names the namespace).
+ */
+static void argument_types(const WalkCtx *ctx, TSNode call, char *out, size_t out_size) {
+    out[0] = '\0';
+    TSNode args = ts_node_child_by_field_name(call, "arguments", 9);
+    if (ts_node_is_null(args)) return;
+    size_t len = 0;
+    uint32_t added = 0;
+    uint32_t n = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < n && added < CTX_ADL_MAX_ARGS; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        char type[256] = {0};
+        if (!strcmp(ts_node_type(arg), "qualified_identifier")) {
+            char path[256];
+            node_path(ctx->source, arg, path, sizeof(path));
+            type_expr_of_path(path, type, sizeof(type));
+        } else {
+            expr_type(ctx, arg, type, sizeof(type), 0);
+        }
+        if (!type[0] || strchr(type, ';')) continue;
+        int w = snprintf(out + len, out_size - len, "%s%s", len ? ";" : "", type);
+        if (w < 0 || (size_t)w >= out_size - len) {
+            out[len] = '\0';
+            return;
+        }
+        len += (size_t)w;
+        added++;
+    }
+}
+
+/*
+ * Classifies the target of a call or member reference.
+ *
+ * fn        Function expression of a call, or a member-access node.
+ * name      Receives the unqualified target name.
+ * qual      Receives the explicit qualifier (C++ ns::f, Python module.f).
+ * recv      Receives the receiver type expression of a member access.
+ * member    Set when the target is reached through an object.
+ * Returns true when a target name was found.
+ */
+static bool classify_target(const WalkCtx *ctx, TSNode fn, char *name, size_t name_size,
+                            char *qual, size_t qual_size, char *recv, size_t recv_size, bool *member) {
+    name[0] = qual[0] = recv[0] = '\0';
+    *member = false;
+    if (ts_node_is_null(fn)) return false;
+    const char *t = ts_node_type(fn);
+    if (!strcmp(t, "field_expression")) {
+        TSNode field = ts_node_child_by_field_name(fn, "field", 5);
+        if (ts_node_is_null(field)) return false;
+        symbol_name_from_node(ctx->source, field, name, name_size, qual, qual_size);
+        *member = true;
+        expr_type(ctx, ts_node_child_by_field_name(fn, "argument", 8), recv, recv_size, 0);
+        return name[0] != '\0';
+    }
+    if (!strcmp(t, "attribute")) {
+        TSNode obj = ts_node_child_by_field_name(fn, "object", 6);
+        TSNode attr = ts_node_child_by_field_name(fn, "attribute", 9);
+        if (ts_node_is_null(attr)) return false;
+        node_text(ctx->source, attr, name, name_size);
+        if (python_is_value(ctx, obj)) {
+            *member = true;
+            expr_type(ctx, obj, recv, recv_size, 0);
+        } else {
+            dotted_path(ctx->source, obj, qual, qual_size);
+        }
+        return name[0] != '\0';
+    }
+    bool object_member = false;
+    TSNode object;
+    if (!target_from_node(ctx->source, fn, name, name_size, qual, qual_size, &object_member, &object))
+        return false;
+    if (object_member) {
+        *member = true;
+        expr_type(ctx, object, recv, recv_size, 0);
+    }
+    return true;
+}
+
+/*
+ * Extracts the symbol or reference site a node contributes and reports the
+ * function/scope it opens for its subtree.
+ *
+ * ctx     Walk state (enclosing function/scope, parent types).
+ * node    Node being visited.
+ * opened  Receives the function/scope the node opens.
+ */
+static void process_node(WalkCtx *ctx, TSNode node, NodeScope *opened) {
+    memset(opened, 0, sizeof(*opened));
     const char *ntype = ts_node_type(node);
     char namebuf[256] = {0};
     char qualifier[256] = {0};
     char sigbuf[512]  = {0};
 
-    /* Skip error nodes but log once */
     if (ts_node_is_error(node)) {
         CTX_LOG_TRACE("Skipping ERROR node in %s at byte %u",
                       ctx->filepath, ts_node_start_byte(node));
-        /* Still recurse into children — partial info is better than none */
+    }
+    if (is_cpp_family(ctx->lang)) {
+        record_lookup_decl(ctx, node, ntype);
+        record_declaration(ctx, node, ntype);
+    } else if (ctx->lang == CTX_LANG_PYTHON) {
+        record_python(ctx, node, ntype);
     }
 
     CtxSymbolKind kind = sym_kind_for(ntype);
@@ -387,20 +1326,12 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
         if (ts_node_is_null(name_node)) name_node = find_descendant(decl, "identifier", 64);
         if (ts_node_is_null(name_node)) name_node = find_child(node, "identifier");
         if (!ts_node_is_null(name_node)) {
-            node_text(ctx->source, name_node, namebuf, sizeof(namebuf));
-            split_qualified_name(namebuf, qualifier, sizeof(qualifier));
-            /* signature = trim source of function node up to body */
+            char text[512];
+            node_text(ctx->source, name_node, text, sizeof(text));
+            parse_qualified_name(text, namebuf, sizeof(namebuf), qualifier, sizeof(qualifier));
             TSNode body = find_child(node, "compound_statement");
             if (ts_node_is_null(body)) body = find_child(node, "block");
-            if (!ts_node_is_null(body)) {
-                uint32_t sig_end = ts_node_start_byte(body);
-                uint32_t sig_start = ts_node_start_byte(node);
-                uint32_t sig_len = sig_end - sig_start;
-                if (sig_len >= sizeof(sigbuf)) sig_len = (uint32_t)(sizeof(sigbuf) - 1);
-                memcpy(sigbuf, ctx->source + sig_start, sig_len);
-                sigbuf[sig_len] = '\0';
-                for (size_t i = 0; sigbuf[i]; i++) if (sigbuf[i]=='\n'||sigbuf[i]=='\t') sigbuf[i]=' ';
-            }
+            if (!ts_node_is_null(body)) signature_until(ctx->source, node, body, sigbuf, sizeof(sigbuf));
             emit_sym = (namebuf[0] != '\0');
         }
         /* Python / JS / Go / Rust: name field is directly "name" or "identifier" */
@@ -409,7 +1340,7 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
             if (ts_node_is_null(name_node2)) name_node2 = find_child(node, "identifier");
             if (!ts_node_is_null(name_node2)) {
                 node_text(ctx->source, name_node2, namebuf, sizeof(namebuf));
-                /* Go method receiver → scope */
+                /* Go method receiver → signature */
                 if (!strcmp(ntype, "method_declaration")) {
                     TSNode recv = find_child(node, "parameter_list");
                     if (!ts_node_is_null(recv)) {
@@ -417,37 +1348,50 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
                         if (ts_node_is_null(rtype)) rtype = find_child(recv, "pointer_type");
                         if (!ts_node_is_null(rtype)) {
                             char recvbuf[128] = {0};
-                            symbol_name_from_node(ctx->source, rtype, recvbuf, sizeof(recvbuf));
-                            if (recvbuf[0]) strncpy(sigbuf, recvbuf, sizeof(sigbuf) - 1);
+                            symbol_name_from_node(ctx->source, rtype, recvbuf, sizeof(recvbuf), NULL, 0);
+                            if (recvbuf[0]) snprintf(sigbuf, sizeof(sigbuf), "%s", recvbuf);
                         }
                     }
                 }
                 /* Rust function_item: grab signature up to body block */
                 if (!strcmp(ntype, "function_item")) {
                     TSNode body = find_child(node, "block");
-                    if (!ts_node_is_null(body)) {
-                        uint32_t sig_end = ts_node_start_byte(body);
-                        uint32_t sig_start = ts_node_start_byte(node);
-                        uint32_t sig_len = sig_end - sig_start;
-                        if (sig_len >= sizeof(sigbuf)) sig_len = (uint32_t)(sizeof(sigbuf) - 1);
-                        memcpy(sigbuf, ctx->source + sig_start, sig_len);
-                        sigbuf[sig_len] = '\0';
-                        for (size_t i = 0; sigbuf[i]; i++) if (sigbuf[i]=='\n'||sigbuf[i]=='\t') sigbuf[i]=' ';
-                    }
+                    if (!ts_node_is_null(body)) signature_until(ctx->source, node, body, sigbuf, sizeof(sigbuf));
                 }
                 emit_sym = (namebuf[0] != '\0');
             }
+        }
+        if (kind == CTX_SYM_FUNCTION && ctx->scope_is_type && !qualifier[0]) kind = CTX_SYM_METHOD;
+        if (emit_sym) {
+            char path[256], ret[256];
+            if (is_cpp_family(ctx->lang))
+                declared_type_path(ctx->source, ts_node_child_by_field_name(node, "type", 4), path, sizeof(path), 0);
+            else if (ctx->lang == CTX_LANG_PYTHON)
+                python_type_path(ctx->source, ts_node_child_by_field_name(node, "return_type", 11), path, sizeof(path), 0);
+            else
+                path[0] = '\0';
+            type_expr_of_path(path, ret, sizeof(ret));
+            join_scope(opened->fn_scope, sizeof(opened->fn_scope), ctx->enclosing_scope, qualifier);
+            record_return(ctx, opened->fn_scope, namebuf, ret, ts_node_start_point(node).row + 1);
+            opened->fn_return_known = ret[0] != '\0';
+            opened->fn_in_method = ctx->scope_is_type || qualifier[0] != '\0';
         }
     } else if ((kind == CTX_SYM_CLASS || kind == CTX_SYM_STRUCT || kind == CTX_SYM_ENUM) &&
                is_type_reference(node, ntype)) {
         /* `struct stat st;` names an existing type; it is not a definition. */
     } else if (kind == CTX_SYM_CLASS || kind == CTX_SYM_STRUCT || kind == CTX_SYM_ENUM) {
-        TSNode name_node = find_child(node, "type_identifier");
+        TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+        if (ts_node_is_null(name_node)) name_node = find_child(node, "type_identifier");
         if (ts_node_is_null(name_node)) name_node = find_child(node, "identifier");
-        if (ts_node_is_null(name_node)) name_node = find_child(node, "name");
         if (!ts_node_is_null(name_node)) {
-            node_text(ctx->source, name_node, namebuf, sizeof(namebuf));
+            symbol_name_from_node(ctx->source, name_node, namebuf, sizeof(namebuf),
+                                  qualifier, sizeof(qualifier));
             emit_sym = (namebuf[0] != '\0');
+        } else if (ctx->parent_type && !strcmp(ctx->parent_type, "type_definition")) {
+            /* typedef struct { ... } Name; names the anonymous struct */
+            emit_sym = declarator_name(ctx->source,
+                                       ts_node_child_by_field_name(ctx->parent, "declarator", 10),
+                                       namebuf, sizeof(namebuf));
         }
     } else if (kind == CTX_SYM_TYPEDEF) {
         /* Go type_declaration: contains a type_spec with the real name and underlying type */
@@ -468,6 +1412,21 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
                     emit_sym = (namebuf[0] != '\0');
                 }
             }
+        } else if (!strcmp(ntype, "type_definition")) {
+            TSNode type = ts_node_child_by_field_name(node, "type", 4);
+            bool names_anonymous = !ts_node_is_null(type) &&
+                                   ts_node_is_null(ts_node_child_by_field_name(type, "name", 4)) &&
+                                   !ts_node_is_null(ts_node_child_by_field_name(type, "body", 4));
+            TSNode decl = ts_node_child_by_field_name(node, "declarator", 10);
+            emit_sym = !names_anonymous && declarator_name(ctx->source, decl, namebuf, sizeof(namebuf));
+            if (emit_sym) signature_until(ctx->source, node, (TSNode){0}, sigbuf, sizeof(sigbuf));
+        } else if (!strcmp(ntype, "alias_declaration")) {
+            TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+            if (!ts_node_is_null(name_node)) {
+                node_text(ctx->source, name_node, namebuf, sizeof(namebuf));
+                signature_until(ctx->source, node, (TSNode){0}, sigbuf, sizeof(sigbuf));
+                emit_sym = (namebuf[0] != '\0');
+            }
         } else {
             /* Rust type_item */
             TSNode name_node = find_child(node, "type_identifier");
@@ -477,12 +1436,30 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
                 emit_sym = (namebuf[0] != '\0');
             }
         }
+    } else if (kind == CTX_SYM_NAMESPACE && !strcmp(ntype, "namespace_definition")) {
+        /* C++ namespace: named ones are symbols; every one opens a scope. */
+        TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+        if (ts_node_is_null(name_node)) {
+            opened->opens_scope = true;
+            snprintf(opened->scope, sizeof(opened->scope), "%s", CTX_ANONYMOUS_SCOPE);
+        } else {
+            char path[256];
+            namespace_path(ctx->source, name_node, path, sizeof(path));
+            parse_qualified_name(path, namebuf, sizeof(namebuf), qualifier, sizeof(qualifier));
+            if (namebuf[0]) {
+                snprintf(sigbuf, sizeof(sigbuf), "namespace %s", path);
+                snprintf(opened->scope, sizeof(opened->scope), "%s", path);
+                opened->opens_scope = true;
+                emit_sym = true;
+            }
+        }
     } else if (kind == CTX_SYM_NAMESPACE) {
-        /* Rust impl_item: "impl Foo" or "impl Trait for Foo" — use the type name as scope */
-        TSNode type_node = find_child(node, "type_identifier");
+        /* Rust impl_item: "impl Foo" or "impl Trait for Foo" — the type is the scope */
+        TSNode type_node = ts_node_child_by_field_name(node, "type", 4);
+        if (ts_node_is_null(type_node)) type_node = find_child(node, "type_identifier");
         if (ts_node_is_null(type_node)) type_node = find_child(node, "generic_type");
         if (!ts_node_is_null(type_node)) {
-            symbol_name_from_node(ctx->source, type_node, namebuf, sizeof(namebuf));
+            symbol_name_from_node(ctx->source, type_node, namebuf, sizeof(namebuf), NULL, 0);
             emit_sym = (namebuf[0] != '\0');
         }
     } else if (kind == CTX_SYM_VARIABLE) {
@@ -512,27 +1489,42 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
             node_text(ctx->source, path_node, pathbuf, sizeof(pathbuf));
         else
             node_text(ctx->source, node, pathbuf, sizeof(pathbuf));
-        strncpy(namebuf, pathbuf, sizeof(namebuf) - 1);
+        snprintf(namebuf, sizeof(namebuf), "%s", pathbuf);
         emit_sym = (namebuf[0] != '\0');
-    } else if (!strcmp(ntype, "call_expression") || !strcmp(ntype, "call")) {
+    } else if (is_call_node(ntype)) {
         /* Record a call site; the graph resolves it by name once every file is known. */
-        TSNode fn_node = find_child(node, "identifier");
+        TSNode fn_node = ts_node_child_by_field_name(node, "function", 8);
+        if (ts_node_is_null(fn_node)) fn_node = find_child(node, "identifier");
         if (ts_node_is_null(fn_node)) fn_node = find_child(node, "field_expression");
-        if (!ts_node_is_null(fn_node)) {
-            char callee_name[256] = {0};
-            symbol_name_from_node(ctx->source, fn_node, callee_name, sizeof(callee_name));
-            if (callee_name[0]) {
-                uint32_t call_line = ts_node_start_point(node).row + 1;
-                ctx_file_extract_add_site(ctx->ex, ctx->enclosing_fn, call_line,
-                                          callee_name, CTX_EDGE_CALLS);
-            }
+        char callee_name[256], callee_scope[256], recv[256], args[512] = {0};
+        bool member = false;
+        if (classify_target(ctx, fn_node, callee_name, sizeof(callee_name),
+                            callee_scope, sizeof(callee_scope), recv, sizeof(recv), &member)) {
+            if (!member && !callee_scope[0] && ctx->lang == CTX_LANG_CPP)
+                argument_types(ctx, node, args, sizeof(args));
+            CtxSiteDraft site = {
+                .from_name = ctx->enclosing_fn, .from_line = ts_node_start_point(node).row + 1,
+                .to_name = callee_name, .to_scope = callee_scope, .kind = CTX_EDGE_CALLS,
+                .member = member, .recv = recv, .arg_types = args,
+            };
+            ctx_file_extract_add_site(ctx->ex, &site);
+        }
+    } else if (ctx->lang == CTX_LANG_PYTHON && !ctx->enclosing_fn[0] && !strcmp(ntype, "assignment")) {
+        /* Module constants and class attributes */
+        TSNode left = ts_node_child_by_field_name(node, "left", 4);
+        if (!ts_node_is_null(left) && !strcmp(ts_node_type(left), "identifier")) {
+            node_text(ctx->source, left, namebuf, sizeof(namebuf));
+            node_text(ctx->source, node, sigbuf, sizeof(sigbuf));
+            kind = CTX_SYM_VARIABLE;
+            emit_sym = namebuf[0] && !is_noise_identifier(namebuf);
+            if (!emit_sym) namebuf[0] = '\0';
         }
     } else if (!ctx->enclosing_fn[0] && is_variable_decl(ntype)) {
         /* Module-level variables/constants only — locals are graph noise. */
         char vname[256] = {0};
-        symbol_name_from_node(ctx->source, node, vname, sizeof(vname));
+        symbol_name_from_node(ctx->source, node, vname, sizeof(vname), NULL, 0);
         if (vname[0] && !is_noise_identifier(vname)) {
-            strncpy(namebuf, vname, sizeof(namebuf) - 1);
+            snprintf(namebuf, sizeof(namebuf), "%s", vname);
             node_text(ctx->source, node, sigbuf, sizeof(sigbuf));
             kind = CTX_SYM_VARIABLE;
             emit_sym = true;
@@ -542,10 +1534,9 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
     if (emit_sym && namebuf[0]) {
         CtxSymbolDraft sym = {0};
         sym.id   = ctx_symbol_id(ctx->filepath, namebuf, ts_node_start_point(node).row + 1);
-        strncpy(sym.name,      namebuf,         sizeof(sym.name)      - 1);
-        strncpy(sym.signature, sigbuf[0] ? sigbuf : namebuf, sizeof(sym.signature) - 1);
-        strncpy(sym.scope, ctx->enclosing_scope[0] ? ctx->enclosing_scope : qualifier,
-                sizeof(sym.scope) - 1);
+        snprintf(sym.name, sizeof(sym.name), "%s", namebuf);
+        snprintf(sym.signature, sizeof(sym.signature), "%s", sigbuf[0] ? sigbuf : namebuf);
+        join_scope(sym.scope, sizeof(sym.scope), ctx->enclosing_scope, qualifier);
         sym.line         = ts_node_start_point(node).row + 1;
         sym.col          = ts_node_start_point(node).column + 1;
         sym.end_line     = ts_node_end_point(node).row + 1;
@@ -569,35 +1560,49 @@ static bool process_node(WalkCtx *ctx, TSNode node, bool *pushed_fn,
         if (kind == CTX_SYM_CLASS || kind == CTX_SYM_STRUCT) {
             emit_inheritance_edges(ctx->ex, ctx->source, namebuf, sym.line, node);
         }
-    } else if (ctx->enclosing_fn[0] && is_identifier_type(ntype) &&
+    } else if (ctx->enclosing_fn[0] &&
+               (is_identifier_type(ntype) || !strcmp(ntype, "qualified_type_identifier")) &&
+               !is_qualified_node(ctx->parent_type) && !is_qualified_node(ctx->grand_type) &&
                !is_call_target(ctx->parent_type, ctx->grand_type) &&
                !is_declaration_name(ctx->parent_type, ctx->grand_type)) {
-        char ref_name[256] = {0};
-        symbol_name_from_node(ctx->source, node, ref_name, sizeof(ref_name));
+        char ref_name[256], ref_scope[256];
+        symbol_name_from_node(ctx->source, node, ref_name, sizeof(ref_name),
+                              ref_scope, sizeof(ref_scope));
         if (ref_name[0] && !is_noise_identifier(ref_name) &&
             strcmp(ref_name, ctx->enclosing_fn) != 0) {
-            uint32_t ref_line = ts_node_start_point(node).row + 1;
-            ctx_file_extract_add_site(ctx->ex, ctx->enclosing_fn, ref_line,
-                                      ref_name, CTX_EDGE_REFERENCES);
+            bool member = false;
+            char recv[256] = {0};
+            bool access = ctx->parent_type && (!strcmp(ctx->parent_type, "field_expression") ||
+                                               !strcmp(ctx->parent_type, "attribute"));
+            if (access) {
+                bool python = ctx->parent_type[0] == 'a';
+                TSNode parent = ctx->parent;
+                bool is_member = ts_node_eq(ts_node_child_by_field_name(parent, python ? "attribute" : "field",
+                                                                        python ? 9 : 5), node);
+                if (is_member && !classify_target(ctx, parent, ref_name, sizeof(ref_name), ref_scope,
+                                                  sizeof(ref_scope), recv, sizeof(recv), &member))
+                    return;
+            }
+            CtxSiteDraft site = {
+                .from_name = ctx->enclosing_fn, .from_line = ts_node_start_point(node).row + 1,
+                .to_name = ref_name, .to_scope = ref_scope, .kind = CTX_EDGE_REFERENCES,
+                .member = member, .recv = recv,
+            };
+            ctx_file_extract_add_site(ctx->ex, &site);
         }
     }
 
-    /* Track enclosing function for call attribution and class/namespace for
-     * scope tagging. Both use the same save/restore mechanism in walk_tree. */
-    bool entered_fn = (kind == CTX_SYM_FUNCTION || kind == CTX_SYM_METHOD) && namebuf[0];
-    bool entered_scope = (kind == CTX_SYM_CLASS || kind == CTX_SYM_STRUCT ||
-                          kind == CTX_SYM_NAMESPACE ||
-                          /* Rust impl_item and Go type_declaration act as scope containers */
-                          (!strcmp(ntype, "impl_item") && namebuf[0]) ||
-                          (!strcmp(ntype, "type_declaration") &&
-                           (kind == CTX_SYM_STRUCT || kind == CTX_SYM_CLASS))) && namebuf[0];
-    if (entered_fn || entered_scope) {
-        strncpy(pushed_name, namebuf, 255);
-        pushed_name[255] = '\0';
+    if (!namebuf[0]) return;
+    if (kind == CTX_SYM_FUNCTION || kind == CTX_SYM_METHOD) {
+        opened->opens_fn = true;
+        snprintf(opened->fn, sizeof(opened->fn), "%s", namebuf);
+    } else if (kind == CTX_SYM_CLASS || kind == CTX_SYM_STRUCT ||
+               (kind == CTX_SYM_NAMESPACE && strcmp(ntype, "namespace_definition") != 0)) {
+        /* Classes, structs, traits, Rust impls and Go struct/interface types */
+        opened->opens_scope = true;
+        opened->scope_is_type = true;
+        join_scope(opened->scope, sizeof(opened->scope), qualifier, namebuf);
     }
-    *pushed_fn = entered_fn;
-    *pushed_scope = entered_scope;
-    return true;
 }
 
 #define CTX_WALK_MAX_DEPTH 512u
@@ -612,32 +1617,40 @@ static void walk_tree(WalkCtx *ctx, TSNode root) {
     ScopeStack scopes = {0};
     TSTreeCursor cursor = ts_tree_cursor_new(root);
     const char *types[CTX_WALK_MAX_DEPTH + 2];
+    TSNode nodes[CTX_WALK_MAX_DEPTH + 2];
     uint32_t depth = 0;
     for (;;) {
         scope_stack_unwind(&scopes, depth, ctx);
         TSNode node = ts_tree_cursor_current_node(&cursor);
-        if (depth <= CTX_WALK_MAX_DEPTH) types[depth] = ts_node_type(node);
+        if (depth <= CTX_WALK_MAX_DEPTH) {
+            types[depth] = ts_node_type(node);
+            nodes[depth] = node;
+        }
+        ctx->parent = depth >= 1 && depth - 1 <= CTX_WALK_MAX_DEPTH ? nodes[depth - 1] : (TSNode){0};
         ctx->parent_type = depth >= 1 && depth - 1 <= CTX_WALK_MAX_DEPTH ? types[depth - 1] : NULL;
         ctx->grand_type = depth >= 2 && depth - 2 <= CTX_WALK_MAX_DEPTH ? types[depth - 2] : NULL;
 
-        bool descend = false;
-        bool pushed_fn = false, pushed_scope = false;
-        char pushed_name[256];
-        if (depth <= CTX_WALK_MAX_DEPTH &&
-            process_node(ctx, node, &pushed_fn, &pushed_scope, pushed_name)) {
-            descend = true;
-            if (pushed_fn || pushed_scope) {
+        bool descend = depth <= CTX_WALK_MAX_DEPTH;
+        if (descend) {
+            NodeScope opened;
+            process_node(ctx, node, &opened);
+            if (opened.opens_fn || opened.opens_scope) {
                 if (!scope_stack_push(&scopes, depth, ctx)) {
                     CTX_LOG_WARN("Cannot allocate scope stack while indexing %s", ctx->filepath);
                     break;
                 }
-                if (pushed_fn) {
-                    strncpy(ctx->enclosing_fn, pushed_name, sizeof(ctx->enclosing_fn) - 1);
-                    ctx->enclosing_fn[sizeof(ctx->enclosing_fn) - 1] = '\0';
+                if (opened.opens_fn) {
+                    snprintf(ctx->enclosing_fn, sizeof(ctx->enclosing_fn), "%s", opened.fn);
+                    snprintf(ctx->fn_scope, sizeof(ctx->fn_scope), "%s", opened.fn_scope);
+                    ctx->in_method = opened.fn_in_method;
+                    ctx->fn_return_known = opened.fn_return_known;
+                    ctx->scope_is_type = false;
                 }
-                if (pushed_scope) {
-                    strncpy(ctx->enclosing_scope, pushed_name, sizeof(ctx->enclosing_scope) - 1);
-                    ctx->enclosing_scope[sizeof(ctx->enclosing_scope) - 1] = '\0';
+                if (opened.opens_scope) {
+                    char joined[sizeof(ctx->enclosing_scope)];
+                    join_scope(joined, sizeof(joined), ctx->enclosing_scope, opened.scope);
+                    memcpy(ctx->enclosing_scope, joined, sizeof(joined));
+                    ctx->scope_is_type = opened.scope_is_type;
                 }
             }
         }
@@ -670,6 +1683,7 @@ bool ctx_extract_file(const char *path, CtxFileExtract *out) {
     WalkCtx wctx = { .ex = out, .source = pr.source, .filepath = path,
                      .lang = (uint8_t)pr.lang };
     walk_tree(&wctx, root);
+    free(wctx.vars);
 
     ctx_parser_free_result(&pr);
     return true;
